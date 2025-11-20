@@ -32,36 +32,66 @@ To stop the server, press `Ctrl+C` in the terminal.
 - `styles.css` - Styling
 - `logo.png` - Company logo (you need to add this file)
 
-## Deployment to erised.me
+## Deployment to erised.me (GitHub Pages)
 
-To make your website live at https://erised.me, you need to upload these files to your web hosting:
+Your files are already pushed to GitHub at: https://github.com/boatmaninlavik/erised.me
 
-### Files to Upload:
-- `index.html` (must be in the root/public_html directory)
-- `styles.css` (same directory as index.html)
+### Step 1: Enable GitHub Pages
 
-### Common Hosting Methods:
+1. Go to your repository: https://github.com/boatmaninlavik/erised.me
+2. Click **Settings** (top right of the repo)
+3. Scroll down to **Pages** in the left sidebar
+4. Under **Source**, select **Deploy from a branch**
+5. Choose **main** branch
+6. Select **/ (root)** folder
+7. Click **Save**
 
-**1. FTP/SFTP Upload:**
-- Connect to your hosting via FTP client (FileZilla, Cyberduck, etc.)
-- Upload `index.html` and `styles.css` to your public_html or www directory
-- Ensure `index.html` is in the root web directory
+Your site will be available at: `https://boatmaninlavik.github.io/erised.me/`
 
-**2. cPanel File Manager:**
-- Log into cPanel
-- Open File Manager
-- Navigate to public_html (or www)
-- Upload `index.html` and `styles.css`
+### Step 2: Connect Custom Domain (erised.me)
 
-**3. Git Deployment (if using GitHub Pages, Vercel, Netlify, etc.):**
-- Push files to your repository
-- Configure your hosting to deploy from the repo
+1. In the same **Pages** settings section
+2. Under **Custom domain**, enter: `erised.me`
+3. Check **Enforce HTTPS** (once DNS is configured)
 
-**4. Command Line (SSH):**
-```bash
-# If you have SSH access to your server
-scp index.html styles.css user@your-server:/path/to/public_html/
+### Step 3: Configure DNS
+
+In your domain registrar (where you bought erised.me), add these DNS records:
+
+**Option A: A Records (Recommended)**
+```
+Type: A
+Name: @
+Value: 185.199.108.153
+TTL: 3600
+
+Type: A
+Name: @
+Value: 185.199.109.153
+TTL: 3600
+
+Type: A
+Name: @
+Value: 185.199.110.153
+TTL: 3600
+
+Type: A
+Name: @
+Value: 185.199.111.153
+TTL: 3600
 ```
 
-After uploading, visit https://erised.me to verify it's working.
+**Option B: CNAME Record**
+```
+Type: CNAME
+Name: @ (or www)
+Value: boatmaninlavik.github.io
+TTL: 3600
+```
+
+**Note:** DNS changes can take up to 48 hours to propagate, but often work within minutes.
+
+### Verify
+
+After DNS propagates, visit https://erised.me to see your site live!
 
