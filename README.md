@@ -32,66 +32,82 @@ To stop the server, press `Ctrl+C` in the terminal.
 - `styles.css` - Styling
 - `logo.png` - Company logo (you need to add this file)
 
-## Deployment to erised.me (GitHub Pages)
+## Deployment to erised.me (Vercel or Netlify)
 
 Your files are already pushed to GitHub at: https://github.com/boatmaninlavik/erised.me
 
-### Step 1: Enable GitHub Pages
+### Option A: Deploy with Vercel (Recommended)
 
-1. Go to your repository: https://github.com/boatmaninlavik/erised.me
-2. Click **Settings** (top right of the repo)
-3. Scroll down to **Pages** in the left sidebar
-4. Under **Source**, select **Deploy from a branch**
-5. Choose **main** branch
-6. Select **/ (root)** folder
-7. Click **Save**
+**Step 1: Import Project**
+1. Go to: https://vercel.com
+2. Sign in with GitHub
+3. Click **Add New...** → **Project**
+4. Import the repository: `boatmaninlavik/erised.me`
+5. Vercel will auto-detect it as a static site
+6. Click **Deploy**
 
-Your site will be available at: `https://boatmaninlavik.github.io/erised.me/`
+Your site will be live at: `https://erised-me.vercel.app` (or similar URL)
 
-### Step 2: Connect Custom Domain (erised.me)
+**Step 2: Add Custom Domain**
+1. Go to your project dashboard in Vercel
+2. Click **Settings** → **Domains**
+3. Enter: `erised.me`
+4. Click **Add**
+5. Vercel will show you the DNS records to add
 
-1. In the same **Pages** settings section
-2. Under **Custom domain**, enter: `erised.me`
-3. Check **Enforce HTTPS** (once DNS is configured)
+**Step 3: Configure DNS at Porkbun**
+1. Log into Porkbun: https://porkbun.com
+2. Go to your domain: erised.me → DNS
+3. Add the CNAME record that Vercel provides:
+   ```
+   Type: CNAME
+   Name: @ (or blank for root)
+   Answer: cname.vercel-dns.com (or what Vercel shows)
+   TTL: 3600
+   ```
+   OR if Vercel provides A records, add those instead.
 
-### Step 3: Configure DNS
+**Step 4: Wait for DNS**
+- DNS propagation usually takes 5-30 minutes
+- Vercel will automatically issue SSL certificate once DNS is verified
 
-In your domain registrar (where you bought erised.me), add these DNS records:
+---
 
-**Option A: A Records (Recommended)**
-```
-Type: A
-Name: @
-Value: 185.199.108.153
-TTL: 3600
+### Option B: Deploy with Netlify
 
-Type: A
-Name: @
-Value: 185.199.109.153
-TTL: 3600
+**Step 1: Import Project**
+1. Go to: https://app.netlify.com
+2. Sign in with GitHub
+3. Click **Add new site** → **Import an existing project**
+4. Choose **Deploy with GitHub**
+5. Select repository: `boatmaninlavik/erised.me`
+6. Click **Deploy site**
 
-Type: A
-Name: @
-Value: 185.199.110.153
-TTL: 3600
+Your site will be live at: `https://random-name.netlify.app`
 
-Type: A
-Name: @
-Value: 185.199.111.153
-TTL: 3600
-```
+**Step 2: Add Custom Domain**
+1. Go to **Site configuration** → **Domain management**
+2. Click **Add custom domain**
+3. Enter: `erised.me`
+4. Click **Verify**
 
-**Option B: CNAME Record**
-```
-Type: CNAME
-Name: @ (or www)
-Value: boatmaninlavik.github.io
-TTL: 3600
-```
+**Step 3: Configure DNS at Porkbun**
+1. Log into Porkbun: https://porkbun.com
+2. Go to your domain: erised.me → DNS
+3. Add the DNS record Netlify provides (usually a CNAME):
+   ```
+   Type: CNAME
+   Name: @
+   Answer: (what Netlify shows - usually ends with netlify.app)
+   TTL: 3600
+   ```
 
-**Note:** DNS changes can take up to 48 hours to propagate, but often work within minutes.
+**Step 4: Wait for DNS**
+- Netlify will automatically provision SSL once DNS is verified
 
-### Verify
+---
 
-After DNS propagates, visit https://erised.me to see your site live!
+### Verify Deployment
+
+After DNS propagates (5-30 minutes), visit https://erised.me to see your site live!
 
