@@ -1,0 +1,33 @@
+steps:
+  # Build the container image (build from root directory)
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-f', 'Dockerfile', '-t', 'gcr.io/$PROJECT_ID/erised-website:$COMMIT_SHA', '-t', 'gcr.io/$PROJECT_ID/erised-website:latest', '.']
+  
+  # Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/erised-website:$COMMIT_SHA']
+  
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/erised-website:latest']
+  
+  # Deploy container image to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'erised-website'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/erised-website:$COMMIT_SHA'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--port'
+      - '3000'
+
+images:
+  - 'gcr.io/$PROJECT_ID/erised-website:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/erised-website:latest'
+
