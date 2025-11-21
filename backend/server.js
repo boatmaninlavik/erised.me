@@ -12,11 +12,12 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Serve static website files (index.html, styles.css)
-app.use(express.static(path.join(__dirname, '../')));
+// In Docker, all files are in /app, so use current directory
+app.use(express.static(__dirname));
 
 // Serve index.html for root route
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, '../index.html'));
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 // Health check endpoint
