@@ -1,6 +1,6 @@
 # ERISED AI Website
 
-Minimal, Scandinavian-style website for erised.me
+Website for erised.me
 
 ## Setup
 
