@@ -16,7 +16,6 @@ COPY backend/server.js ./
 # Copy static website files (index.html, styles.css, favicon)
 COPY index.html ./
 COPY styles.css ./
-COPY favicon.png ./
 COPY favicon.svg ./
 
 # Expose port (Cloud Run will set PORT env variable)
