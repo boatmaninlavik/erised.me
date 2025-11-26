@@ -17,6 +17,7 @@ COPY backend/server.js ./
 COPY index.html ./
 COPY styles.css ./
 COPY favicon.png ./
+COPY favicon.svg ./
 
 # Expose port (Cloud Run will set PORT env variable)
 EXPOSE 3000
