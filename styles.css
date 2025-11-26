@@ -13,6 +13,7 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
+    padding-bottom: 120px;
 }
 
 .container {
@@ -23,18 +24,18 @@ body {
 }
 
 h1 {
-    font-size: 32px;
+    font-size: 56px;
     font-weight: 300;
-    letter-spacing: 2px;
-    margin-bottom: 20px;
+    letter-spacing: 4px;
+    margin-bottom: 24px;
     color: #1a2b4a;
 }
 
 .description {
-    font-size: 16px;
+    font-size: 22px;
     font-weight: 400;
     color: #4a5568;
-    margin-bottom: 80px;
+    margin-bottom: 100px;
 }
 
 footer {
@@ -42,15 +43,15 @@ footer {
 }
 
 .contact-label {
-    font-size: 14px;
+    font-size: 18px;
     color: #1a2b4a;
-    margin-bottom: 8px;
+    margin-bottom: 12px;
 }
 
 .contact-email {
-    font-size: 14px;
+    font-size: 18px;
     color: #1a2b4a;
-    margin-bottom: 4px;
+    margin-bottom: 6px;
 }
 
 footer a {
@@ -64,18 +65,27 @@ footer a:hover {
 }
 
 @media (max-width: 768px) {
+    body {
+        padding-bottom: 80px;
+    }
+    
     .container {
         padding: 30px 20px;
     }
     
     h1 {
-        font-size: 28px;
-        margin-bottom: 16px;
+        font-size: 40px;
+        margin-bottom: 20px;
     }
     
     .description {
-        font-size: 15px;
-        margin-bottom: 60px;
+        font-size: 18px;
+        margin-bottom: 70px;
+    }
+    
+    .contact-label,
+    .contact-email {
+        font-size: 16px;
     }
 }
 
