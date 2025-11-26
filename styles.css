@@ -41,9 +41,16 @@ footer {
     margin-top: 60px;
 }
 
-footer p {
+.contact-label {
     font-size: 14px;
     color: #1a2b4a;
+    margin-bottom: 8px;
+}
+
+.contact-email {
+    font-size: 14px;
+    color: #1a2b4a;
+    margin-bottom: 4px;
 }
 
 footer a {

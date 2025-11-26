@@ -13,9 +13,10 @@ RUN npm ci --only=production
 # Copy backend server
 COPY backend/server.js ./
 
-# Copy static website files (index.html, styles.css)
+# Copy static website files (index.html, styles.css, favicon)
 COPY index.html ./
 COPY styles.css ./
+COPY favicon.png ./
 
 # Expose port (Cloud Run will set PORT env variable)
 EXPOSE 3000
