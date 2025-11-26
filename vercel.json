@@ -9,7 +9,7 @@
   "redirects": [
     {
       "source": "/demo",
-      "destination": "https://erised-da0ismka5-friends-projects-c6207712.vercel.app",
+      "destination": "https://erised-web.vercel.app",
       "permanent": false
     }
   ],
