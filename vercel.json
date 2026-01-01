@@ -2,14 +2,5 @@
   "version": 2,
   "builds": [
     { "src": "**", "use": "@vercel/static" }
-  ],
-  "redirects": [
-    {
-      "source": "/demo",
-      "destination": "https://erised-web.vercel.app",
-      "permanent": false
-    }
   ]
 }
-
-
