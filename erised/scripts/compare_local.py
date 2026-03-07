@@ -590,6 +590,9 @@ def main():
     # ── FastAPI app ───────────────────────────────────────────────────
     app = FastAPI(title="Erised Compare")
 
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
     class SubmitRequest(BaseModel):
         prompt: str
         lyrics: str
