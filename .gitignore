@@ -31,3 +31,4 @@ outputs/
 # IDE
 .vscode/
 .idea/
+.env.local
