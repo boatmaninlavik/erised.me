@@ -1,44 +1,8 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
-
-const BACKEND_KEY = "erised_backend_url";
-
-function BackendModal({ onSave }: { onSave: (url: string) => void }) {
-  const [url, setUrl] = useState("");
-  return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 px-6">
-      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-8 max-w-lg w-full space-y-6">
-        <div>
-          <h2 className="text-xl font-semibold tracking-tight text-white">Connect to GPU</h2>
-          <p className="text-zinc-400 text-sm mt-2">
-            Start the compare server on RunPod, then paste your ngrok or RunPod URL below.
-          </p>
-          <code className="block mt-3 text-xs text-zinc-500 bg-zinc-800 rounded-lg p-3 leading-relaxed">
-            cd /workspace/heartlib<br />
-            python -m erised.scripts.compare_local --dpo-path /workspace/dpo_checkpoints_v6/dpo_best<br />
-            # then: ngrok http 7860
-          </code>
-        </div>
-        <input
-          className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-4 py-3 text-white text-sm placeholder:text-zinc-500 focus:outline-none focus:border-zinc-500"
-          placeholder="https://xxxx.ngrok-free.app"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && url.trim() && onSave(url.trim())}
-        />
-        <button
-          onClick={() => url.trim() && onSave(url.trim())}
-          className="w-full bg-white text-black font-semibold rounded-xl py-3 text-sm tracking-tight hover:bg-zinc-100 transition-colors"
-        >
-          Connect
-        </button>
-      </div>
-    </div>
-  );
-}
 
 type JobStatus = "idle" | "pending" | "running" | "done" | "error";
 
@@ -78,7 +42,7 @@ async function pollJob(backendUrl: string, jobId: string): Promise<GenerationRes
 
 export default function GeneratePage() {
   const [backendUrl, setBackendUrl] = useState<string | null>(null);
-  const [showModal, setShowModal] = useState(false);
+  const [gpuStatus, setGpuStatus] = useState<"loading" | "online" | "offline">("loading");
   const [prompt, setPrompt] = useState("");
   const [lyrics, setLyrics] = useState("");
   const [maxSec, setMaxSec] = useState(60);
@@ -95,22 +59,28 @@ export default function GeneratePage() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  const origAudioRef = useRef<HTMLAudioElement>(null);
-  const dpoAudioRef = useRef<HTMLAudioElement>(null);
-  const singleAudioRef = useRef<HTMLAudioElement>(null);
+  const loadBackendUrl = useCallback(async () => {
+    const { data } = await supabase
+      .from("erised_config")
+      .select("value")
+      .eq("key", "backend_url")
+      .single();
 
-  useEffect(() => {
-    const stored = localStorage.getItem(BACKEND_KEY);
-    if (stored) setBackendUrl(stored);
-    else setShowModal(true);
+    const url = data?.value?.trim();
+    if (url) {
+      setBackendUrl(url);
+      setGpuStatus("online");
+    } else {
+      setBackendUrl(null);
+      setGpuStatus("offline");
+    }
   }, []);
 
-  function handleSaveBackend(url: string) {
-    const clean = url.replace(/\/$/, "");
-    localStorage.setItem(BACKEND_KEY, clean);
-    setBackendUrl(clean);
-    setShowModal(false);
-  }
+  useEffect(() => {
+    loadBackendUrl();
+    const interval = setInterval(loadBackendUrl, 30000);
+    return () => clearInterval(interval);
+  }, [loadBackendUrl]);
 
   async function generateBoth() {
     if (!backendUrl || !prompt.trim() || !lyrics.trim()) return;
@@ -219,212 +189,223 @@ export default function GeneratePage() {
 
   return (
     <div className="min-h-screen bg-black text-white">
-      {showModal && <BackendModal onSave={handleSaveBackend} />}
-
-      {/* Nav */}
       <nav className="px-6 py-5 flex items-center justify-between border-b border-zinc-900">
         <Link href="/" className="text-xl font-semibold tracking-tighter text-white">
           Erised
         </Link>
-        <button
-          onClick={() => setShowModal(true)}
-          className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
-        >
-          {backendUrl ? `Connected: ${new URL(backendUrl).hostname}` : "Connect GPU →"}
-        </button>
+        <div className="flex items-center gap-2">
+          <div className={`w-2 h-2 rounded-full ${
+            gpuStatus === "online" ? "bg-green-500" :
+            gpuStatus === "offline" ? "bg-zinc-600" : "bg-yellow-500 animate-pulse"
+          }`} />
+          <span className="text-xs text-zinc-500">
+            {gpuStatus === "online" ? "GPU online" :
+             gpuStatus === "offline" ? "GPU offline" : "Connecting..."}
+          </span>
+        </div>
       </nav>
 
-      <div className="max-w-2xl mx-auto px-6 py-10 space-y-8">
-        <div>
-          <h2 className="text-2xl font-semibold tracking-tight">Generate</h2>
-          <p className="text-zinc-500 text-sm mt-1">Compare original vs DPO-tuned model output.</p>
+      {gpuStatus === "loading" && (
+        <div className="flex items-center justify-center min-h-[60vh]">
+          <p className="text-zinc-500 text-sm animate-pulse">Connecting to GPU...</p>
         </div>
+      )}
 
-        {/* Tabs */}
-        <div className="flex gap-1 bg-zinc-900 rounded-xl p-1">
-          {(["ab", "single"] as const).map((t) => (
+      {gpuStatus === "offline" && (
+        <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-4 px-6 text-center">
+          <p className="text-2xl font-semibold tracking-tight">GPU is offline</p>
+          <p className="text-zinc-500 text-sm max-w-sm">
+            The generation server isn&apos;t running right now. Check back later.
+          </p>
+          <button
+            onClick={loadBackendUrl}
+            className="text-xs text-zinc-600 hover:text-zinc-400 transition-colors mt-4"
+          >
+            Retry connection
+          </button>
+        </div>
+      )}
+
+      {gpuStatus === "online" && (
+        <div className="max-w-2xl mx-auto px-6 py-10 space-y-8">
+          <div>
+            <h2 className="text-2xl font-semibold tracking-tight">Generate</h2>
+            <p className="text-zinc-500 text-sm mt-1">Compare original vs DPO-tuned model output.</p>
+          </div>
+
+          {/* Tabs */}
+          <div className="flex gap-1 bg-zinc-900 rounded-xl p-1">
+            {(["ab", "single"] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                className={`flex-1 py-2 text-sm font-medium rounded-lg transition-colors ${
+                  tab === t ? "bg-zinc-700 text-white" : "text-zinc-500 hover:text-zinc-300"
+                }`}
+              >
+                {t === "ab" ? "A/B Compare" : "Single Generate"}
+              </button>
+            ))}
+          </div>
+
+          {/* Form */}
+          <div className="space-y-4">
+            {tab === "single" && (
+              <div className="flex gap-2">
+                {(["original", "dpo"] as const).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => setSelectedModel(m)}
+                    className={`flex-1 py-2.5 rounded-xl text-sm font-medium border transition-colors ${
+                      selectedModel === m
+                        ? "border-white text-white bg-zinc-800"
+                        : "border-zinc-800 text-zinc-500 hover:border-zinc-600"
+                    }`}
+                  >
+                    {m === "dpo" ? "DPO-tuned" : "Original"}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div>
+              <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
+                Musical Prompt
+              </label>
+              <textarea
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                rows={3}
+                placeholder="e.g. emotional pop ballad with piano and strings"
+                className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-white text-sm placeholder:text-zinc-600 focus:outline-none focus:border-zinc-600 resize-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
+                Lyrics
+              </label>
+              <textarea
+                value={lyrics}
+                onChange={(e) => setLyrics(e.target.value)}
+                rows={8}
+                placeholder={"[Verse 1]\nYour lyrics here...\n\n[Chorus]\nYour chorus here..."}
+                className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-white text-sm placeholder:text-zinc-600 focus:outline-none focus:border-zinc-600 resize-none font-mono"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
+                Max length — {maxSec}s
+              </label>
+              <input
+                type="range"
+                min={10}
+                max={240}
+                step={5}
+                value={maxSec}
+                onChange={(e) => setMaxSec(Number(e.target.value))}
+                className="w-full accent-white"
+              />
+            </div>
+
             <button
-              key={t}
-              onClick={() => setTab(t)}
-              className={`flex-1 py-2 text-sm font-medium rounded-lg transition-colors ${
-                tab === t ? "bg-zinc-700 text-white" : "text-zinc-500 hover:text-zinc-300"
-              }`}
+              onClick={tab === "ab" ? generateBoth : generateSingle}
+              disabled={isGenerating || !prompt.trim() || !lyrics.trim()}
+              className="w-full py-4 bg-white text-black font-semibold rounded-xl text-sm tracking-tight hover:bg-zinc-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              {t === "ab" ? "A/B Compare" : "Single Generate"}
+              {isGenerating
+                ? "Generating..."
+                : tab === "ab"
+                ? "Generate Both (Original + DPO)"
+                : `Generate with ${selectedModel === "dpo" ? "DPO-tuned" : "Original"} model`}
             </button>
-          ))}
-        </div>
+          </div>
 
-        {/* Form */}
-        <div className="space-y-4">
-          {tab === "single" && (
-            <div className="flex gap-2">
-              {(["original", "dpo"] as const).map((m) => (
-                <button
-                  key={m}
-                  onClick={() => setSelectedModel(m)}
-                  className={`flex-1 py-2.5 rounded-xl text-sm font-medium border transition-colors ${
-                    selectedModel === m
-                      ? "border-white text-white bg-zinc-800"
-                      : "border-zinc-800 text-zinc-500 hover:border-zinc-600"
-                  }`}
-                >
-                  {m === "dpo" ? "DPO-tuned" : "Original"}
-                </button>
-              ))}
+          {error && (
+            <p className="text-red-400 text-sm bg-red-950/30 border border-red-900 rounded-xl px-4 py-3">
+              {error}
+            </p>
+          )}
+
+          {/* A/B Results */}
+          {tab === "ab" && (origStatus !== "idle" || dpoStatus !== "idle") && (
+            <div className="space-y-4">
+              {(["original", "dpo"] as const).map((model) => {
+                const result = model === "original" ? origResult : dpoResult;
+                const status = model === "original" ? origStatus : dpoStatus;
+                return (
+                  <div key={model} className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="font-medium text-sm tracking-tight">
+                        {model === "dpo" ? "DPO-Tuned Model" : "Original Model"}
+                      </h3>
+                      {(status === "running" || status === "pending") && (
+                        <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
+                      )}
+                      {result && (
+                        <span className="text-xs text-zinc-500">{result.elapsed}s · {result.num_frames} frames</span>
+                      )}
+                    </div>
+                    {result && backendUrl ? (
+                      <>
+                        <audio controls src={`${backendUrl}/audio/${result.audio_file}`} className="w-full" />
+                        <p className="text-xs text-zinc-600 font-mono">{result.tags}</p>
+                        {model === "dpo" && (
+                          <button
+                            onClick={() => saveToLibrary(result)}
+                            disabled={saving || saved}
+                            className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
+                          >
+                            {saved ? "✓ Saved to Library" : saving ? "Saving..." : "Save to My Library →"}
+                          </button>
+                        )}
+                      </>
+                    ) : status === "error" ? (
+                      <p className="text-xs text-red-400">Generation failed</p>
+                    ) : (
+                      <div className="h-10 bg-zinc-800 rounded-lg animate-pulse" />
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
 
-          <div>
-            <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
-              Musical Prompt
-            </label>
-            <textarea
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              rows={3}
-              placeholder="e.g. emotional pop ballad with piano and strings"
-              className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-white text-sm placeholder:text-zinc-600 focus:outline-none focus:border-zinc-600 resize-none"
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
-              Lyrics
-            </label>
-            <textarea
-              value={lyrics}
-              onChange={(e) => setLyrics(e.target.value)}
-              rows={8}
-              placeholder={"[Verse 1]\nYour lyrics here...\n\n[Chorus]\nYour chorus here..."}
-              className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-white text-sm placeholder:text-zinc-600 focus:outline-none focus:border-zinc-600 resize-none font-mono"
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
-              Max length — {maxSec}s
-            </label>
-            <input
-              type="range"
-              min={10}
-              max={240}
-              step={5}
-              value={maxSec}
-              onChange={(e) => setMaxSec(Number(e.target.value))}
-              className="w-full accent-white"
-            />
-          </div>
-
-          <button
-            onClick={tab === "ab" ? generateBoth : generateSingle}
-            disabled={isGenerating || !backendUrl || !prompt.trim() || !lyrics.trim()}
-            className="w-full py-4 bg-white text-black font-semibold rounded-xl text-sm tracking-tight hover:bg-zinc-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {isGenerating
-              ? "Generating..."
-              : tab === "ab"
-              ? "Generate Both (Original + DPO)"
-              : `Generate with ${selectedModel === "dpo" ? "DPO-tuned" : "Original"} model`}
-          </button>
-        </div>
-
-        {error && (
-          <p className="text-red-400 text-sm bg-red-950/30 border border-red-900 rounded-xl px-4 py-3">
-            {error}
-          </p>
-        )}
-
-        {/* A/B Results */}
-        {tab === "ab" && (origStatus !== "idle" || dpoStatus !== "idle") && (
-          <div className="space-y-4">
-            {(["original", "dpo"] as const).map((model) => {
-              const result = model === "original" ? origResult : dpoResult;
-              const status = model === "original" ? origStatus : dpoStatus;
-              const audioRef = model === "original" ? origAudioRef : dpoAudioRef;
-              return (
-                <div
-                  key={model}
-                  className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3"
-                >
-                  <div className="flex items-center justify-between">
-                    <h3 className="font-medium text-sm tracking-tight">
-                      {model === "dpo" ? "DPO-Tuned Model" : "Original Model"}
-                    </h3>
-                    {status === "running" || status === "pending" ? (
-                      <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
-                    ) : result ? (
-                      <span className="text-xs text-zinc-500">{result.elapsed}s · {result.num_frames} frames</span>
-                    ) : null}
-                  </div>
-                  {result && backendUrl ? (
-                    <>
-                      <audio
-                        ref={audioRef}
-                        controls
-                        src={`${backendUrl}/audio/${result.audio_file}`}
-                        className="w-full"
-                      />
-                      <p className="text-xs text-zinc-600 font-mono">{result.tags}</p>
-                      {model === "dpo" && (
-                        <button
-                          onClick={() => saveToLibrary(result)}
-                          disabled={saving || saved}
-                          className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
-                        >
-                          {saved ? "✓ Saved to Library" : saving ? "Saving..." : "Save to My Library →"}
-                        </button>
-                      )}
-                    </>
-                  ) : status === "error" ? (
-                    <p className="text-xs text-red-400">Generation failed</p>
-                  ) : (
-                    <div className="h-10 bg-zinc-800 rounded-lg animate-pulse" />
+          {/* Single Result */}
+          {tab === "single" && singleStatus !== "idle" && (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
+              <div className="flex items-center justify-between">
+                <h3 className="font-medium text-sm tracking-tight">
+                  {selectedModel === "dpo" ? "DPO-Tuned Model" : "Original Model"}
+                </h3>
+                {(singleStatus === "running" || singleStatus === "pending") && (
+                  <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
+                )}
+              </div>
+              {singleResult && backendUrl ? (
+                <>
+                  <audio controls src={`${backendUrl}/audio/${singleResult.audio_file}`} className="w-full" />
+                  <p className="text-xs text-zinc-600 font-mono">{singleResult.tags}</p>
+                  {selectedModel === "dpo" && (
+                    <button
+                      onClick={() => saveToLibrary(singleResult)}
+                      disabled={saving || saved}
+                      className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
+                    >
+                      {saved ? "✓ Saved to Library" : saving ? "Saving..." : "Save to My Library →"}
+                    </button>
                   )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Single Result */}
-        {tab === "single" && singleStatus !== "idle" && (
-          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
-            <div className="flex items-center justify-between">
-              <h3 className="font-medium text-sm tracking-tight">
-                {selectedModel === "dpo" ? "DPO-Tuned Model" : "Original Model"}
-              </h3>
-              {(singleStatus === "running" || singleStatus === "pending") && (
-                <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
+                </>
+              ) : singleStatus === "error" ? (
+                <p className="text-xs text-red-400">Generation failed</p>
+              ) : (
+                <div className="h-10 bg-zinc-800 rounded-lg animate-pulse" />
               )}
             </div>
-            {singleResult && backendUrl ? (
-              <>
-                <audio
-                  ref={singleAudioRef}
-                  controls
-                  src={`${backendUrl}/audio/${singleResult.audio_file}`}
-                  className="w-full"
-                />
-                <p className="text-xs text-zinc-600 font-mono">{singleResult.tags}</p>
-                {selectedModel === "dpo" && (
-                  <button
-                    onClick={() => saveToLibrary(singleResult)}
-                    disabled={saving || saved}
-                    className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
-                  >
-                    {saved ? "✓ Saved to Library" : saving ? "Saving..." : "Save to My Library →"}
-                  </button>
-                )}
-              </>
-            ) : singleStatus === "error" ? (
-              <p className="text-xs text-red-400">Generation failed</p>
-            ) : (
-              <div className="h-10 bg-zinc-800 rounded-lg animate-pulse" />
-            )}
-          </div>
-        )}
-      </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
