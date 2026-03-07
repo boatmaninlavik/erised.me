@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+.ipynb_checkpoints/
+
+# Model weights and checkpoints
+*.safetensors
+*.pt
+*.pth
+dpo_checkpoints*/
+
+# Database and user data
+*.db
+*.db-shm
+*.db-wal
+
+# Audio outputs
+outputs/
+*.wav
+*.mp3
+*.flac
+
+# Environment
+.env
+*.env
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/

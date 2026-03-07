@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Erised - Rate Songs</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0a;
+            color: #e5e5e5;
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            color: #a855f7;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 30px;
+        }
+        .form-section {
+            background: #151515;
+            padding: 24px;
+            border-radius: 12px;
+            margin-bottom: 24px;
+        }
+        label {
+            display: block;
+            color: #a855f7;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+        textarea, input {
+            width: 100%;
+            background: #1e1e1e;
+            border: 1px solid #333;
+            color: #e5e5e5;
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: 'Menlo', 'Monaco', monospace;
+            resize: vertical;
+        }
+        textarea:focus, input:focus {
+            outline: none;
+            border-color: #a855f7;
+        }
+        .btn {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #a855f7, #7c3aed);
+            border: none;
+            color: white;
+            font-size: 16px;
+            font-weight: 600;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: transform 0.1s, opacity 0.2s;
+        }
+        .btn:hover:not(:disabled) {
+            transform: translateY(-1px);
+        }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .status-section {
+            background: #151515;
+            padding: 24px;
+            border-radius: 12px;
+            margin-bottom: 24px;
+            display: none;
+        }
+        .status-section.active {
+            display: block;
+        }
+        .progress-bar {
+            background: #333;
+            border-radius: 8px;
+            height: 24px;
+            overflow: hidden;
+            margin: 16px 0;
+        }
+        .progress-fill {
+            background: linear-gradient(90deg, #a855f7, #7c3aed);
+            height: 100%;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+        .status-text {
+            text-align: center;
+            color: #888;
+        }
+        .comparison-section {
+            display: none;
+        }
+        .comparison-section.active {
+            display: block;
+        }
+        .audio-card {
+            background: #151515;
+            padding: 24px;
+            border-radius: 12px;
+            margin-bottom: 16px;
+            border: 2px solid transparent;
+            cursor: pointer;
+            transition: border-color 0.2s, transform 0.1s;
+        }
+        .audio-card:hover {
+            border-color: #333;
+        }
+        .audio-card.selected {
+            border-color: #a855f7;
+            background: #1a1525;
+        }
+        .audio-card h3 {
+            margin: 0 0 12px 0;
+            color: #a855f7;
+        }
+        audio {
+            width: 100%;
+            margin: 12px 0;
+        }
+        .tags {
+            font-size: 12px;
+            color: #666;
+            font-family: monospace;
+        }
+        .submit-rating {
+            background: #22c55e;
+            margin-top: 16px;
+        }
+        .submit-rating:disabled {
+            background: #333;
+        }
+        .stats {
+            text-align: center;
+            padding: 20px;
+            background: #151515;
+            border-radius: 12px;
+        }
+        .stats-count {
+            font-size: 24px;
+            font-weight: 700;
+            color: #a855f7;
+        }
+        .toolbar {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+            justify-content: flex-end;
+        }
+        .toolbar-btn {
+            padding: 10px 20px;
+            background: #222;
+            border: 1px solid #444;
+            color: #ccc;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .toolbar-btn:hover {
+            background: #333;
+        }
+        .backup-link {
+            color: #a855f7;
+            margin-left: 8px;
+        }
+        .error-msg {
+            background: #7f1d1d;
+            color: #fecaca;
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 12px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎵 Erised RLHF Rating</h1>
+        <p class="subtitle">Rate which song sounds better to train your model</p>
+
+        <div class="toolbar">
+            <button class="toolbar-btn" onclick="createBackup()">💾 Create Backup</button>
+            <span id="backupStatus"></span>
+        </div>
+
+        <div class="form-section" id="formSection">
+            <label for="prompt">Musical Prompt</label>
+            <textarea id="prompt" rows="3" placeholder="e.g., Male rappers, UK Drill Hip-Hop, 808 bassline, drill hi-hats, confident, luxurious mood">Male rappers, UK Drill Hip-Hop, 808 bassline, drill hi-hats, confident, luxurious mood</textarea>
+
+            <label for="lyrics" style="margin-top: 16px;">Lyrics</label>
+            <textarea id="lyrics" rows="8" placeholder="Enter lyrics with [Verse], [Chorus] markers...">[Verse 1]
+Blueprint in my head, a different architecture
+Used to read the signs, now I just write the lecture
+
+[Chorus]
+Black card, gold card, which one for the moment
+New coast, old friends, which one feels like home then</textarea>
+
+            <button class="btn" id="generateBtn" onclick="startGeneration()">Generate Pair</button>
+            <div class="error-msg" id="errorMsg"></div>
+        </div>
+
+        <div class="status-section" id="statusSection">
+            <h3 style="text-align: center; margin: 0;">Generating songs...</h3>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <p class="status-text" id="statusText">Starting generation...</p>
+        </div>
+
+        <div class="comparison-section" id="comparisonSection">
+            <div class="audio-card" id="cardA" onclick="selectChoice('a')">
+                <h3>Option A <span style="font-size: 12px; color: #888; font-weight: normal;">(conservative)</span></h3>
+                <audio id="audioA" controls></audio>
+                <p class="tags" id="tagsA"></p>
+            </div>
+
+            <div class="audio-card" id="cardB" onclick="selectChoice('b')">
+                <h3>Option B <span style="font-size: 12px; color: #888; font-weight: normal;">(creative)</span></h3>
+                <audio id="audioB" controls></audio>
+                <p class="tags" id="tagsB"></p>
+            </div>
+
+            <button class="btn submit-rating" id="submitBtn" onclick="submitRating()" disabled>
+                Select one to submit your rating
+            </button>
+        </div>
+
+        <div class="stats">
+            <div>Preferences collected: <span class="stats-count" id="statsCount">0</span></div>
+            <div style="color: #666; font-size: 12px; margin-top: 4px;">Aim for 50-100 before running DPO training</div>
+        </div>
+    </div>
+
+    <script>
+        let currentPairId = null;
+        let currentChoice = null;
+        let currentJobId = null;
+        let pollInterval = null;
+
+        async function startGeneration() {
+            const prompt = document.getElementById('prompt').value.trim();
+            const lyrics = document.getElementById('lyrics').value.trim();
+
+            if (!prompt || !lyrics) {
+                showError('Please fill in both prompt and lyrics');
+                return;
+            }
+
+            // Reset UI
+            document.getElementById('generateBtn').disabled = true;
+            document.getElementById('formSection').style.opacity = '0.5';
+            document.getElementById('statusSection').classList.add('active');
+            document.getElementById('comparisonSection').classList.remove('active');
+            document.getElementById('progressFill').style.width = '5%';
+            document.getElementById('statusText').textContent = 'Starting generation...';
+            hideError();
+
+            try {
+                const res = await fetch('/start-pair', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt, lyrics })
+                });
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || 'Failed to start generation');
+                }
+
+                const data = await res.json();
+                currentJobId = data.job_id;
+                
+                // Start polling
+                pollInterval = setInterval(pollJobStatus, 3000);
+                pollJobStatus(); // immediate first poll
+                
+            } catch (e) {
+                showError(e.message);
+                resetForm();
+            }
+        }
+
+        async function pollJobStatus() {
+            if (!currentJobId) return;
+
+            try {
+                const res = await fetch(`/job/${currentJobId}`);
+                if (!res.ok) throw new Error('Failed to get job status');
+                
+                const data = await res.json();
+                
+                // Update progress
+                document.getElementById('progressFill').style.width = `${data.progress}%`;
+                
+                const statusMessages = {
+                    'pending': 'Waiting to start...',
+                    'generating_a': 'Generating song A... (this takes ~3-4 min)',
+                    'generating_b': 'Generating song B... (this takes ~3-4 min)',
+                    'complete': 'Done!',
+                    'failed': 'Generation failed'
+                };
+                document.getElementById('statusText').textContent = statusMessages[data.status] || data.status;
+
+                if (data.status === 'complete') {
+                    clearInterval(pollInterval);
+                    pollInterval = null;
+                    showComparison(data.result);
+                } else if (data.status === 'failed') {
+                    clearInterval(pollInterval);
+                    pollInterval = null;
+                    showError(data.error || 'Generation failed');
+                    resetForm();
+                }
+            } catch (e) {
+                console.error('Poll error:', e);
+                // Don't stop polling on transient errors
+            }
+        }
+
+        function showComparison(result) {
+            currentPairId = result.pair_id;
+            currentChoice = null;
+
+            // Set audio sources
+            document.getElementById('audioA').src = result.a.audio_url;
+            document.getElementById('audioB').src = result.b.audio_url;
+            document.getElementById('tagsA').textContent = `Tags: ${result.a.tags_used}`;
+            document.getElementById('tagsB').textContent = `Tags: ${result.b.tags_used}`;
+
+            // Reset selection
+            document.getElementById('cardA').classList.remove('selected');
+            document.getElementById('cardB').classList.remove('selected');
+            document.getElementById('submitBtn').disabled = true;
+            document.getElementById('submitBtn').textContent = 'Select one to submit your rating';
+
+            // Show comparison, hide form
+            document.getElementById('statusSection').classList.remove('active');
+            document.getElementById('comparisonSection').classList.add('active');
+            document.getElementById('formSection').style.opacity = '1';
+            document.getElementById('generateBtn').disabled = false;
+        }
+
+        function selectChoice(choice) {
+            currentChoice = choice;
+            document.getElementById('cardA').classList.toggle('selected', choice === 'a');
+            document.getElementById('cardB').classList.toggle('selected', choice === 'b');
+            document.getElementById('submitBtn').disabled = false;
+            document.getElementById('submitBtn').textContent = `Submit: Option ${choice.toUpperCase()} is better`;
+        }
+
+        async function submitRating() {
+            if (!currentPairId || !currentChoice) return;
+
+            const [a_id, b_id] = currentPairId.split('_');
+            const winner_id = currentChoice === 'a' ? a_id : b_id;
+            const loser_id = currentChoice === 'a' ? b_id : a_id;
+
+            try {
+                document.getElementById('submitBtn').disabled = true;
+                document.getElementById('submitBtn').textContent = 'Submitting...';
+
+                // Stop both audio players immediately
+                const audioA = document.getElementById('audioA');
+                const audioB = document.getElementById('audioB');
+                audioA.pause();
+                audioB.pause();
+                audioA.currentTime = 0;
+                audioB.currentTime = 0;
+
+                const res = await fetch('/rate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        pair_id: currentPairId,
+                        winner_id,
+                        loser_id,
+                        prompt: document.getElementById('prompt').value,
+                        lyrics: document.getElementById('lyrics').value
+                    })
+                });
+
+                if (!res.ok) throw new Error('Failed to submit rating');
+
+                // Update stats
+                const count = parseInt(document.getElementById('statsCount').textContent) + 1;
+                document.getElementById('statsCount').textContent = count;
+
+                // Reset for next generation
+                document.getElementById('comparisonSection').classList.remove('active');
+                document.getElementById('submitBtn').textContent = 'Rating submitted! Generate another pair';
+                
+                // Clear the input fields for fresh start
+                document.getElementById('prompt').value = '';
+                document.getElementById('lyrics').value = '';
+                
+                currentPairId = null;
+                currentChoice = null;
+                currentJobId = null;
+
+            } catch (e) {
+                showError(e.message);
+                document.getElementById('submitBtn').disabled = false;
+            }
+        }
+
+        async function createBackup() {
+            document.getElementById('backupStatus').textContent = 'Creating...';
+            try {
+                const res = await fetch('/backup', { method: 'POST' });
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || 'Backup failed');
+                }
+                const data = await res.json();
+                document.getElementById('backupStatus').innerHTML = 
+                    '✓ <a href="' + data.download_url + '" class="backup-link">Download</a>';
+            } catch (e) {
+                document.getElementById('backupStatus').textContent = 'Error: ' + e.message;
+            }
+        }
+
+        function showError(msg) {
+            const el = document.getElementById('errorMsg');
+            el.textContent = msg;
+            el.style.display = 'block';
+        }
+
+        function hideError() {
+            document.getElementById('errorMsg').style.display = 'none';
+        }
+
+        function resetForm() {
+            document.getElementById('generateBtn').disabled = false;
+            document.getElementById('formSection').style.opacity = '1';
+            document.getElementById('statusSection').classList.remove('active');
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
+        }
+
+        // Load initial stats
+        fetch('/stats').then(r => r.ok ? r.json() : {count: 0}).then(d => {
+            document.getElementById('statsCount').textContent = d.count || 0;
+        }).catch(() => {});
+    </script>
+</body>
+</html>
