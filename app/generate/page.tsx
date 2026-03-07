@@ -188,12 +188,12 @@ export default function GeneratePage() {
       const filename = `${Date.now()}_${result.model}.${ext}`;
 
       const { data: uploadData, error: uploadErr } = await supabase.storage
-        .from("songs")
+        .from("dpo-songs")
         .upload(filename, blob, { contentType: blob.type || "audio/wav", upsert: false });
 
       if (uploadErr) throw uploadErr;
 
-      const { data: urlData } = supabase.storage.from("songs").getPublicUrl(uploadData.path);
+      const { data: urlData } = supabase.storage.from("dpo-songs").getPublicUrl(uploadData.path);
 
       await supabase.from("dpo_songs").insert({
         prompt,
