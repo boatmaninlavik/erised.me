@@ -194,7 +194,7 @@ input[type=range] { accent-color: #38bdf8; width: 100%; }
 <!-- Rating section (shown when a pair is ready) -->
 <div id="rating-section">
     <div class="audio-card" id="card-a">
-        <h3>Option A <span>(balanced · temp 0.7)</span></h3>
+        <h3>Option A <span>(balanced · temp 0.8)</span></h3>
         <audio id="audio-a" controls preload="auto"></audio>
         <div class="speed-btns" data-for="audio-a">
             <button class="speed-btn" data-speed="0.5">0.5x</button>
@@ -451,7 +451,7 @@ def main():
                 result_a = pipeline.generate(
                     prompt=prompt, lyrics=lyrics,
                     max_audio_length_ms=int(max_sec * 1000),
-                    temperature=0.7, cfg_scale=1.5,
+                    temperature=0.8, cfg_scale=1.5,
                 )
                 logger.info("[A] Generated %s in %.1fs", result_a.audio_path, time.time() - t0)
 
