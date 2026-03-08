@@ -165,7 +165,7 @@ export default function GeneratePage() {
 
       const { data: urlData } = supabase.storage.from("dpo-songs").getPublicUrl(uploadData.path);
 
-      await supabase.from("dpo_songs").insert({
+      await supabase.from("dpo-songs").insert({
         prompt,
         lyrics,
         tags: result.tags,

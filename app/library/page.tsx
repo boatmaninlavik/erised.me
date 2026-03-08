@@ -20,7 +20,7 @@ export default function LibraryPage() {
   useEffect(() => {
     async function load() {
       const { data, error } = await supabase
-        .from("dpo_songs")
+        .from("dpo-songs")
         .select("*")
         .eq("model", "dpo")
         .order("created_at", { ascending: false });
