@@ -56,8 +56,8 @@ export default function GeneratePage() {
   const [dpoResult, setDpoResult] = useState<GenerationResult | null>(null);
   const [singleResult, setSingleResult] = useState<GenerationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState<string | null>(null);
+  const [savedModels, setSavedModels] = useState<Set<string>>(new Set());
   const [randomizingPrompt, setRandomizingPrompt] = useState(false);
   const [randomizingLyrics, setRandomizingLyrics] = useState(false);
 
@@ -102,7 +102,7 @@ export default function GeneratePage() {
     setError(null);
     setOrigResult(null);
     setDpoResult(null);
-    setSaved(false);
+    setSavedModels(new Set());
     setOrigStatus("pending");
     setDpoStatus("pending");
 
@@ -150,7 +150,7 @@ export default function GeneratePage() {
     if (!backendUrl || !prompt.trim() || !lyrics.trim()) return;
     setError(null);
     setSingleResult(null);
-    setSaved(false);
+    setSavedModels(new Set());
     setSingleStatus("pending");
 
     try {
@@ -172,7 +172,7 @@ export default function GeneratePage() {
 
   async function saveToLibrary(result: GenerationResult) {
     if (!backendUrl) return;
-    setSaving(true);
+    setSaving(result.model);
     try {
       const audioResp = await fetch(`${backendUrl}/audio/${result.audio_file}`);
       const blob = await audioResp.blob();
@@ -188,6 +188,7 @@ export default function GeneratePage() {
       const { data: urlData } = supabase.storage.from("dpo-songs").getPublicUrl(uploadData.path);
 
       const { error: insertErr } = await supabase.from("dpo-songs").insert({
+        title: "Untitled",
         prompt,
         lyrics,
         tags: result.tags,
@@ -198,11 +199,11 @@ export default function GeneratePage() {
 
       if (insertErr) throw insertErr;
 
-      setSaved(true);
+      setSavedModels((prev) => new Set(prev).add(result.model));
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Failed to save");
     } finally {
-      setSaving(false);
+      setSaving(null);
     }
   }
 
@@ -413,15 +414,13 @@ export default function GeneratePage() {
                       <>
                         <audio controls src={`${backendUrl}/audio/${result.audio_file}`} className="w-full" />
                         <p className="text-xs text-zinc-600 font-mono">{result.tags}</p>
-                        {model === "dpo" && (
-                          <button
-                            onClick={() => saveToLibrary(result)}
-                            disabled={saving || saved}
-                            className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
-                          >
-                            {saved ? "✓ Saved to Library" : saving ? "Saving..." : "Save to My Library →"}
-                          </button>
-                        )}
+                        <button
+                          onClick={() => saveToLibrary(result)}
+                          disabled={saving !== null || savedModels.has(model)}
+                          className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
+                        >
+                          {savedModels.has(model) ? "Saved" : saving === model ? "Saving..." : "Save to My Library"}
+                        </button>
                       </>
                     ) : status === "error" ? (
                       <p className="text-xs text-red-400">Generation failed</p>
@@ -449,15 +448,13 @@ export default function GeneratePage() {
                 <>
                   <audio controls src={`${backendUrl}/audio/${singleResult.audio_file}`} className="w-full" />
                   <p className="text-xs text-zinc-600 font-mono">{singleResult.tags}</p>
-                  {selectedModel === "dpo" && (
-                    <button
-                      onClick={() => saveToLibrary(singleResult)}
-                      disabled={saving || saved}
-                      className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
-                    >
-                      {saved ? "✓ Saved to Library" : saving ? "Saving..." : "Save to My Library →"}
-                    </button>
-                  )}
+                  <button
+                    onClick={() => saveToLibrary(singleResult)}
+                    disabled={saving !== null || savedModels.has(selectedModel)}
+                    className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
+                  >
+                    {savedModels.has(selectedModel) ? "Saved" : saving === selectedModel ? "Saving..." : "Save to My Library"}
+                  </button>
                 </>
               ) : singleStatus === "error" ? (
                 <p className="text-xs text-red-400">Generation failed</p>
