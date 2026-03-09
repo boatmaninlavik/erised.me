@@ -67,10 +67,23 @@ export default function GeneratePage() {
       .single();
 
     const url = data?.value?.trim();
-    if (url) {
-      setBackendUrl(url);
-      setGpuStatus("online");
-    } else {
+    if (!url) {
+      setBackendUrl(null);
+      setGpuStatus("offline");
+      return;
+    }
+
+    // Verify the server is actually reachable
+    try {
+      const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
+      if (resp.ok) {
+        setBackendUrl(url);
+        setGpuStatus("online");
+      } else {
+        setBackendUrl(null);
+        setGpuStatus("offline");
+      }
+    } catch {
       setBackendUrl(null);
       setGpuStatus("offline");
     }

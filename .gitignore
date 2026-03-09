@@ -21,6 +21,10 @@ outputs/
 *.mp3
 *.flac
 
+# Node
+node_modules/
+package-lock.json
+
 # Environment
 .env
 *.env
