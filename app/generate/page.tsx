@@ -322,7 +322,7 @@ export default function GeneratePage() {
                   disabled={randomizingPrompt}
                   className="text-xs text-zinc-500 hover:text-white transition-colors disabled:opacity-40"
                 >
-                  {randomizingPrompt ? "Generating..." : "Randomize"}
+                  {randomizingPrompt ? "Generating..." : "get random prompt"}
                 </button>
               </div>
               <textarea
@@ -344,7 +344,7 @@ export default function GeneratePage() {
                   disabled={randomizingLyrics}
                   className="text-xs text-zinc-500 hover:text-white transition-colors disabled:opacity-40"
                 >
-                  {randomizingLyrics ? "Generating..." : "Randomize"}
+                  {randomizingLyrics ? "Generating..." : "get random lyrics"}
                 </button>
               </div>
               <textarea
