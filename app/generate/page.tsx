@@ -58,6 +58,8 @@ export default function GeneratePage() {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [randomizingPrompt, setRandomizingPrompt] = useState(false);
+  const [randomizingLyrics, setRandomizingLyrics] = useState(false);
 
   const loadBackendUrl = useCallback(async () => {
     const { data } = await supabase
@@ -202,6 +204,26 @@ export default function GeneratePage() {
     }
   }
 
+  async function randomize(type: "prompt" | "lyrics") {
+    const setLoading = type === "prompt" ? setRandomizingPrompt : setRandomizingLyrics;
+    const setValue = type === "prompt" ? setPrompt : setLyrics;
+    setLoading(true);
+    try {
+      const resp = await fetch("/api/generate-random", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type, context: type === "lyrics" ? prompt : undefined }),
+      });
+      const data = await resp.json();
+      if (data.text) setValue(data.text);
+      else if (data.error) setError(data.error);
+    } catch {
+      setError("Failed to generate random " + type);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   const isGenerating =
     origStatus === "pending" || origStatus === "running" ||
     dpoStatus === "pending" || dpoStatus === "running" ||
@@ -289,9 +311,18 @@ export default function GeneratePage() {
             )}
 
             <div>
-              <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
-                Musical Prompt
-              </label>
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs text-zinc-400 font-medium tracking-wide uppercase">
+                  Musical Prompt
+                </label>
+                <button
+                  onClick={() => randomize("prompt")}
+                  disabled={randomizingPrompt}
+                  className="text-xs text-zinc-500 hover:text-white transition-colors disabled:opacity-40"
+                >
+                  {randomizingPrompt ? "Generating..." : "Randomize"}
+                </button>
+              </div>
               <textarea
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
@@ -302,9 +333,18 @@ export default function GeneratePage() {
             </div>
 
             <div>
-              <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
-                Lyrics
-              </label>
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs text-zinc-400 font-medium tracking-wide uppercase">
+                  Lyrics
+                </label>
+                <button
+                  onClick={() => randomize("lyrics")}
+                  disabled={randomizingLyrics}
+                  className="text-xs text-zinc-500 hover:text-white transition-colors disabled:opacity-40"
+                >
+                  {randomizingLyrics ? "Generating..." : "Randomize"}
+                </button>
+              </div>
               <textarea
                 value={lyrics}
                 onChange={(e) => setLyrics(e.target.value)}
