@@ -83,6 +83,11 @@ class PreferenceStore:
         ).fetchall()
         return [PreferencePair(*r) for r in rows]
 
+    def delete_preference(self, pair_id: str):
+        self._conn.execute("DELETE FROM preferences WHERE pair_id = ?", (pair_id,))
+        self._conn.commit()
+        logger.info("Deleted preference: pair=%s", pair_id)
+
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM preferences").fetchone()[0]
 
