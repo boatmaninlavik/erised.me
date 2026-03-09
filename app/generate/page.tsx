@@ -121,19 +121,26 @@ export default function GeneratePage() {
       const dpoJob = await dpoResp.json();
       setDpoStatus("running");
 
-      const [origRes, dpoRes] = await Promise.all([
-        pollJob(backendUrl, origJob.job_id),
-        pollJob(backendUrl, dpoJob.job_id),
-      ]);
+      // Show each result as soon as it's ready (original first so user can listen while DPO generates)
+      const origPromise = pollJob(backendUrl, origJob.job_id).then((res) => {
+        setOrigResult(res);
+        setOrigStatus("done");
+      }).catch((e) => {
+        setOrigStatus("error");
+        throw e;
+      });
 
-      setOrigResult(origRes);
-      setDpoResult(dpoRes);
-      setOrigStatus("done");
-      setDpoStatus("done");
+      const dpoPromise = pollJob(backendUrl, dpoJob.job_id).then((res) => {
+        setDpoResult(res);
+        setDpoStatus("done");
+      }).catch((e) => {
+        setDpoStatus("error");
+        throw e;
+      });
+
+      await Promise.all([origPromise, dpoPromise]);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Generation failed");
-      setOrigStatus("error");
-      setDpoStatus("error");
     }
   }
 
