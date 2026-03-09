@@ -187,7 +187,7 @@ export default function GeneratePage() {
 
       const { data: urlData } = supabase.storage.from("dpo-songs").getPublicUrl(uploadData.path);
 
-      await supabase.from("dpo-songs").insert({
+      const { error: insertErr } = await supabase.from("dpo-songs").insert({
         prompt,
         lyrics,
         tags: result.tags,
@@ -195,6 +195,8 @@ export default function GeneratePage() {
         num_frames: result.num_frames,
         model: result.model,
       });
+
+      if (insertErr) throw insertErr;
 
       setSaved(true);
     } catch (e: unknown) {

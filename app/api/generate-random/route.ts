@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-2.5-pro";
+const MODEL = "gemini-2.5-flash";
 
 const PROMPT_SYSTEM = `You are a world-class music producer and A&R executive with encyclopedic knowledge of music across all genres, eras, and cultures. Your job is to come up with a vivid musical description for a song that could be a genuine hit.
 
@@ -61,37 +61,52 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid type. Use 'prompt' or 'lyrics'." }, { status: 400 });
   }
 
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI_KEY}`;
+  const payload = JSON.stringify({
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ parts: [{ text: userMessage }] }],
+    generationConfig: { temperature: 1.2, maxOutputTokens: 2048 },
+  });
+
   try {
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI_KEY}`,
-      {
+    let lastStatus = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const resp = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents: [{ parts: [{ text: userMessage }] }],
-          generationConfig: { temperature: 1.2, maxOutputTokens: 2048 },
-        }),
+        body: payload,
+      });
+
+      lastStatus = resp.status;
+
+      if (resp.status === 503 || resp.status === 429) {
+        await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+        continue;
       }
+
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}));
+        console.error("Gemini API error:", resp.status, errData);
+        return NextResponse.json(
+          { error: `Gemini API error: ${resp.status}` },
+          { status: 502 }
+        );
+      }
+
+      const data = await resp.json();
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (!text) {
+        return NextResponse.json({ error: "Empty response from Gemini" }, { status: 502 });
+      }
+
+      return NextResponse.json({ text: text.trim() });
+    }
+
+    return NextResponse.json(
+      { error: `Gemini API overloaded (${lastStatus}). Try again in a moment.` },
+      { status: 502 }
     );
-
-    if (!resp.ok) {
-      const errData = await resp.json().catch(() => ({}));
-      console.error("Gemini API error:", resp.status, errData);
-      return NextResponse.json(
-        { error: `Gemini API error: ${resp.status}` },
-        { status: 502 }
-      );
-    }
-
-    const data = await resp.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!text) {
-      return NextResponse.json({ error: "Empty response from Gemini" }, { status: 502 });
-    }
-
-    return NextResponse.json({ text: text.trim() });
   } catch (e: unknown) {
     console.error("generate-random error:", e);
     return NextResponse.json(
