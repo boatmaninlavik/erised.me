@@ -682,6 +682,8 @@ def main():
             "pending": gen_stats["pending"],
             "completed": gen_stats["completed"],
             "generating": gen_stats["generating"],
+            "ready": len(rate_ready_pairs),
+            "rated": rate_stats["rated"],
         }
 
     @app.get("/api/info")
@@ -690,6 +692,120 @@ def main():
             "original_path": original_model_path,
             "dpo_path": args.dpo_path,
         }
+
+    # ── Rating endpoints ───────────────────────────────────────────
+    # For each queued pair, we generate original + DPO Guided from the
+    # same prompt/lyrics, then let the user A/B compare and vote.
+    # Pairs are stored in rate_ready_pairs once both generations finish.
+
+    rate_ready_pairs = []  # completed pairs waiting to be rated
+    rate_stats = {"rated": 0}
+
+    class QueueRequest(BaseModel):
+        prompt: str
+        lyrics: str
+        max_sec: int = 60
+        count: int = 1
+
+    class RateVote(BaseModel):
+        pair_id: str
+        choice: str  # "a" or "b"
+
+    @app.post("/api/queue")
+    def queue_pairs(req: QueueRequest):
+        """Queue N pairs for A/B rating. Each pair = original + DPO Guided."""
+        if not req.prompt.strip() or not req.lyrics.strip():
+            raise HTTPException(400, "Prompt and lyrics required")
+
+        for _ in range(min(req.count, 10)):
+            pair_id = str(uuid.uuid4())[:8]
+            orig_job_id = str(uuid.uuid4())[:8]
+            dpo_job_id = str(uuid.uuid4())[:8]
+
+            jobs[orig_job_id] = {"status": "pending"}
+            jobs[dpo_job_id] = {"status": "pending"}
+            gen_stats["pending"] += 2
+
+            # Track this pair so we can assemble it when both jobs finish
+            rate_pending_pairs[pair_id] = {
+                "prompt": req.prompt,
+                "orig_job": orig_job_id,
+                "dpo_job": dpo_job_id,
+                "orig_result": None,
+                "dpo_result": None,
+            }
+
+            job_queue.put((orig_job_id, req.prompt, req.lyrics, req.max_sec, "original", 0.0))
+            job_queue.put((dpo_job_id, req.prompt, req.lyrics, req.max_sec, "dpo", 3.0))
+
+        return {"queued": min(req.count, 10)}
+
+    rate_pending_pairs = {}  # pair_id -> tracking dict
+
+    @app.get("/api/next")
+    def next_pair():
+        """Get the next ready pair for rating."""
+        # Check if any pending pairs have both results ready
+        for pair_id, info in list(rate_pending_pairs.items()):
+            orig = jobs.get(info["orig_job"], {})
+            dpo = jobs.get(info["dpo_job"], {})
+            if orig.get("status") == "done" and dpo.get("status") == "done":
+                # Both ready — move to ready queue
+                import random
+                # Randomize which is A vs B so user can't guess
+                if random.random() < 0.5:
+                    a_result, b_result = orig["result"], dpo["result"]
+                    a_model, b_model = "original", "dpo"
+                else:
+                    a_result, b_result = dpo["result"], orig["result"]
+                    a_model, b_model = "dpo", "original"
+
+                rate_ready_pairs.append({
+                    "pair_id": pair_id,
+                    "prompt": info["prompt"],
+                    "a_audio": a_result["audio_file"],
+                    "b_audio": b_result["audio_file"],
+                    "tags_a": a_result["tags"],
+                    "tags_b": b_result["tags"],
+                    "a_model": a_model,
+                    "b_model": b_model,
+                })
+                del rate_pending_pairs[pair_id]
+
+        if rate_ready_pairs:
+            pair = rate_ready_pairs[0]
+            return {"status": "ready", "pair": pair}
+        elif rate_pending_pairs or gen_stats["generating"]:
+            return {"status": "generating"}
+        else:
+            return {"status": "empty"}
+
+    @app.post("/api/rate")
+    def rate_pair(req: RateVote):
+        """Record a preference vote for a pair."""
+        if req.choice not in ("a", "b"):
+            raise HTTPException(400, "Choice must be 'a' or 'b'")
+
+        # Find and remove the pair from ready list
+        pair = None
+        for i, p in enumerate(rate_ready_pairs):
+            if p["pair_id"] == req.pair_id:
+                pair = rate_ready_pairs.pop(i)
+                break
+
+        if pair is None:
+            raise HTTPException(404, "Pair not found")
+
+        winner_model = pair["a_model"] if req.choice == "a" else pair["b_model"]
+        loser_model = pair["b_model"] if req.choice == "a" else pair["a_model"]
+        rate_stats["rated"] += 1
+
+        logger.info(
+            "Rating: pair=%s choice=%s winner=%s loser=%s prompt=%s",
+            req.pair_id, req.choice, winner_model, loser_model, pair["prompt"][:60],
+        )
+
+        return {"status": "recorded", "count": rate_stats["rated"]}
 
     logger.info("Starting server on port %d", args.port)
     logger.info("Original: %s", original_model_path)
