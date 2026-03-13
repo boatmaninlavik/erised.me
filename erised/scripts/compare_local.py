@@ -636,6 +636,11 @@ def main():
     # in a thread pool. This prevents GIL contention with the generation thread
     # from blocking responses — the main cause of 502s through ngrok.
 
+    @app.get("/health")
+    def health():
+        """Health check endpoint for the Vercel frontend to detect GPU status."""
+        return {"status": "ok", "model": "dpo_guided"}
+
     @app.get("/", response_class=HTMLResponse)
     def index():
         return HTML_PAGE

@@ -154,7 +154,11 @@ class DPOGuider:
         )
 
     def _setup_dpo_caches(self, bs_size: int):
-        """Set up KV caches for the DPO branch layers."""
+        """Set up KV caches for the DPO branch layers.
+
+        Must pass encoder_max_seq_len and decoder_max_seq_len to match
+        how torchtune's TransformerDecoder.setup_caches() calls each layer.
+        """
         for layer in self.dpo_top_layers:
             attn = getattr(layer, "attn", None)
             if attn is not None:
@@ -162,8 +166,18 @@ class DPOGuider:
                     attn.kv_cache = None
                     attn.cache_enabled = False
 
-        for layer in self.dpo_top_layers:
-            layer.setup_caches(bs_size, self.dtype)
+        # Get the cache seq len from the backbone (set during model.setup_caches)
+        backbone = self.orig_model.backbone
+        max_seq = getattr(backbone, "decoder_max_cache_seq_len",
+                          getattr(backbone, "max_seq_len", 4096))
+
+        with torch.device(self.device):
+            for layer in self.dpo_top_layers:
+                layer.setup_caches(
+                    bs_size, self.dtype,
+                    encoder_max_seq_len=max_seq,
+                    decoder_max_seq_len=max_seq,
+                )
 
     def _reset_dpo_caches(self):
         """Reset KV caches on DPO branch layers."""
@@ -195,7 +209,7 @@ class DPOGuider:
         b, s, _ = tokens.size()
 
         # ── Causal mask ──
-        backbone_mask = model.backbone_causal_mask[None, None, input_pos.squeeze()]
+        backbone_mask = model.backbone_causal_mask[input_pos, :]
 
         # ── Unconditional mask for CFG ──
         uncond_mask = None
@@ -279,9 +293,7 @@ class DPOGuider:
         curr_h = curr_h.to(embeds.dtype)
 
         for i in range(1, model.config.audio_num_codebooks):
-            curr_decoder_mask = model.decoder_causal_mask[
-                None, None, curr_pos.squeeze()
-            ]
+            curr_decoder_mask = model.decoder_causal_mask[curr_pos, :]
             decoder_h = model.decoder(
                 model.projection(curr_h),
                 input_pos=curr_pos,
