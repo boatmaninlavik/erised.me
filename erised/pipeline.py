@@ -18,6 +18,7 @@ import torchaudio
 from heartlib import HeartMuLaGenPipeline
 from .config import ErisedConfig
 from .prompt_to_tags import PromptToTags
+from .guided_generate import DPOGuider
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,100 @@ class ErisedPipeline:
     def get_model(self):
         """Access the underlying HeartMuLa model (for DPO training)."""
         return self.pipe.mula
+
+    # ── DPO Guided Generation ─────────────────────────────────────────
+    # Instead of merging DPO weights into the model (which causes noise
+    # accumulation during autoregressive generation), we apply DPO
+    # preferences at the logit level:
+    #
+    #   logits_final = logits_orig + scale * (logits_dpo - logits_orig)
+    #
+    # The original model drives generation (stays internally consistent),
+    # while the DPO model's learned preferences steer token selection.
+    # Only the top N backbone layers (trained by DPO) are branched;
+    # the bottom shared layers run once for ~7% overhead instead of 2x.
+
+    def init_guided(
+        self,
+        dpo_checkpoint_path: str,
+        n_dpo_layers: int = 2,
+    ):
+        """
+        Initialize the DPO Guided system. Call this once after pipeline init.
+
+        Creates a DPOGuider that holds only the top N DPO-trained layers,
+        sharing the bottom layers with the original model to minimize VRAM.
+
+        Args:
+            dpo_checkpoint_path: Path to the DPO checkpoint (e.g. dpo_best).
+            n_dpo_layers: Number of top backbone layers that were DPO-trained.
+        """
+        self.guider = DPOGuider(
+            orig_model=self.pipe.mula,
+            dpo_checkpoint_path=dpo_checkpoint_path,
+            n_dpo_layers=n_dpo_layers,
+        )
+        logger.info("DPO Guided system initialized from %s", dpo_checkpoint_path)
+
+    def generate_guided(
+        self,
+        prompt: str,
+        lyrics: str,
+        *,
+        max_audio_length_ms: Optional[int] = None,
+        temperature: Optional[float] = None,
+        topk: Optional[int] = None,
+        cfg_scale: Optional[float] = None,
+        dpo_scale: float = 1.0,
+    ) -> GenerationResult:
+        """
+        Generate a song using DPO Guided inference.
+
+        Instead of running a merged DPO model, this uses the original model
+        for internal consistency and applies DPO preferences at the logit
+        level. The dpo_scale parameter controls guidance strength:
+          - 0.0 = pure original model (no DPO influence)
+          - 1.0 = full DPO guidance (default)
+          - >1.0 = amplified DPO preferences
+
+        Requires init_guided() to have been called first.
+        """
+        if not hasattr(self, "guider") or self.guider is None:
+            raise RuntimeError(
+                "DPO Guided not initialized. Call pipeline.init_guided(path) first."
+            )
+
+        tags = self.tag_converter.convert(prompt)
+        logger.info("Prompt → tags: %s", tags)
+
+        gen_id = uuid.uuid4().hex[:12]
+        audio_path = os.path.join(self.config.output_dir, f"{gen_id}.mp3")
+        tokens_path = os.path.join(self.config.output_dir, f"{gen_id}_tokens.pt")
+
+        frames = self.guider.generate(
+            pipeline=self,
+            tags=tags,
+            lyrics=lyrics,
+            save_path=audio_path,
+            max_audio_length_ms=max_audio_length_ms or self.config.max_audio_length_ms,
+            temperature=temperature or self.config.temperature,
+            topk=topk or self.config.topk,
+            cfg_scale=cfg_scale or self.config.cfg_scale,
+            dpo_scale=dpo_scale,
+        )
+
+        torch.save(frames.cpu(), tokens_path)
+        logger.info("DPO Guided: saved tokens (%d frames) to %s", frames.shape[-1], tokens_path)
+
+        return GenerationResult(
+            generation_id=gen_id,
+            audio_path=audio_path,
+            tokens_path=tokens_path,
+            prompt=prompt,
+            lyrics=lyrics,
+            tags_used=tags,
+            num_frames=frames.shape[-1],
+        )
 
     def get_codec(self):
         """Access the underlying HeartCodec (for audio decode during eval)."""

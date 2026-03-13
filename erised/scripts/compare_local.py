@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-FastAPI-based A/B comparison UI for DPO-tuned vs original Erised.
+FastAPI-based A/B comparison UI for DPO Guided vs original Erised.
+
+DPO Guided approach: instead of merging DPO weights (which causes noise
+accumulation), we apply DPO preferences at the logit level:
+    logits_final = logits_orig + scale * (logits_dpo - logits_orig)
+
+The bottom 26 shared backbone layers run once; only the top 2 DPO-trained
+layers are branched, giving ~7% overhead instead of 2x slowdown.
 
 Uses a job queue + polling pattern so ngrok doesn't timeout on long generations.
 Submit a job -> returns job_id instantly -> poll /api/job/{id} until done.
 
 Usage (on RunPod):
     python3 -u -m erised.scripts.compare_local \
-        --dpo-path /workspace/dpo_checkpoints/dpo_best
+        --dpo-path /workspace/dpo_checkpoints_v8/dpo_best
 
     # Then in another terminal: ngrok http 7860
 """
@@ -173,7 +180,7 @@ input[type=range] { accent-color: #38bdf8; width: 100%; }
 <body>
 
 <h1>Erised</h1>
-<p class="subtitle">Compare <b>original</b> vs <b>DPO-tuned</b> generations. You can leave the page while generating.</p>
+<p class="subtitle">Compare <b>original</b> vs <b>DPO Guided</b> generations. You can leave the page while generating.</p>
 
 <!-- Status bar -->
 <div class="status-bar">
@@ -226,7 +233,7 @@ input[type=range] { accent-color: #38bdf8; width: 100%; }
         </div>
 
         <div class="audio-card" id="card-dpo">
-            <h3>DPO-Tuned Model</h3>
+            <h3>DPO Guided</h3>
             <audio id="audio-dpo" controls preload="auto"></audio>
             <div class="speed-btns" data-for="audio-dpo">
                 <button class="speed-btn" data-speed="0.5">0.5x</button>
@@ -250,7 +257,7 @@ input[type=range] { accent-color: #38bdf8; width: 100%; }
         <label>Model</label>
         <div class="model-select">
             <div class="model-opt" data-model="original" onclick="selectModel('original')">Original</div>
-            <div class="model-opt selected" data-model="dpo" onclick="selectModel('dpo')">DPO-tuned</div>
+            <div class="model-opt selected" data-model="dpo" onclick="selectModel('dpo')">DPO Guided</div>
         </div>
         <div style="margin-bottom: 16px;">
             <label for="prompt-single">Musical Prompt</label>
@@ -272,7 +279,7 @@ input[type=range] { accent-color: #38bdf8; width: 100%; }
 
     <div id="single-result">
         <div class="audio-card">
-            <h3 id="single-model-label">DPO-Tuned Model</h3>
+            <h3 id="single-model-label">DPO Guided</h3>
             <audio id="audio-single" controls preload="auto"></audio>
             <div class="speed-btns" data-for="audio-single">
                 <button class="speed-btn" data-speed="0.5">0.5x</button>
@@ -416,7 +423,7 @@ async function generateBoth() {
             body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: 'dpo' }),
         });
         const dpoJob = await dpoSubmit.json();
-        document.getElementById('ab-progress-text').textContent = 'Generating DPO-tuned model output...';
+        document.getElementById('ab-progress-text').textContent = 'Generating DPO Guided model output...';
         const dpoResult = await pollJob(dpoJob.job_id);
 
         const audioDpo = document.getElementById('audio-dpo');
@@ -448,7 +455,7 @@ async function generateSingle() {
     document.getElementById('single-result').style.display = 'none';
     document.getElementById('single-progress').style.display = 'block';
     document.getElementById('single-progress-text').textContent =
-        'Generating with ' + (selectedModel === 'dpo' ? 'DPO-tuned' : 'original') + ' model...';
+        'Generating with ' + (selectedModel === 'dpo' ? 'DPO Guided' : 'original') + ' model...';
 
     try {
         const submitResp = await fetchRetry('/api/submit', {
@@ -461,7 +468,7 @@ async function generateSingle() {
 
         document.getElementById('single-result').style.display = 'block';
         document.getElementById('single-model-label').textContent =
-            (selectedModel === 'dpo' ? 'DPO-Tuned' : 'Original') + ' Model';
+            (selectedModel === 'dpo' ? 'DPO Guided' : 'Original') + ' Model';
         const audio = document.getElementById('audio-single');
         audio.src = '/audio/' + result.audio_file;
         audio.load();
@@ -494,7 +501,7 @@ pollStatus();
 fetch('/api/info').then(r => r.json()).then(data => {
     document.getElementById('paths-info').innerHTML =
         '<b>Original:</b> <code>' + data.original_path + '</code> &nbsp; ' +
-        '<b>DPO:</b> <code>' + data.dpo_path + '</code>';
+        '<b>DPO Guided:</b> <code>' + data.dpo_path + '</code>';
 });
 </script>
 </body>
@@ -504,7 +511,7 @@ fetch('/api/info').then(r => r.json()).then(data => {
 def main():
     parser = argparse.ArgumentParser(description="FastAPI A/B comparison UI for Erised DPO")
     parser.add_argument("--original-path", type=str, default=None)
-    parser.add_argument("--dpo-path", type=str, default="/workspace/dpo_checkpoints/dpo_best")
+    parser.add_argument("--dpo-path", type=str, default="/workspace/dpo_checkpoints_v8/dpo_best")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--max-length", type=int, default=60)
     args = parser.parse_args()
@@ -528,38 +535,64 @@ def main():
     logger.info("Pipeline loaded on %s", device)
 
     gen_lock = threading.Lock()
-    current_weights = {"path": original_model_path}
     gen_stats = {"pending": 0, "completed": 0, "generating": False}
+
+    # ── DPO Guided: instead of swapping weights, we initialize the DPOGuider
+    # which holds only the top 2 DPO-trained layers alongside the original model.
+    # The bottom 26 shared layers run once; the top 2 branch for orig vs DPO logits.
+    # logits_final = logits_orig + scale * (logits_dpo - logits_orig)
+    logger.info("Initializing DPO Guided system from %s ...", args.dpo_path)
+    pipeline.init_guided(dpo_checkpoint_path=args.dpo_path, n_dpo_layers=2)
+    logger.info("DPO Guided system ready.")
+
+    # ── Old weight-swapping approach (kept for reference) ──────────────
+    # current_weights = {"path": original_model_path}
+    #
+    # def swap_weights(target_path):
+    #     if current_weights["path"] == target_path:
+    #         return
+    #     logger.info("Swapping weights -> %s", target_path)
+    #     load_safetensors_sharded(pipeline.pipe.mula, target_path, device=device)
+    #     current_weights["path"] = target_path
+    #     torch.cuda.empty_cache()
+    # ── End old weight-swapping approach ───────────────────────────────
 
     # Job store: job_id -> {"status": "pending"|"running"|"done"|"error", "result": ..., "error": ...}
     jobs = {}
     job_queue = queue.Queue()
 
-    def swap_weights(target_path):
-        if current_weights["path"] == target_path:
-            return
-        logger.info("Swapping weights -> %s", target_path)
-        load_safetensors_sharded(pipeline.pipe.mula, target_path, device=device)
-        current_weights["path"] = target_path
-        torch.cuda.empty_cache()
-
     def generation_worker():
-        """Background thread that processes generation jobs one at a time."""
+        """Background thread that processes generation jobs one at a time.
+
+        DPO Guided approach: for "original" model, we generate normally.
+        For "dpo" model, we use the DPOGuider which applies DPO preferences
+        at the logit level without swapping any weights.
+        """
         while True:
             job_id, prompt, lyrics, max_sec, model_name = job_queue.get()
             jobs[job_id]["status"] = "running"
             gen_stats["generating"] = True
 
             try:
-                target_path = args.dpo_path if model_name == "dpo" else original_model_path
                 with gen_lock:
-                    swap_weights(target_path)
                     t0 = time.time()
-                    result = pipeline.generate(
-                        prompt=prompt,
-                        lyrics=lyrics,
-                        max_audio_length_ms=int(max_sec * 1000),
-                    )
+
+                    if model_name == "dpo":
+                        # DPO Guided: use logit-level guidance (no weight swap needed)
+                        result = pipeline.generate_guided(
+                            prompt=prompt,
+                            lyrics=lyrics,
+                            max_audio_length_ms=int(max_sec * 1000),
+                            dpo_scale=1.0,
+                        )
+                    else:
+                        # Original model: standard generation
+                        result = pipeline.generate(
+                            prompt=prompt,
+                            lyrics=lyrics,
+                            max_audio_length_ms=int(max_sec * 1000),
+                        )
+
                     elapsed = time.time() - t0
                     logger.info("[%s] Generated %s in %.1fs (%d frames)",
                                 model_name, result.audio_path, elapsed, result.num_frames)
@@ -654,7 +687,7 @@ def main():
 
     logger.info("Starting server on port %d", args.port)
     logger.info("Original: %s", original_model_path)
-    logger.info("DPO: %s", args.dpo_path)
+    logger.info("DPO Guided: %s", args.dpo_path)
     logger.info("Access at http://0.0.0.0:%d or via ngrok", args.port)
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")
 

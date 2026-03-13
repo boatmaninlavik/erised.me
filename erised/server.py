@@ -41,6 +41,16 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing Erised pipeline...")
     _pipeline = ErisedPipeline(config)
     _pref_store = PreferenceStore(config.dpo_db_path)
+
+    # DPO Guided: if a DPO checkpoint path is set, initialize the guider
+    # so the /generate-guided endpoint is available
+    dpo_path = os.environ.get("ERISED_DPO_PATH")
+    if dpo_path and os.path.isdir(dpo_path):
+        n_layers = int(os.environ.get("ERISED_DPO_LAYERS", "2"))
+        logger.info("Initializing DPO Guided from %s (%d layers)...", dpo_path, n_layers)
+        _pipeline.init_guided(dpo_checkpoint_path=dpo_path, n_dpo_layers=n_layers)
+        logger.info("DPO Guided ready.")
+
     logger.info("Erised ready on %s:%d", config.host, config.port)
     yield
     logger.info("Shutting down Erised.")
@@ -65,6 +75,7 @@ class GenerateRequest(BaseModel):
     temperature: Optional[float] = None
     topk: Optional[int] = None
     cfg_scale: Optional[float] = None
+    dpo_scale: Optional[float] = None  # DPO Guided: set to enable logit-level guidance
 
 
 class GenerateResponse(BaseModel):
@@ -117,6 +128,43 @@ async def generate(req: GenerateRequest):
         temperature=req.temperature,
         topk=req.topk,
         cfg_scale=req.cfg_scale,
+    )
+
+    filename = os.path.basename(result.audio_path)
+    return GenerateResponse(
+        generation_id=result.generation_id,
+        audio_url=f"/outputs/{filename}",
+        tags_used=result.tags_used,
+        num_frames=result.num_frames,
+    )
+
+
+# ── DPO Guided endpoint ────────────────────────────────────────────
+# Uses logit-level DPO guidance instead of merged weights.
+# The original model drives generation (stays internally consistent),
+# while the DPO model's learned preferences steer token selection:
+#   logits_final = logits_orig + scale * (logits_dpo - logits_orig)
+@app.post("/generate-guided", response_model=GenerateResponse)
+async def generate_guided(req: GenerateRequest):
+    """Generate a song using DPO Guided inference.
+
+    Requires the pipeline to have been initialized with init_guided().
+    The dpo_scale parameter controls guidance strength (default 1.0).
+    """
+    if _pipeline is None:
+        raise HTTPException(503, "Pipeline not initialized")
+
+    if not hasattr(_pipeline, "guider") or _pipeline.guider is None:
+        raise HTTPException(503, "DPO Guided not initialized. Set ERISED_DPO_PATH env var.")
+
+    result = _pipeline.generate_guided(
+        prompt=req.prompt,
+        lyrics=req.lyrics,
+        max_audio_length_ms=req.max_audio_length_ms,
+        temperature=req.temperature,
+        topk=req.topk,
+        cfg_scale=req.cfg_scale,
+        dpo_scale=req.dpo_scale or 1.0,
     )
 
     filename = os.path.basename(result.audio_path)
