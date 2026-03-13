@@ -161,7 +161,7 @@ export default function LibraryPage() {
                     {song.tags && (
                       <div>
                         <p className="text-[10px] text-zinc-500 font-medium tracking-wide uppercase mb-1">Tags</p>
-                        <p className="text-xs text-zinc-600 font-mono">{song.tags}</p>
+                        <p className="text-xs text-zinc-600 font-mono break-all">{song.tags}</p>
                       </div>
                     )}
                     {song.lyrics && (

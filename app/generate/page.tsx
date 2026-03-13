@@ -432,7 +432,7 @@ export default function GeneratePage() {
                     {result && backendUrl ? (
                       <>
                         <audio controls src={`${backendUrl}/audio/${result.audio_file}`} className="w-full" />
-                        <p className="text-xs text-zinc-600 font-mono">{result.tags}</p>
+                        <p className="text-xs text-zinc-600 font-mono break-all">{result.tags}</p>
                         <button
                           onClick={() => saveToLibrary(result)}
                           disabled={saving !== null || savedModels.has(model)}
@@ -466,7 +466,7 @@ export default function GeneratePage() {
               {singleResult && backendUrl ? (
                 <>
                   <audio controls src={`${backendUrl}/audio/${singleResult.audio_file}`} className="w-full" />
-                  <p className="text-xs text-zinc-600 font-mono">{singleResult.tags}</p>
+                  <p className="text-xs text-zinc-600 font-mono break-all">{singleResult.tags}</p>
                   <button
                     onClick={() => saveToLibrary(singleResult)}
                     disabled={saving !== null || savedModels.has(selectedModel)}

@@ -308,7 +308,7 @@ export default function RatePage() {
                     src={`${backendUrl}/audio/${currentPair[`${side}_audio` as "a_audio" | "b_audio"]}`}
                     className="w-full"
                   />
-                  <p className="text-xs text-zinc-600 font-mono">
+                  <p className="text-xs text-zinc-600 font-mono break-all">
                     {currentPair[`tags_${side}` as "tags_a" | "tags_b"]}
                   </p>
                   <button
