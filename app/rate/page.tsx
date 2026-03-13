@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 
@@ -8,9 +8,11 @@ interface Pair {
   pair_id: string;
   prompt: string;
   a_audio: string;
-  b_audio: string;
+  b_audio?: string;
   tags_a: string;
-  tags_b: string;
+  tags_b?: string;
+  a_ready?: boolean;
+  b_ready?: boolean;
 }
 
 interface ServerStatus {
@@ -31,10 +33,13 @@ export default function RatePage() {
   const [currentPair, setCurrentPair] = useState<Pair | null>(null);
   const [serverStatus, setServerStatus] = useState<ServerStatus>({ pending: 0, ready: 0, generating: false, rated: 0 });
   const [voted, setVoted] = useState<"a" | "b" | null>(null);
-  const [pairState, setPairState] = useState<"none" | "loading" | "ready" | "generating">("none");
+  const [pairState, setPairState] = useState<"none" | "loading" | "ready" | "partial" | "generating">("none");
   const [randomizingPrompt, setRandomizingPrompt] = useState(false);
   const [randomizingLyrics, setRandomizingLyrics] = useState(false);
   const [randomError, setRandomError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const pollingPairId = useRef<string | null>(null);
 
   const loadBackendUrl = useCallback(async () => {
     const { data } = await supabase
@@ -50,7 +55,6 @@ export default function RatePage() {
       return;
     }
 
-    // Verify the server is actually reachable
     try {
       const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
       if (resp.ok) {
@@ -79,11 +83,29 @@ export default function RatePage() {
         const resp = await fetch(`${backendUrl}/api/status`);
         const data = await resp.json();
         setServerStatus(data);
-        if (!currentPair && data.ready > 0) fetchNext();
+        if (!currentPair && !pollingPairId.current && data.ready > 0) fetchNext();
       } catch {}
     }, 2000);
     return () => clearInterval(interval);
   }, [backendUrl, currentPair]);
+
+  // Poll for song B when we have a partial pair
+  useEffect(() => {
+    if (!backendUrl || pairState !== "partial" || !pollingPairId.current) return;
+    const pid = pollingPairId.current;
+    const interval = setInterval(async () => {
+      try {
+        const resp = await fetch(`${backendUrl}/api/pair/${pid}`);
+        const data = await resp.json();
+        if (data.status === "ready" && data.pair.b_ready) {
+          setCurrentPair(data.pair);
+          setPairState("ready");
+          pollingPairId.current = null;
+        }
+      } catch {}
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [backendUrl, pairState]);
 
   async function fetchNext() {
     if (!backendUrl) return;
@@ -94,7 +116,15 @@ export default function RatePage() {
       if (data.status === "ready") {
         setCurrentPair(data.pair);
         setVoted(null);
+        setSaved(false);
         setPairState("ready");
+        pollingPairId.current = null;
+      } else if (data.status === "partial") {
+        setCurrentPair(data.pair);
+        setVoted(null);
+        setSaved(false);
+        setPairState("partial");
+        pollingPairId.current = data.pair.pair_id;
       } else if (data.status === "generating") {
         setPairState("generating");
       } else {
@@ -142,7 +172,7 @@ export default function RatePage() {
   }
 
   async function vote(choice: "a" | "b") {
-    if (!backendUrl || !currentPair || voted) return;
+    if (!backendUrl || !currentPair || voted || pairState !== "ready") return;
     setVoted(choice);
     try {
       const resp = await fetch(`${backendUrl}/api/rate`, {
@@ -153,11 +183,57 @@ export default function RatePage() {
       const data = await resp.json();
       setServerStatus((s) => ({ ...s, rated: data.count }));
     } catch {}
-    setTimeout(() => {
-      setCurrentPair(null);
-      fetchNext();
-    }, 400);
+    // Don't auto-advance — let user save winner first if they want
   }
+
+  function goToNext() {
+    setCurrentPair(null);
+    pollingPairId.current = null;
+    setSaved(false);
+    setVoted(null);
+    fetchNext();
+  }
+
+  async function saveWinnerToLibrary() {
+    if (!backendUrl || !currentPair || !voted) return;
+    setSaving(true);
+    try {
+      const winnerAudio = voted === "a" ? currentPair.a_audio : currentPair.b_audio!;
+      const winnerTags = voted === "a" ? currentPair.tags_a : currentPair.tags_b!;
+
+      const audioResp = await fetch(`${backendUrl}/audio/${winnerAudio}`);
+      const blob = await audioResp.blob();
+      const ext = winnerAudio.split(".").pop() || "wav";
+      const filename = `${Date.now()}_rate_winner.${ext}`;
+
+      const { data: uploadData, error: uploadErr } = await supabase.storage
+        .from("dpo-songs")
+        .upload(filename, blob, { contentType: blob.type || "audio/wav", upsert: false });
+
+      if (uploadErr) throw uploadErr;
+
+      const { data: urlData } = supabase.storage.from("dpo-songs").getPublicUrl(uploadData.path);
+
+      const { error: insertErr } = await supabase.from("dpo-songs").insert({
+        title: "Untitled",
+        prompt: currentPair.prompt,
+        lyrics: "",
+        tags: winnerTags,
+        audio_url: urlData.publicUrl,
+        num_frames: null,
+        model: "rate-winner",
+      });
+
+      if (insertErr) throw insertErr;
+      setSaved(true);
+    } catch (e: unknown) {
+      console.error("Save failed:", e);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const bReady = currentPair?.b_ready !== false;
 
   return (
     <div className="min-h-screen bg-black text-white">
@@ -291,39 +367,103 @@ export default function RatePage() {
           </div>
 
           {/* Rating */}
-          {pairState === "ready" && currentPair ? (
+          {(pairState === "ready" || pairState === "partial") && currentPair ? (
             <div className="space-y-4">
-              <p className="text-xs text-zinc-500 text-center">Which sounds better?</p>
+              <p className="text-xs text-zinc-500 text-center">
+                {voted ? "Voted!" : bReady ? "Which sounds better?" : "Listen to A while B generates..."}
+              </p>
               <p className="text-xs text-zinc-600 text-center font-mono">{currentPair.prompt}</p>
-              {(["a", "b"] as const).map((side) => (
-                <div
-                  key={side}
-                  className={`bg-zinc-900 border rounded-2xl p-5 space-y-3 transition-colors ${
-                    voted === side ? "border-white" : "border-zinc-800"
+
+              {/* Option A */}
+              <div
+                className={`bg-zinc-900 border rounded-2xl p-5 space-y-3 transition-colors ${
+                  voted === "a" ? "border-white" : "border-zinc-800"
+                }`}
+              >
+                <h3 className="text-sm font-medium text-zinc-300">Option A</h3>
+                <audio
+                  controls
+                  src={`${backendUrl}/audio/${currentPair.a_audio}`}
+                  className="w-full"
+                />
+                <p className="text-xs text-zinc-600 font-mono">
+                  {currentPair.tags_a}
+                </p>
+                <button
+                  onClick={() => vote("a")}
+                  disabled={!!voted || !bReady}
+                  className={`w-full py-3 rounded-xl text-sm font-medium transition-colors ${
+                    voted === "a"
+                      ? "bg-white text-black"
+                      : !bReady
+                        ? "bg-zinc-800/50 text-zinc-600 cursor-not-allowed"
+                        : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
                   }`}
                 >
-                  <h3 className="text-sm font-medium text-zinc-300">Option {side.toUpperCase()}</h3>
-                  <audio
-                    controls
-                    src={`${backendUrl}/audio/${currentPair[`${side}_audio` as "a_audio" | "b_audio"]}`}
-                    className="w-full"
-                  />
-                  <p className="text-xs text-zinc-600 font-mono break-all">
-                    {currentPair[`tags_${side}` as "tags_a" | "tags_b"]}
-                  </p>
+                  {!bReady ? "Waiting for B..." : voted === "a" ? "Winner" : "A is better"}
+                </button>
+              </div>
+
+              {/* Option B */}
+              <div
+                className={`bg-zinc-900 border rounded-2xl p-5 space-y-3 transition-colors ${
+                  !bReady ? "border-zinc-800/50 opacity-60" :
+                  voted === "b" ? "border-white" : "border-zinc-800"
+                }`}
+              >
+                <h3 className="text-sm font-medium text-zinc-300">Option B</h3>
+                {bReady ? (
+                  <>
+                    <audio
+                      controls
+                      src={`${backendUrl}/audio/${currentPair.b_audio}`}
+                      className="w-full"
+                    />
+                    <p className="text-xs text-zinc-600 font-mono">
+                      {currentPair.tags_b}
+                    </p>
+                    <button
+                      onClick={() => vote("b")}
+                      disabled={!!voted}
+                      className={`w-full py-3 rounded-xl text-sm font-medium transition-colors ${
+                        voted === "b"
+                          ? "bg-white text-black"
+                          : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
+                      }`}
+                    >
+                      {voted === "b" ? "Winner" : "B is better"}
+                    </button>
+                  </>
+                ) : (
+                  <div className="py-8 text-center">
+                    <div className="inline-block w-5 h-5 border-2 border-zinc-600 border-t-zinc-300 rounded-full animate-spin mb-3" />
+                    <p className="text-sm text-zinc-500 animate-pulse">Generating song B...</p>
+                  </div>
+                )}
+              </div>
+
+              {/* Post-vote actions: save winner + next */}
+              {voted && (
+                <div className="flex gap-3 pt-2">
                   <button
-                    onClick={() => vote(side)}
-                    disabled={!!voted}
-                    className={`w-full py-3 rounded-xl text-sm font-medium transition-colors ${
-                      voted === side
-                        ? "bg-white text-black"
-                        : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
+                    onClick={saveWinnerToLibrary}
+                    disabled={saving || saved}
+                    className={`flex-1 py-3 rounded-xl text-sm font-medium transition-colors ${
+                      saved
+                        ? "bg-green-900/30 text-green-400 border border-green-800"
+                        : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 border border-zinc-700"
                     }`}
                   >
-                    {side.toUpperCase()} is better
+                    {saved ? "Saved to Library" : saving ? "Saving..." : "Save Winner to Library"}
+                  </button>
+                  <button
+                    onClick={goToNext}
+                    className="flex-1 py-3 bg-white text-black font-semibold rounded-xl text-sm tracking-tight hover:bg-zinc-100 transition-colors"
+                  >
+                    Next Pair
                   </button>
                 </div>
-              ))}
+              )}
             </div>
           ) : pairState === "generating" ? (
             <div className="text-center py-12 text-zinc-500 animate-pulse text-sm">
