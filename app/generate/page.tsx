@@ -46,6 +46,7 @@ export default function GeneratePage() {
   const [prompt, setPrompt] = useState("");
   const [lyrics, setLyrics] = useState("");
   const [maxSec, setMaxSec] = useState(60);
+  const [dpoScale, setDpoScale] = useState(3.0);
   const [tab, setTab] = useState<"ab" | "single">("ab");
   const [selectedModel, setSelectedModel] = useState<"dpo" | "original">("dpo");
 
@@ -118,7 +119,7 @@ export default function GeneratePage() {
       const dpoResp = await fetchRetry(`${backendUrl}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: "dpo" }),
+        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: "dpo", dpo_scale: dpoScale }),
       });
       const dpoJob = await dpoResp.json();
       setDpoStatus("running");
@@ -157,7 +158,7 @@ export default function GeneratePage() {
       const resp = await fetchRetry(`${backendUrl}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: selectedModel }),
+        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: selectedModel, dpo_scale: dpoScale }),
       });
       const job = await resp.json();
       setSingleStatus("running");
@@ -275,7 +276,7 @@ export default function GeneratePage() {
         <div className="max-w-2xl mx-auto px-6 py-10 space-y-8">
           <div>
             <h2 className="text-2xl font-semibold tracking-tight">Generate</h2>
-            <p className="text-zinc-500 text-sm mt-1">Compare original vs DPO-tuned model output.</p>
+            <p className="text-zinc-500 text-sm mt-1">Compare original vs DPO Guided model output.</p>
           </div>
 
           {/* Tabs */}
@@ -307,7 +308,7 @@ export default function GeneratePage() {
                         : "border-zinc-800 text-zinc-500 hover:border-zinc-600"
                     }`}
                   >
-                    {m === "dpo" ? "DPO-tuned" : "Original"}
+                    {m === "dpo" ? "DPO Guided" : "Original"}
                   </button>
                 ))}
               </div>
@@ -372,6 +373,24 @@ export default function GeneratePage() {
               />
             </div>
 
+            <div>
+              <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
+                DPO Taste Influence — {dpoScale.toFixed(1)}
+              </label>
+              <p className="text-xs text-zinc-600 mb-2">
+                How much should the DPO model be influenced by your taste? 0 = no influence, 3 = maximum.
+              </p>
+              <input
+                type="range"
+                min={0}
+                max={3}
+                step={0.1}
+                value={dpoScale}
+                onChange={(e) => setDpoScale(Number(e.target.value))}
+                className="w-full accent-white"
+              />
+            </div>
+
             <button
               onClick={tab === "ab" ? generateBoth : generateSingle}
               disabled={isGenerating || !prompt.trim() || !lyrics.trim()}
@@ -380,8 +399,8 @@ export default function GeneratePage() {
               {isGenerating
                 ? "Generating..."
                 : tab === "ab"
-                ? "Generate Both (Original + DPO)"
-                : `Generate with ${selectedModel === "dpo" ? "DPO-tuned" : "Original"} model`}
+                ? "Generate Both (Original + DPO Guided)"
+                : `Generate with ${selectedModel === "dpo" ? "DPO Guided" : "Original"} model`}
             </button>
           </div>
 
@@ -401,7 +420,7 @@ export default function GeneratePage() {
                   <div key={model} className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
                     <div className="flex items-center justify-between">
                       <h3 className="font-medium text-sm tracking-tight">
-                        {model === "dpo" ? "DPO-Tuned Model" : "Original Model"}
+                        {model === "dpo" ? "DPO Guided" : "Original Model"}
                       </h3>
                       {(status === "running" || status === "pending") && (
                         <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
@@ -438,7 +457,7 @@ export default function GeneratePage() {
             <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
               <div className="flex items-center justify-between">
                 <h3 className="font-medium text-sm tracking-tight">
-                  {selectedModel === "dpo" ? "DPO-Tuned Model" : "Original Model"}
+                  {selectedModel === "dpo" ? "DPO Guided" : "Original Model"}
                 </h3>
                 {(singleStatus === "running" || singleStatus === "pending") && (
                   <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>

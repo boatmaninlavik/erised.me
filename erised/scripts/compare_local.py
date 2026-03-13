@@ -569,7 +569,7 @@ def main():
         at the logit level without swapping any weights.
         """
         while True:
-            job_id, prompt, lyrics, max_sec, model_name = job_queue.get()
+            job_id, prompt, lyrics, max_sec, model_name, dpo_scale = job_queue.get()
             jobs[job_id]["status"] = "running"
             gen_stats["generating"] = True
 
@@ -583,7 +583,7 @@ def main():
                             prompt=prompt,
                             lyrics=lyrics,
                             max_audio_length_ms=int(max_sec * 1000),
-                            dpo_scale=1.0,
+                            dpo_scale=dpo_scale,
                         )
                     else:
                         # Original model: standard generation
@@ -631,6 +631,7 @@ def main():
         lyrics: str
         max_sec: int = 60
         model: str = "dpo"  # "original" or "dpo"
+        dpo_scale: float = 3.0  # DPO Guided: 0=no influence, 1=full, up to 3=amplified
 
     # NOTE: All endpoints are sync `def` (not `async def`) so FastAPI runs them
     # in a thread pool. This prevents GIL contention with the generation thread
@@ -664,8 +665,8 @@ def main():
         job_id = str(uuid.uuid4())[:8]
         jobs[job_id] = {"status": "pending"}
         gen_stats["pending"] += 1
-        job_queue.put((job_id, req.prompt, req.lyrics, req.max_sec, req.model))
-        logger.info("Job %s submitted: model=%s, max_sec=%d", job_id, req.model, req.max_sec)
+        job_queue.put((job_id, req.prompt, req.lyrics, req.max_sec, req.model, req.dpo_scale))
+        logger.info("Job %s submitted: model=%s, max_sec=%d, dpo_scale=%.1f", job_id, req.model, req.max_sec, req.dpo_scale)
         return {"job_id": job_id}
 
     @app.get("/api/job/{job_id}")
