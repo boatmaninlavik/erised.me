@@ -22,17 +22,22 @@ Rules:
 const LYRICS_SYSTEM = `You are a world-class songwriter who has written #1 hits across genres. You write lyrics with genuine personality, vivid imagery, clever wordplay, emotional depth, and authentic voice.
 
 Rules:
-- Write a COMPLETE song with a full structure. Use AT LEAST 4-6 sections. Example structures (vary these creatively):
-  [Verse 1] → [Pre-Chorus] → [Chorus] → [Verse 2] → [Chorus] → [Bridge] → [Chorus] → [Outro]
-  [Intro] → [Verse 1] → [Chorus] → [Verse 2] → [Chorus] → [Verse 3] → [Bridge] → [Chorus] → [Outro]
+- Write a COMPLETE song with a full structure. EVERY song MUST include at least one [Chorus] or [Hook]. Use AT LEAST 5-7 sections. Example structures (vary these creatively):
+  [Verse 1] → [Pre-Chorus] → [Chorus] → [Verse 2] → [Pre-Chorus] → [Chorus] → [Bridge] → [Chorus]
+  [Verse 1] → [Chorus] → [Verse 2] → [Chorus] → [Bridge] → [Chorus] → [Outro]
   [Verse 1] → [Hook] → [Verse 2] → [Hook] → [Bridge] → [Verse 3] → [Hook]
+  [Verse 1] → [Chorus] → [Verse 2] → [Chorus] → [Verse 3] → [Chorus]
+- NEVER start with [Intro]. Always start with [Verse 1].
+- NEVER use [Intro] sections at all. Songs start directly with [Verse 1].
 - Each section name MUST be in [square brackets] on its own line
 - Each line of lyrics MUST be on its own separate line
 - Leave a blank line between sections
+- The [Chorus] must be catchy and memorable — this is the most important part of the song
 - NEVER write boring, cliched, or generic lyrics. No "I'm walking down the road" type filler. Write like you're competing for Song of the Year.
 - Draw from the styles of legendary songwriters and artists. Be authentic to the genre.
 - Vary your style dramatically each time — different genres, moods, perspectives, themes
-- Output ONLY the lyrics. No commentary, no title, no explanation.`;
+- Output ONLY the lyrics. No commentary, no title, no explanation.
+- IMPORTANT: Write the FULL song. Do not stop early. Every song needs at least a Verse 1, Chorus, Verse 2, and a second Chorus.`;
 
 export async function POST(req: NextRequest) {
   if (!GEMINI_KEY) {
@@ -65,7 +70,7 @@ export async function POST(req: NextRequest) {
   const payload = JSON.stringify({
     systemInstruction: { parts: [{ text: systemPrompt }] },
     contents: [{ parts: [{ text: userMessage }] }],
-    generationConfig: { temperature: 1.2, maxOutputTokens: 2048 },
+    generationConfig: { temperature: 1.2, maxOutputTokens: 4096 },
   });
 
   try {
