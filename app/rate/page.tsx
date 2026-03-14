@@ -7,6 +7,7 @@ import { supabase } from "@/lib/supabase";
 interface Pair {
   pair_id: string;
   prompt: string;
+  lyrics?: string;
   a_audio: string;
   b_audio?: string;
   tags_a: string;
@@ -217,7 +218,7 @@ export default function RatePage() {
       const { error: insertErr } = await supabase.from("dpo-songs").insert({
         title: "Untitled",
         prompt: currentPair.prompt,
-        lyrics: "",
+        lyrics: currentPair.lyrics || "",
         tags: winnerTags,
         audio_url: urlData.publicUrl,
         num_frames: null,
@@ -372,7 +373,7 @@ export default function RatePage() {
               <p className="text-xs text-zinc-500 text-center">
                 {voted ? "Voted!" : bReady ? "Which sounds better?" : "Listen to A while B generates..."}
               </p>
-              <p className="text-xs text-zinc-600 text-center font-mono">{currentPair.prompt}</p>
+              <p className="text-xs text-zinc-600 text-center font-mono break-words overflow-wrap-anywhere">{currentPair.prompt}</p>
 
               {/* Option A */}
               <div
@@ -386,7 +387,7 @@ export default function RatePage() {
                   src={`${backendUrl}/audio/${currentPair.a_audio}`}
                   className="w-full"
                 />
-                <p className="text-xs text-zinc-600 font-mono">
+                <p className="text-xs text-zinc-600 font-mono break-words overflow-wrap-anywhere">
                   {currentPair.tags_a}
                 </p>
                 <button
@@ -419,7 +420,7 @@ export default function RatePage() {
                       src={`${backendUrl}/audio/${currentPair.b_audio}`}
                       className="w-full"
                     />
-                    <p className="text-xs text-zinc-600 font-mono">
+                    <p className="text-xs text-zinc-600 font-mono break-words overflow-wrap-anywhere">
                       {currentPair.tags_b}
                     </p>
                     <button

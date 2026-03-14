@@ -127,11 +127,13 @@ export default function LibraryPage() {
                         </button>
                       )}
                       <span className={`text-[10px] font-medium tracking-wide uppercase px-1.5 py-0.5 rounded shrink-0 ${
-                        song.model === "dpo"
-                          ? "bg-zinc-800 text-zinc-400"
-                          : "bg-zinc-800 text-zinc-500"
+                        song.model === "rate-winner"
+                          ? "bg-emerald-950 text-emerald-400"
+                          : song.model === "dpo"
+                            ? "bg-zinc-800 text-zinc-400"
+                            : "bg-zinc-800 text-zinc-500"
                       }`}>
-                        {song.model === "dpo" ? "DPO" : "Original"}
+                        {song.model === "rate-winner" ? "Rated" : song.model === "dpo" ? "DPO" : "Original"}
                       </span>
                     </div>
                     <p className="text-xs text-zinc-500 mt-1">{formatDate(song.created_at)}</p>
