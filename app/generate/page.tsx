@@ -206,7 +206,7 @@ export default function GeneratePage() {
 
       const { data: urlData } = supabase.storage.from("dpo-songs").getPublicUrl(uploadData.path);
 
-      const { error: insertErr } = await supabase.from("dpo-songs").insert({
+      const baseRow = {
         title: "Untitled",
         prompt,
         lyrics,
@@ -214,11 +214,19 @@ export default function GeneratePage() {
         audio_url: urlData.publicUrl,
         num_frames: result.num_frames,
         model: result.model,
+      };
+
+      // Try with identity fields; fall back without them if columns don't exist yet
+      const { error: insertErr } = await supabase.from("dpo-songs").insert({
+        ...baseRow,
         guest_id: guestId,
         user_id: user?.id || null,
       });
 
-      if (insertErr) throw insertErr;
+      if (insertErr) {
+        const { error: retryErr } = await supabase.from("dpo-songs").insert(baseRow);
+        if (retryErr) throw retryErr;
+      }
 
       setSavedModels((prev) => new Set(prev).add(result.model));
     } catch (e: unknown) {

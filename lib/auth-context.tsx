@@ -50,6 +50,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSession(session);
       setUser(session?.user ?? null);
       setLoading(false);
+
+      // Re-trigger migration for existing sessions (covers case where
+      // columns didn't exist when user first signed in)
+      if (session?.user && session.access_token) {
+        fetch("/api/migrate-guest-data", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        }).catch(() => {});
+      }
     });
 
     const {

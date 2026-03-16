@@ -235,7 +235,7 @@ export default function RatePage() {
 
       const { data: urlData } = supabase.storage.from("dpo-songs").getPublicUrl(uploadData.path);
 
-      const { error: insertErr } = await supabase.from("dpo-songs").insert({
+      const baseRow = {
         title: "Untitled",
         prompt: currentPair.prompt,
         lyrics: currentPair.lyrics || "",
@@ -243,11 +243,19 @@ export default function RatePage() {
         audio_url: urlData.publicUrl,
         num_frames: null,
         model: "rate-winner",
+      };
+
+      // Try with identity fields; fall back without them if columns don't exist yet
+      const { error: insertErr } = await supabase.from("dpo-songs").insert({
+        ...baseRow,
         guest_id: guestId,
         user_id: user?.id || null,
       });
 
-      if (insertErr) throw insertErr;
+      if (insertErr) {
+        const { error: retryErr } = await supabase.from("dpo-songs").insert(baseRow);
+        if (retryErr) throw retryErr;
+      }
       setSaved(true);
     } catch (e: unknown) {
       console.error("Save failed:", e);
