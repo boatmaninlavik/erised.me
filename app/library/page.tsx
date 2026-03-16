@@ -28,21 +28,45 @@ export default function LibraryPage() {
     if (authLoading) return;
 
     async function load() {
-      let query = supabase
-        .from("dpo-songs")
-        .select("*")
-        .order("created_at", { ascending: false });
+      // Use separate queries to avoid PostgREST .or() edge cases
+      const seen = new Set<string>();
+      const results: DpoSong[] = [];
 
-      if (user) {
-        // Logged in: show user's songs + unclaimed legacy songs
-        query = query.or(`user_id.eq.${user.id},and(user_id.is.null,guest_id.is.null)`);
-      } else if (guestId) {
-        // Guest: show this guest's songs + unclaimed legacy songs
-        query = query.or(`guest_id.eq.${guestId},and(user_id.is.null,guest_id.is.null)`);
+      function addUnique(data: DpoSong[] | null) {
+        for (const s of data || []) {
+          if (!seen.has(s.id)) { seen.add(s.id); results.push(s); }
+        }
       }
 
-      const { data, error } = await query;
-      if (!error && data) setSongs(data as DpoSong[]);
+      if (user) {
+        const { data } = await supabase
+          .from("dpo-songs").select("*").eq("user_id", user.id);
+        addUnique(data as DpoSong[] | null);
+      }
+
+      if (guestId) {
+        // Guest songs (not yet migrated to an account)
+        const q = supabase.from("dpo-songs").select("*").eq("guest_id", guestId);
+        const { data } = user ? await q.is("user_id", null) : await q;
+        addUnique(data as DpoSong[] | null);
+      }
+
+      // Legacy songs (pre-system, no identity at all)
+      const { data: legacy, error: legacyErr } = await supabase
+        .from("dpo-songs").select("*").is("user_id", null).is("guest_id", null);
+
+      if (legacyErr) {
+        // Columns likely don't exist yet — fall back to loading all songs
+        const { data: all } = await supabase
+          .from("dpo-songs").select("*").order("created_at", { ascending: false });
+        setSongs((all || []) as DpoSong[]);
+        setLoading(false);
+        return;
+      }
+
+      addUnique(legacy as DpoSong[] | null);
+      results.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+      setSongs(results);
       setLoading(false);
     }
     load();
