@@ -46,7 +46,7 @@ export default function GeneratePage() {
   const [prompt, setPrompt] = useState("");
   const [lyrics, setLyrics] = useState("");
   const [maxSec, setMaxSec] = useState(60);
-  const [dpoScale, setDpoScale] = useState(3.0);
+  const [dpoScale, setDpoScale] = useState(0.4);
   const [tab, setTab] = useState<"ab" | "single">("ab");
   const [selectedModel, setSelectedModel] = useState<"dpo" | "original">("dpo");
 
@@ -185,10 +185,13 @@ export default function GeneratePage() {
   }
 
   async function saveToLibrary(result: GenerationResult) {
-    if (!backendUrl) return;
     setSaving(result.model);
     try {
-      const audioResp = await fetch(`${backendUrl}/audio/${result.audio_file}`);
+      const audioResp = await fetch(`/api/proxy-audio?file=${encodeURIComponent(result.audio_file)}`);
+      if (!audioResp.ok) {
+        const errData = await audioResp.json().catch(() => ({ error: "Failed to fetch audio" }));
+        throw new Error(errData.error || "Failed to fetch audio");
+      }
       const blob = await audioResp.blob();
       const ext = result.audio_file.split(".").pop() || "wav";
       const filename = `${Date.now()}_${result.model}.${ext}`;
@@ -394,13 +397,13 @@ export default function GeneratePage() {
                 DPO Taste Influence — {dpoScale.toFixed(1)}
               </label>
               <p className="text-xs text-zinc-600 mb-2">
-                How much should the DPO model be influenced by your taste? 0 = no influence, 3 = maximum.
+                How much should the DPO model be influenced by your taste? 0 = no influence, 1 = full DPO.
               </p>
               <input
                 type="range"
                 min={0}
-                max={3}
-                step={0.1}
+                max={1}
+                step={0.05}
                 value={dpoScale}
                 onChange={(e) => setDpoScale(Number(e.target.value))}
                 className="w-full accent-white"

@@ -210,13 +210,17 @@ export default function RatePage() {
   }
 
   async function saveWinnerToLibrary() {
-    if (!backendUrl || !currentPair || !voted) return;
+    if (!currentPair || !voted) return;
     setSaving(true);
     try {
       const winnerAudio = voted === "a" ? currentPair.a_audio : currentPair.b_audio!;
       const winnerTags = voted === "a" ? currentPair.tags_a : currentPair.tags_b!;
 
-      const audioResp = await fetch(`${backendUrl}/audio/${winnerAudio}`);
+      const audioResp = await fetch(`/api/proxy-audio?file=${encodeURIComponent(winnerAudio)}`);
+      if (!audioResp.ok) {
+        const errData = await audioResp.json().catch(() => ({ error: "Failed to fetch audio" }));
+        throw new Error(errData.error || "Failed to fetch audio");
+      }
       const blob = await audioResp.blob();
       const ext = winnerAudio.split(".").pop() || "wav";
       const filename = `${Date.now()}_rate_winner.${ext}`;
