@@ -115,7 +115,7 @@ class DPOGuider:
         )
 
         # Deep copy only the top N layers and codebook0_head from the original,
-        # then overwrite with DPO weights.
+        # then overwrite with DPO weights directly (no full model copy needed).
         self.dpo_top_layers = deepcopy(
             orig_model.backbone.layers[self.n_shared:]
         )
@@ -123,25 +123,58 @@ class DPOGuider:
         # Also copy the backbone norm (applied after all layers)
         self.dpo_backbone_norm = deepcopy(orig_model.backbone.norm)
 
-        # Load DPO checkpoint into a temporary full model to extract the right weights
+        # Load DPO checkpoint state dict to CPU, then extract only the weights
+        # we need for the top layers, codebook0_head, and backbone norm.
+        # This avoids creating a full model copy which would OOM on A100-40GB.
         logger.info("Loading DPO weights from %s ...", dpo_checkpoint_path)
-        tmp_model = deepcopy(orig_model)
-        _load_safetensors_sharded(tmp_model, dpo_checkpoint_path, device=self.device)
+        from safetensors.torch import load_file
+        files = sorted(glob.glob(os.path.join(dpo_checkpoint_path, "*.safetensors")))
+        if not files:
+            files = sorted(glob.glob(os.path.join(dpo_checkpoint_path, "*", "*.safetensors")))
+        if not files:
+            raise FileNotFoundError(f"No .safetensors in {dpo_checkpoint_path}")
 
-        # Copy DPO-trained weights into our lightweight copies
-        self.dpo_top_layers.load_state_dict(
-            tmp_model.backbone.layers[self.n_shared:].state_dict()
-        )
-        self.dpo_codebook0_head.load_state_dict(
-            tmp_model.codebook0_head.state_dict()
-        )
-        self.dpo_backbone_norm.load_state_dict(
-            tmp_model.backbone.norm.state_dict()
-        )
+        full_state = {}
+        for f in files:
+            full_state.update(load_file(f, device="cpu"))
+        logger.info("Loaded %d tensors from checkpoint", len(full_state))
 
-        # Free the temporary full model
-        del tmp_model
-        torch.cuda.empty_cache()
+        # Map checkpoint keys to our small copies.
+        # Checkpoint keys look like: backbone.layers.26.xxx, backbone.norm.xxx, codebook0_head.xxx
+        # For top layers, we need backbone.layers[n_shared:] remapped to indices 0..n_dpo_layers-1
+        top_layer_state = {}
+        for key, val in full_state.items():
+            if key.startswith("backbone.layers."):
+                parts = key.split(".", 3)  # ['backbone', 'layers', '<idx>', '<rest>']
+                layer_idx = int(parts[2])
+                if layer_idx >= self.n_shared:
+                    new_idx = layer_idx - self.n_shared
+                    new_key = f"{new_idx}.{parts[3]}"
+                    top_layer_state[new_key] = val
+
+        norm_state = {}
+        for key, val in full_state.items():
+            if key.startswith("backbone.norm."):
+                new_key = key[len("backbone.norm."):]
+                norm_state[new_key] = val
+
+        head_state = {}
+        for key, val in full_state.items():
+            if key.startswith("codebook0_head."):
+                new_key = key[len("codebook0_head."):]
+                head_state[new_key] = val
+
+        if top_layer_state:
+            self.dpo_top_layers.load_state_dict(top_layer_state, strict=False)
+            logger.info("Loaded %d tensors into DPO top layers", len(top_layer_state))
+        if norm_state:
+            self.dpo_backbone_norm.load_state_dict(norm_state, strict=False)
+            logger.info("Loaded %d tensors into DPO backbone norm", len(norm_state))
+        if head_state:
+            self.dpo_codebook0_head.load_state_dict(head_state, strict=False)
+            logger.info("Loaded %d tensors into DPO codebook0 head", len(head_state))
+
+        del full_state, top_layer_state, norm_state, head_state
 
         # Move to device
         self.dpo_top_layers.to(self.device)

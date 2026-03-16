@@ -45,6 +45,7 @@ image = (
         "pydantic>=2.0",
         "openai>=1.0",
     )
+    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     # Copy heartlib source into the image
     .add_local_dir("/workspace/heartlib/src/heartlib", remote_path="/root/heartlib_pkg/heartlib")
     # Copy erised package into the image
