@@ -268,7 +268,7 @@ export default function GeneratePage() {
       {(gpuStatus === "loading" || gpuStatus === "starting") && (
         <div className="flex items-center justify-center min-h-[60vh]">
           <p className="text-zinc-500 text-sm animate-pulse">
-            {gpuStatus === "starting" ? "Starting GPU — this takes about a minute..." : "Connecting to GPU..."}
+            {gpuStatus === "starting" ? "Setting up the GPUs needed in the background, this may take up to 1 minute..." : "Connecting to GPU..."}
           </p>
         </div>
       )}
