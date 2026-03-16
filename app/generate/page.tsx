@@ -42,7 +42,7 @@ async function pollJob(backendUrl: string, jobId: string): Promise<GenerationRes
 
 export default function GeneratePage() {
   const [backendUrl, setBackendUrl] = useState<string | null>(null);
-  const [gpuStatus, setGpuStatus] = useState<"loading" | "online" | "offline">("loading");
+  const [gpuStatus, setGpuStatus] = useState<"loading" | "online" | "offline" | "starting">("loading");
   const [prompt, setPrompt] = useState("");
   const [lyrics, setLyrics] = useState("");
   const [maxSec, setMaxSec] = useState(60);
@@ -76,9 +76,22 @@ export default function GeneratePage() {
       return;
     }
 
-    // Verify the server is actually reachable
+    // Quick check first (5s) — if it responds, GPU is already warm
     try {
       const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
+      if (resp.ok) {
+        setBackendUrl(url);
+        setGpuStatus("online");
+        return;
+      }
+    } catch {
+      // Timeout or error — GPU is likely cold-starting on Modal
+    }
+
+    // Cold start: show "starting" and wait longer (up to 120s)
+    setGpuStatus("starting");
+    try {
+      const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(120000) });
       if (resp.ok) {
         setBackendUrl(url);
         setGpuStatus("online");
@@ -246,14 +259,17 @@ export default function GeneratePage() {
           }`} />
           <span className="text-xs text-zinc-500">
             {gpuStatus === "online" ? "GPU online" :
-             gpuStatus === "offline" ? "GPU offline" : "Connecting..."}
+             gpuStatus === "offline" ? "GPU offline" :
+             gpuStatus === "starting" ? "GPU starting..." : "Connecting..."}
           </span>
         </div>
       </nav>
 
-      {gpuStatus === "loading" && (
+      {(gpuStatus === "loading" || gpuStatus === "starting") && (
         <div className="flex items-center justify-center min-h-[60vh]">
-          <p className="text-zinc-500 text-sm animate-pulse">Connecting to GPU...</p>
+          <p className="text-zinc-500 text-sm animate-pulse">
+            {gpuStatus === "starting" ? "Starting GPU — this takes about a minute..." : "Connecting to GPU..."}
+          </p>
         </div>
       )}
 
