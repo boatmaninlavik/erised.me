@@ -28,45 +28,40 @@ export default function LibraryPage() {
     if (authLoading) return;
 
     async function load() {
-      // Use separate queries to avoid PostgREST .or() edge cases
-      const seen = new Set<string>();
-      const results: DpoSong[] = [];
+      // Simple approach: fetch all songs, then filter client-side by ownership.
+      // This avoids RLS issues where the authenticated client can't see rows
+      // that were inserted with the anon key.
+      const { data: all, error } = await supabase
+        .from("dpo-songs")
+        .select("*")
+        .order("created_at", { ascending: false });
 
-      function addUnique(data: DpoSong[] | null) {
-        for (const s of data || []) {
-          if (!seen.has(s.id)) { seen.add(s.id); results.push(s); }
-        }
-      }
-
-      if (user) {
-        const { data } = await supabase
-          .from("dpo-songs").select("*").eq("user_id", user.id);
-        addUnique(data as DpoSong[] | null);
-      }
-
-      if (guestId) {
-        // Guest songs (not yet migrated to an account)
-        const q = supabase.from("dpo-songs").select("*").eq("guest_id", guestId);
-        const { data } = user ? await q.is("user_id", null) : await q;
-        addUnique(data as DpoSong[] | null);
-      }
-
-      // Legacy songs (pre-system, no identity at all)
-      const { data: legacy, error: legacyErr } = await supabase
-        .from("dpo-songs").select("*").is("user_id", null).is("guest_id", null);
-
-      if (legacyErr) {
-        // Columns likely don't exist yet — fall back to loading all songs
-        const { data: all } = await supabase
-          .from("dpo-songs").select("*").order("created_at", { ascending: false });
-        setSongs((all || []) as DpoSong[]);
+      if (error) {
+        console.error("Library query error:", error);
+        setSongs([]);
         setLoading(false);
         return;
       }
 
-      addUnique(legacy as DpoSong[] | null);
-      results.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-      setSongs(results);
+      const allSongs = (all || []) as DpoSong[];
+
+      // If not logged in and no guest id, show all songs (legacy behavior)
+      if (!user && !guestId) {
+        setSongs(allSongs);
+        setLoading(false);
+        return;
+      }
+
+      // Filter to songs that belong to this user or guest
+      const filtered = allSongs.filter((s) => {
+        if (user && s.user_id === user.id) return true;
+        if (guestId && s.guest_id === guestId && !s.user_id) return true;
+        // Legacy songs (no identity) — show to everyone for now
+        if (!s.user_id && !s.guest_id) return true;
+        return false;
+      });
+
+      setSongs(filtered);
       setLoading(false);
     }
     load();
