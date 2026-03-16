@@ -3,6 +3,8 @@
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import { supabase, type DpoSong } from "@/lib/supabase";
+import { useAuth } from "@/lib/auth-context";
+import { Navbar } from "@/components/navbar";
 
 function formatDate(iso: string) {
   return new Date(iso).toLocaleDateString("en-US", {
@@ -13,6 +15,7 @@ function formatDate(iso: string) {
 }
 
 export default function LibraryPage() {
+  const { user, guestId, loading: authLoading } = useAuth();
   const [songs, setSongs] = useState<DpoSong[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -21,17 +24,28 @@ export default function LibraryPage() {
   const editRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    if (authLoading) return;
+
     async function load() {
-      const { data, error } = await supabase
+      let query = supabase
         .from("dpo-songs")
         .select("*")
         .order("created_at", { ascending: false });
 
+      if (user) {
+        // Logged in: show user's songs + unclaimed legacy songs
+        query = query.or(`user_id.eq.${user.id},and(user_id.is.null,guest_id.is.null)`);
+      } else if (guestId) {
+        // Guest: show this guest's songs + unclaimed legacy songs
+        query = query.or(`guest_id.eq.${guestId},and(user_id.is.null,guest_id.is.null)`);
+      }
+
+      const { data, error } = await query;
       if (!error && data) setSongs(data as DpoSong[]);
       setLoading(false);
     }
     load();
-  }, []);
+  }, [authLoading, user, guestId]);
 
   useEffect(() => {
     if (editingId && editRef.current) {
@@ -64,14 +78,11 @@ export default function LibraryPage() {
 
   return (
     <div className="min-h-screen bg-black text-white">
-      <nav className="px-6 py-5 flex items-center justify-between border-b border-zinc-900">
-        <Link href="/" className="text-xl font-semibold tracking-tighter text-white">
-          Erised
-        </Link>
+      <Navbar>
         <Link href="/generate" className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors">
           Generate →
         </Link>
-      </nav>
+      </Navbar>
 
       <div className="max-w-2xl mx-auto px-6 py-10 space-y-8">
         <div>

@@ -1,8 +1,9 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import Link from "next/link";
 import { supabase } from "@/lib/supabase";
+import { useAuth } from "@/lib/auth-context";
+import { Navbar } from "@/components/navbar";
 
 interface Pair {
   pair_id: string;
@@ -24,6 +25,7 @@ interface ServerStatus {
 }
 
 export default function RatePage() {
+  const { user, guestId } = useAuth();
   const [backendUrl, setBackendUrl] = useState<string | null>(null);
   const [gpuStatus, setGpuStatus] = useState<"loading" | "online" | "offline" | "starting">("loading");
   const [prompt, setPrompt] = useState("");
@@ -241,6 +243,8 @@ export default function RatePage() {
         audio_url: urlData.publicUrl,
         num_frames: null,
         model: "rate-winner",
+        guest_id: guestId,
+        user_id: user?.id || null,
       });
 
       if (insertErr) throw insertErr;
@@ -256,10 +260,7 @@ export default function RatePage() {
 
   return (
     <div className="min-h-screen bg-black text-white">
-      <nav className="px-6 py-5 flex items-center justify-between border-b border-zinc-900">
-        <Link href="/" className="text-xl font-semibold tracking-tighter text-white">
-          Erised
-        </Link>
+      <Navbar>
         <div className="flex items-center gap-2">
           <div className={`w-2 h-2 rounded-full ${
             gpuStatus === "online" ? "bg-green-500" :
@@ -271,7 +272,7 @@ export default function RatePage() {
              gpuStatus === "starting" ? "GPU starting..." : "Connecting..."}
           </span>
         </div>
-      </nav>
+      </Navbar>
 
       {(gpuStatus === "loading" || gpuStatus === "starting") && (
         <div className="flex items-center justify-center min-h-[60vh]">

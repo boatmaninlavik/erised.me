@@ -1,8 +1,9 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import Link from "next/link";
 import { supabase } from "@/lib/supabase";
+import { useAuth } from "@/lib/auth-context";
+import { Navbar } from "@/components/navbar";
 
 type JobStatus = "idle" | "pending" | "running" | "done" | "error";
 
@@ -41,6 +42,7 @@ async function pollJob(backendUrl: string, jobId: string): Promise<GenerationRes
 }
 
 export default function GeneratePage() {
+  const { user, guestId } = useAuth();
   const [backendUrl, setBackendUrl] = useState<string | null>(null);
   const [gpuStatus, setGpuStatus] = useState<"loading" | "online" | "offline" | "starting">("loading");
   const [prompt, setPrompt] = useState("");
@@ -212,6 +214,8 @@ export default function GeneratePage() {
         audio_url: urlData.publicUrl,
         num_frames: result.num_frames,
         model: result.model,
+        guest_id: guestId,
+        user_id: user?.id || null,
       });
 
       if (insertErr) throw insertErr;
@@ -251,10 +255,7 @@ export default function GeneratePage() {
 
   return (
     <div className="min-h-screen bg-black text-white">
-      <nav className="px-6 py-5 flex items-center justify-between border-b border-zinc-900">
-        <Link href="/" className="text-xl font-semibold tracking-tighter text-white">
-          Erised
-        </Link>
+      <Navbar>
         <div className="flex items-center gap-2">
           <div className={`w-2 h-2 rounded-full ${
             gpuStatus === "online" ? "bg-green-500" :
@@ -266,7 +267,7 @@ export default function GeneratePage() {
              gpuStatus === "starting" ? "GPU starting..." : "Connecting..."}
           </span>
         </div>
-      </nav>
+      </Navbar>
 
       {(gpuStatus === "loading" || gpuStatus === "starting") && (
         <div className="flex items-center justify-center min-h-[60vh]">

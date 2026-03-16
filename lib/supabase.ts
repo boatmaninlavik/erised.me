@@ -14,5 +14,7 @@ export interface DpoSong {
   audio_url: string;
   num_frames: number | null;
   model: string;
+  guest_id: string | null;
+  user_id: string | null;
   created_at: string;
 }

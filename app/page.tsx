@@ -1,8 +1,10 @@
 import Link from "next/link";
+import { HomeAuthButton } from "@/components/home-auth-button";
 
 export default function Home() {
   return (
     <main className="min-h-screen flex flex-col items-center justify-center bg-black relative overflow-hidden">
+      <HomeAuthButton />
       <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-white/[0.02] rounded-full blur-3xl pointer-events-none" />
 
       <div className="max-w-3xl w-full text-center space-y-10 z-10 px-6">
