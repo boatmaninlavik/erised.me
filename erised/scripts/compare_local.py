@@ -626,12 +626,16 @@ def main():
     from fastapi.middleware.cors import CORSMiddleware
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+    # Only this email gets full DPO; others get original (until per-user LoRA is trained)
+    DPO_USER_EMAIL = os.environ.get("ERISED_DPO_USER_EMAIL", "zsean@berkeley.edu")
+
     class SubmitRequest(BaseModel):
         prompt: str
         lyrics: str
         max_sec: int = 60
         model: str = "dpo"  # "original" or "dpo"
         dpo_scale: float = 3.0  # DPO Guided: 0=no influence, 1=full, up to 3=amplified
+        user_email: str | None = None
 
     # NOTE: All endpoints are sync `def` (not `async def`) so FastAPI runs them
     # in a thread pool. This prevents GIL contention with the generation thread
@@ -662,11 +666,17 @@ def main():
         if req.model not in ("original", "dpo"):
             raise HTTPException(400, "Model must be 'original' or 'dpo'")
 
+        # Enforce: only the DPO user (Sean) gets DPO; others fall back to original
+        effective_model = req.model
+        if req.model == "dpo" and req.user_email != DPO_USER_EMAIL:
+            effective_model = "original"
+            logger.info("User %s requested DPO but is not the DPO user — falling back to original", req.user_email)
+
         job_id = str(uuid.uuid4())[:8]
         jobs[job_id] = {"status": "pending"}
         gen_stats["pending"] += 1
-        job_queue.put((job_id, req.prompt, req.lyrics, req.max_sec, req.model, req.dpo_scale))
-        logger.info("Job %s submitted: model=%s, max_sec=%d, dpo_scale=%.1f", job_id, req.model, req.max_sec, req.dpo_scale)
+        job_queue.put((job_id, req.prompt, req.lyrics, req.max_sec, effective_model, req.dpo_scale))
+        logger.info("Job %s submitted: model=%s, max_sec=%d, dpo_scale=%.1f, user=%s", job_id, effective_model, req.max_sec, req.dpo_scale, req.user_email)
         return {"job_id": job_id}
 
     @app.get("/api/job/{job_id}")
@@ -706,16 +716,22 @@ def main():
         lyrics: str
         max_sec: int = 60
         count: int = 1
+        user_email: str | None = None
 
     class RateVote(BaseModel):
         pair_id: str
         choice: str  # "a" or "b"
+        user_email: str | None = None
 
     @app.post("/api/queue")
     def queue_pairs(req: QueueRequest):
-        """Queue N pairs for A/B rating. Each pair = original + DPO Guided."""
+        """Queue N pairs for A/B rating. Each pair = original + DPO/original variant."""
         if not req.prompt.strip() or not req.lyrics.strip():
             raise HTTPException(400, "Prompt and lyrics required")
+
+        # Sean gets Original vs DPO; others get two Original variants (different seeds)
+        use_dpo = req.user_email == DPO_USER_EMAIL
+        second_model = "dpo" if use_dpo else "original"
 
         for _ in range(min(req.count, 10)):
             pair_id = str(uuid.uuid4())[:8]
@@ -733,11 +749,13 @@ def main():
                 "dpo_job": dpo_job_id,
                 "orig_result": None,
                 "dpo_result": None,
+                "user_email": req.user_email,
             }
 
             job_queue.put((orig_job_id, req.prompt, req.lyrics, req.max_sec, "original", 0.0))
-            job_queue.put((dpo_job_id, req.prompt, req.lyrics, req.max_sec, "dpo", 3.0))
+            job_queue.put((dpo_job_id, req.prompt, req.lyrics, req.max_sec, second_model, 3.0))
 
+        logger.info("Queued %d pairs for user=%s (dpo=%s)", min(req.count, 10), req.user_email, use_dpo)
         return {"queued": min(req.count, 10)}
 
     rate_pending_pairs = {}  # pair_id -> tracking dict
@@ -801,8 +819,8 @@ def main():
         rate_stats["rated"] += 1
 
         logger.info(
-            "Rating: pair=%s choice=%s winner=%s loser=%s prompt=%s",
-            req.pair_id, req.choice, winner_model, loser_model, pair["prompt"][:60],
+            "Rating: pair=%s choice=%s winner=%s loser=%s user=%s prompt=%s",
+            req.pair_id, req.choice, winner_model, loser_model, req.user_email, pair["prompt"][:60],
         )
 
         return {"status": "recorded", "count": rate_stats["rated"]}

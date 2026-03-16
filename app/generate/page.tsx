@@ -41,8 +41,11 @@ async function pollJob(backendUrl: string, jobId: string): Promise<GenerationRes
   }
 }
 
+const SEAN_EMAIL = "zsean@berkeley.edu";
+
 export default function GeneratePage() {
   const { user, guestId } = useAuth();
+  const isSean = user?.email === SEAN_EMAIL;
   const [backendUrl, setBackendUrl] = useState<string | null>(null);
   const [gpuStatus, setGpuStatus] = useState<"loading" | "online" | "offline" | "starting">("loading");
   const [prompt, setPrompt] = useState("");
@@ -126,7 +129,7 @@ export default function GeneratePage() {
       const origResp = await fetchRetry(`${backendUrl}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: "original" }),
+        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: "original", user_email: user?.email || null }),
       });
       const origJob = await origResp.json();
       setOrigStatus("running");
@@ -134,7 +137,7 @@ export default function GeneratePage() {
       const dpoResp = await fetchRetry(`${backendUrl}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: "dpo", dpo_scale: dpoScale }),
+        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: isSean ? "dpo" : "original", dpo_scale: dpoScale, user_email: user?.email || null }),
       });
       const dpoJob = await dpoResp.json();
       setDpoStatus("running");
@@ -170,10 +173,11 @@ export default function GeneratePage() {
     setSingleStatus("pending");
 
     try {
+      const effectiveModel = isSean ? selectedModel : "original";
       const resp = await fetchRetry(`${backendUrl}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: selectedModel, dpo_scale: dpoScale }),
+        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: effectiveModel, dpo_scale: dpoScale, user_email: user?.email || null }),
       });
       const job = await resp.json();
       setSingleStatus("running");
@@ -256,6 +260,9 @@ export default function GeneratePage() {
     }
   }
 
+  // Non-Sean users always use single generate (no A/B with DPO)
+  const effectiveTab = isSean ? tab : "single";
+
   const isGenerating =
     origStatus === "pending" || origStatus === "running" ||
     dpoStatus === "pending" || dpoStatus === "running" ||
@@ -304,27 +311,35 @@ export default function GeneratePage() {
         <div className="max-w-2xl mx-auto px-6 py-10 space-y-8">
           <div>
             <h2 className="text-2xl font-semibold tracking-tight">Generate</h2>
-            <p className="text-zinc-500 text-sm mt-1">Compare original vs DPO Guided model output.</p>
+            <p className="text-zinc-500 text-sm mt-1">
+              {isSean ? "Compare original vs DPO Guided model output." : "Generate music with Erised."}
+            </p>
           </div>
 
-          {/* Tabs */}
-          <div className="flex gap-1 bg-zinc-900 rounded-xl p-1">
-            {(["ab", "single"] as const).map((t) => (
-              <button
-                key={t}
-                onClick={() => setTab(t)}
-                className={`flex-1 py-2 text-sm font-medium rounded-lg transition-colors ${
-                  tab === t ? "bg-zinc-700 text-white" : "text-zinc-500 hover:text-zinc-300"
-                }`}
-              >
-                {t === "ab" ? "A/B Compare" : "Single Generate"}
-              </button>
-            ))}
-          </div>
+          {/* Tabs — A/B compare only available for Sean (DPO vs Original) */}
+          {isSean ? (
+            <div className="flex gap-1 bg-zinc-900 rounded-xl p-1">
+              {(["ab", "single"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className={`flex-1 py-2 text-sm font-medium rounded-lg transition-colors ${
+                    tab === t ? "bg-zinc-700 text-white" : "text-zinc-500 hover:text-zinc-300"
+                  }`}
+                >
+                  {t === "ab" ? "A/B Compare" : "Single Generate"}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-zinc-600">
+              Rate songs to start training your personalized model.
+            </p>
+          )}
 
           {/* Form */}
           <div className="space-y-4">
-            {tab === "single" && (
+            {tab === "single" && isSean && (
               <div className="flex gap-2">
                 {(["original", "dpo"] as const).map((m) => (
                   <button
@@ -401,31 +416,35 @@ export default function GeneratePage() {
               />
             </div>
 
-            <div>
-              <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
-                DPO Taste Influence — {dpoScale.toFixed(1)}
-              </label>
-              <p className="text-xs text-zinc-600 mb-2">
-                How much should the DPO model be influenced by your taste? 0 = no influence, 1 = full DPO.
-              </p>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={dpoScale}
-                onChange={(e) => setDpoScale(Number(e.target.value))}
-                className="w-full accent-white"
-              />
-            </div>
+            {isSean && (
+              <div>
+                <label className="block text-xs text-zinc-400 mb-2 font-medium tracking-wide uppercase">
+                  DPO Taste Influence — {dpoScale.toFixed(1)}
+                </label>
+                <p className="text-xs text-zinc-600 mb-2">
+                  How much should the DPO model be influenced by your taste? 0 = no influence, 1 = full DPO.
+                </p>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={dpoScale}
+                  onChange={(e) => setDpoScale(Number(e.target.value))}
+                  className="w-full accent-white"
+                />
+              </div>
+            )}
 
             <button
-              onClick={tab === "ab" ? generateBoth : generateSingle}
+              onClick={effectiveTab === "ab" ? generateBoth : generateSingle}
               disabled={isGenerating || !prompt.trim() || !lyrics.trim()}
               className="w-full py-4 bg-white text-black font-semibold rounded-xl text-sm tracking-tight hover:bg-zinc-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {isGenerating
                 ? "Generating..."
+                : !isSean
+                ? "Generate"
                 : tab === "ab"
                 ? "Generate Both (Original + DPO Guided)"
                 : `Generate with ${selectedModel === "dpo" ? "DPO Guided" : "Original"} model`}
@@ -439,7 +458,7 @@ export default function GeneratePage() {
           )}
 
           {/* A/B Results */}
-          {tab === "ab" && (origStatus !== "idle" || dpoStatus !== "idle") && (
+          {effectiveTab === "ab" && (origStatus !== "idle" || dpoStatus !== "idle") && (
             <div className="space-y-4">
               {(["original", "dpo"] as const).map((model) => {
                 const result = model === "original" ? origResult : dpoResult;
@@ -481,7 +500,7 @@ export default function GeneratePage() {
           )}
 
           {/* Single Result */}
-          {tab === "single" && singleStatus !== "idle" && (
+          {effectiveTab === "single" && singleStatus !== "idle" && (
             <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
               <div className="flex items-center justify-between">
                 <h3 className="font-medium text-sm tracking-tight">

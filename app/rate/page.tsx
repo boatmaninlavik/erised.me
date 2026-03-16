@@ -24,8 +24,11 @@ interface ServerStatus {
   rated: number;
 }
 
+const SEAN_EMAIL = "zsean@berkeley.edu";
+
 export default function RatePage() {
   const { user, guestId } = useAuth();
+  const isSean = user?.email === SEAN_EMAIL;
   const [backendUrl, setBackendUrl] = useState<string | null>(null);
   const [gpuStatus, setGpuStatus] = useState<"loading" | "online" | "offline" | "starting">("loading");
   const [prompt, setPrompt] = useState("");
@@ -180,7 +183,7 @@ export default function RatePage() {
       await fetch(`${backendUrl}/api/queue`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, count }),
+        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, count, user_email: user?.email || null }),
       });
       if (!currentPair) fetchNext();
     } finally {
@@ -195,7 +198,7 @@ export default function RatePage() {
       const resp = await fetch(`${backendUrl}/api/rate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pair_id: currentPair.pair_id, choice }),
+        body: JSON.stringify({ pair_id: currentPair.pair_id, choice, user_email: user?.email || null }),
       });
       const data = await resp.json();
       setServerStatus((s) => ({ ...s, rated: data.count }));
