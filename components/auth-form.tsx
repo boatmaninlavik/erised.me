@@ -7,7 +7,6 @@ type Mode = "sign-in" | "sign-up" | "forgot-password" | "reset-sent";
 
 export function AuthForm({ onSuccess }: { onSuccess?: () => void }) {
   const [mode, setMode] = useState<Mode>("sign-in");
-  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -45,7 +44,6 @@ export function AuthForm({ onSuccess }: { onSuccess?: () => void }) {
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
-      options: { data: { name } },
     });
     if (error) {
       setError(error.message);
@@ -104,16 +102,6 @@ export function AuthForm({ onSuccess }: { onSuccess?: () => void }) {
 
   return (
     <form onSubmit={handleSubmit} className="space-y-2">
-      {mode === "sign-up" && (
-        <input
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="name"
-          className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-white/30 transition-colors text-sm"
-        />
-      )}
-
       <input
         type="email"
         value={email}

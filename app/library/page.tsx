@@ -21,6 +21,7 @@ export default function LibraryPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const editRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -72,6 +73,25 @@ export default function LibraryPage() {
   function startEditing(song: DpoSong) {
     setEditingId(song.id);
     setEditTitle(song.title || "Untitled");
+  }
+
+  async function deleteSong(id: string) {
+    const song = songs.find((s) => s.id === id);
+    if (!song) return;
+
+    // Delete from Supabase storage (extract filename from URL)
+    const urlParts = song.audio_url.split("/");
+    const storagePath = urlParts[urlParts.length - 1];
+    if (storagePath) {
+      await supabase.storage.from("dpo-songs").remove([storagePath]);
+    }
+
+    // Delete from database
+    const { error } = await supabase.from("dpo-songs").delete().eq("id", id);
+    if (!error) {
+      setSongs((prev) => prev.filter((s) => s.id !== id));
+    }
+    setDeletingId(null);
   }
 
   const expanded = expandedId ? songs.find((s) => s.id === expandedId) : null;
@@ -149,12 +169,37 @@ export default function LibraryPage() {
                     </div>
                     <p className="text-xs text-zinc-500 mt-1">{formatDate(song.created_at)}</p>
                   </div>
-                  <button
-                    onClick={() => setExpandedId(expandedId === song.id ? null : song.id)}
-                    className="text-xs text-zinc-500 hover:text-white transition-colors shrink-0 pt-0.5"
-                  >
-                    {expandedId === song.id ? "Close" : "Details"}
-                  </button>
+                  <div className="flex items-center gap-3 shrink-0 pt-0.5">
+                    <button
+                      onClick={() => setExpandedId(expandedId === song.id ? null : song.id)}
+                      className="text-xs text-zinc-500 hover:text-white transition-colors"
+                    >
+                      {expandedId === song.id ? "Close" : "Details"}
+                    </button>
+                    {deletingId === song.id ? (
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => deleteSong(song.id)}
+                          className="text-xs text-red-400 hover:text-red-300 transition-colors"
+                        >
+                          Confirm
+                        </button>
+                        <button
+                          onClick={() => setDeletingId(null)}
+                          className="text-xs text-zinc-500 hover:text-white transition-colors"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setDeletingId(song.id)}
+                        className="text-xs text-zinc-600 hover:text-red-400 transition-colors"
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <audio
