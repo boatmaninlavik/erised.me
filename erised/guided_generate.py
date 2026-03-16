@@ -404,15 +404,6 @@ class DPOGuider:
         model.setup_caches(bs_size)
         self._setup_dpo_caches(bs_size)
 
-        # Initial frame (processes the full prompt)
-        with torch.autocast(device_type=device.type, dtype=self.dtype):
-            curr_token = self._guided_generate_frame(
-                prompt_tokens, prompt_tokens_mask, prompt_pos,
-                temperature, topk, cfg_scale, dpo_scale,
-                continuous_segment, starts,
-            )
-        frames.append(curr_token[0:1,])
-
         # Padding helper
         parallel_number = 8 + 1
         empty_id = pipe.config.empty_id
@@ -430,18 +421,28 @@ class DPOGuider:
 
         max_audio_frames = max_audio_length_ms // 80
 
-        # Autoregressive loop
-        for i in tqdm(range(max_audio_frames), desc="Guided generation"):
-            curr_padded, curr_mask = _pad(curr_token)
-            with torch.autocast(device_type=device.type, dtype=self.dtype):
+        # torch.no_grad() is critical — without it, PyTorch builds gradient
+        # graphs for every frame in the autoregressive loop, causing ~3x slowdown.
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):
+            # Initial frame (processes the full prompt)
+            curr_token = self._guided_generate_frame(
+                prompt_tokens, prompt_tokens_mask, prompt_pos,
+                temperature, topk, cfg_scale, dpo_scale,
+                continuous_segment, starts,
+            )
+            frames.append(curr_token[0:1,])
+
+            # Autoregressive loop
+            for i in tqdm(range(max_audio_frames), desc="Guided generation"):
+                curr_padded, curr_mask = _pad(curr_token)
                 curr_token = self._guided_generate_frame(
                     curr_padded, curr_mask,
                     prompt_pos[..., -1:] + i + 1,
                     temperature, topk, cfg_scale, dpo_scale,
                 )
-            if torch.any(curr_token[0:1, :] >= pipe.config.audio_eos_id):
-                break
-            frames.append(curr_token[0:1,])
+                if torch.any(curr_token[0:1, :] >= pipe.config.audio_eos_id):
+                    break
+                frames.append(curr_token[0:1,])
 
         frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
 
