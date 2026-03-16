@@ -1,23 +1,13 @@
 """
 Modal serverless deployment for Erised GPU backend.
 
-Deploys compare_local.py as a Modal web endpoint with:
+Deploys the generation server as a Modal web endpoint with:
 - Auto cold-start: container boots when users visit erised.me (~45s)
 - Auto shutdown: container stops after 5 min idle (no charges)
 - Permanent URL: stored once in Supabase, never changes
 
-Setup (one-time):
-    pip install modal
-    modal setup          # authenticate with Modal
+Deploy:
     modal deploy modal_app.py
-
-The deploy command prints a URL like:
-    https://<your-workspace>--erised-gpu-serve.modal.run
-
-Paste that URL into Supabase:
-    Table: erised_config → row where key = "backend_url" → set value to the URL
-
-That's it. The frontend's existing cold-start logic handles the rest.
 """
 
 import os
@@ -25,25 +15,39 @@ import modal
 
 app = modal.App("erised-gpu")
 
-# Volume for model weights + DPO checkpoints + outputs
-# Upload your weights once:  modal volume put erised-data /workspace/ckpt /ckpt
-#                             modal volume put erised-data /workspace/dpo_checkpoints_v8 /dpo_checkpoints_v8
+# Volume for model weights + DPO checkpoints + generated outputs
 erised_vol = modal.Volume.from_name("erised-data", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg", "libsndfile1")
     .pip_install(
-        "torch>=2.4.0",
-        "torchaudio>=2.4.0",
-        "safetensors",
+        # heartlib dependencies (pinned from pyproject.toml)
+        "numpy==2.0.2",
+        "torch==2.4.1",
+        "torchaudio==2.4.1",
+        "torchtune==0.4.0",
+        "torchao==0.9.0",
+        "torchvision==0.19.1",
+        "tqdm==4.67.1",
+        "transformers==4.57.0",
+        "tokenizers==0.22.1",
+        "einops==0.8.1",
+        "accelerate==1.12.0",
+        "bitsandbytes==0.49.0",
+        "vector-quantize-pytorch==1.27.15",
+        "modelscope==1.33.0",
         "soundfile",
+        "safetensors",
+        # erised dependencies
         "fastapi",
         "uvicorn[standard]",
         "pydantic>=2.0",
         "openai>=1.0",
     )
-    .apt_install("ffmpeg")
-    # Copy the erised package into the image
+    # Copy heartlib source into the image
+    .add_local_dir("/workspace/heartlib/src/heartlib", remote_path="/root/heartlib_pkg/heartlib")
+    # Copy erised package into the image
     .add_local_dir("erised", remote_path="/root/erised")
 )
 
@@ -53,12 +57,12 @@ image = (
     gpu="A100",
     volumes={"/data": erised_vol},
     timeout=600,
-    container_idle_timeout=300,  # 5 min idle → shut down
-    secrets=[modal.Secret.from_name("erised-secrets")],  # GEMINI_API_KEY, etc.
+    scaledown_window=300,  # 5 min idle → shut down
+    secrets=[modal.Secret.from_name("erised-secrets")],
 )
 @modal.asgi_app()
 def serve():
-    """Create and return the FastAPI app (same as compare_local.py main())."""
+    """Create and return the FastAPI app."""
     import sys
     import logging
     import queue
@@ -66,7 +70,8 @@ def serve():
     import time
     import uuid
 
-    # Make erised importable
+    # Make heartlib and erised importable
+    sys.path.insert(0, "/root/heartlib_pkg")
     sys.path.insert(0, "/root")
 
     logging.basicConfig(
