@@ -22,7 +22,6 @@ export default function LibraryPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [debugInfo, setDebugInfo] = useState("");
   const editRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -36,10 +35,6 @@ export default function LibraryPage() {
         .from("dpo-songs")
         .select("*")
         .order("created_at", { ascending: false });
-
-      // Debug info — temporary, remove after fixing
-      const info = `user: ${user?.id || "none"} | email: ${user?.email || "none"} | guestId: ${guestId || "none"} | query returned: ${all?.length ?? "null"} rows | error: ${error?.message || "none"}`;
-      setDebugInfo(info);
 
       if (error) {
         setSongs([]);
@@ -131,7 +126,6 @@ export default function LibraryPage() {
         <div>
           <h2 className="text-2xl font-semibold tracking-tight">My Library</h2>
           <p className="text-zinc-500 text-sm mt-1">Songs you&apos;ve saved.</p>
-          {debugInfo && <p className="text-yellow-500 text-xs font-mono mt-2 break-all">{debugInfo}</p>}
         </div>
 
         {loading ? (

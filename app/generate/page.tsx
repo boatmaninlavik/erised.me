@@ -66,6 +66,7 @@ export default function GeneratePage() {
   const [savedModels, setSavedModels] = useState<Set<string>>(new Set());
   const [randomizingPrompt, setRandomizingPrompt] = useState(false);
   const [randomizingLyrics, setRandomizingLyrics] = useState(false);
+  const [songTitle, setSongTitle] = useState("Untitled");
 
   const loadBackendUrl = useCallback(async () => {
     const { data } = await supabase
@@ -211,7 +212,7 @@ export default function GeneratePage() {
       const { data: urlData } = supabase.storage.from("dpo-songs").getPublicUrl(uploadData.path);
 
       const baseRow = {
-        title: "Untitled",
+        title: songTitle,
         prompt,
         lyrics,
         tags: result.tags,
@@ -251,8 +252,12 @@ export default function GeneratePage() {
         body: JSON.stringify({ type, context: type === "lyrics" ? prompt : undefined }),
       });
       const data = await resp.json();
-      if (data.text) setValue(data.text);
-      else if (data.error) setError(data.error);
+      if (data.text) {
+        setValue(data.text);
+        if (type === "lyrics" && data.title) {
+          setSongTitle(data.title);
+        }
+      } else if (data.error) setError(data.error);
     } catch {
       setError("Failed to generate random " + type);
     } finally {

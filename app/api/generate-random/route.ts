@@ -36,7 +36,7 @@ Rules:
 - NEVER write boring, cliched, or generic lyrics. No "I'm walking down the road" type filler. Write like you're competing for Song of the Year.
 - Draw from the styles of legendary songwriters and artists. Be authentic to the genre.
 - Vary your style dramatically each time — different genres, moods, perspectives, themes
-- Output ONLY the lyrics. No commentary, no title, no explanation.
+- On the VERY FIRST LINE, write a creative song title (2-5 words, no quotes, no "Title:" prefix). Then leave a blank line. Then write the lyrics.
 - IMPORTANT: Write the FULL song. Do not stop early. Every song needs at least a Verse 1, Chorus, Verse 2, and a second Chorus.`;
 
 export async function POST(req: NextRequest) {
@@ -103,6 +103,21 @@ export async function POST(req: NextRequest) {
 
       if (!text) {
         return NextResponse.json({ error: "Empty response from Gemini" }, { status: 502 });
+      }
+
+      // For lyrics, extract the title from the first line
+      if (type === "lyrics") {
+        const trimmed = text.trim();
+        const firstNewline = trimmed.indexOf("\n");
+        if (firstNewline > 0) {
+          const firstLine = trimmed.slice(0, firstNewline).trim();
+          // If first line doesn't look like a section header, it's the title
+          if (!firstLine.startsWith("[")) {
+            const rest = trimmed.slice(firstNewline).trim();
+            return NextResponse.json({ text: rest, title: firstLine });
+          }
+        }
+        return NextResponse.json({ text: trimmed });
       }
 
       return NextResponse.json({ text: text.trim() });
