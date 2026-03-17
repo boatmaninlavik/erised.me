@@ -214,6 +214,7 @@ class DPOGuider:
         cfg_scale: float = 1.5,
         dpo_scale: float = 1.0,
         on_progress: Optional[Callable] = None,
+        on_frames_checkpoint: Optional[Callable] = None,
     ) -> torch.Tensor:
         """Full guided generation loop — identical to v8's guided_forward."""
         pipe = pipeline.pipe
@@ -259,6 +260,11 @@ class DPOGuider:
 
         max_audio_frames = max_audio_length_ms // 80
 
+        # Frame checkpoint thresholds for streaming decode on separate GPU.
+        _FIRST_CHUNK = int(29.76 * 12.5)   # 372
+        _HOP = _FIRST_CHUNK // 93 * 80     # 320
+        next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
+
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):
             # Initial frame
             curr_token = _guided_generate_frame(
@@ -285,21 +291,33 @@ class DPOGuider:
                 if len(frames) % 10 == 0 and on_progress:
                     on_progress(len(frames), max_audio_frames, None, None)
 
-        # Decode to audio (safe — generation complete, KV caches released)
+                # Send frames to external codec worker at checkpoint thresholds
+                if next_checkpoint and len(frames) >= next_checkpoint:
+                    frames_tensor_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+                    on_frames_checkpoint(frames_tensor_cp, is_final=False)
+                    next_checkpoint += _HOP
+
+        # Stack frames and decode to audio
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
         num_gen_frames = len(frames)
 
-        def _on_chunk(chunk_idx, total_chunks):
-            if on_progress:
-                on_progress(
-                    num_gen_frames, max_audio_frames,
-                    os.path.basename(save_path), chunk_idx,
-                )
+        if on_frames_checkpoint:
+            # External decoder handles all audio — send final frames
+            on_frames_checkpoint(frames_tensor, is_final=True)
+            logger.info("Guided frames sent to external decoder (%d frames)", frames_tensor.shape[-1])
+        else:
+            # No external decoder — decode locally (original path)
+            def _on_chunk(chunk_idx, total_chunks):
+                if on_progress:
+                    on_progress(
+                        num_gen_frames, max_audio_frames,
+                        os.path.basename(save_path), chunk_idx,
+                    )
 
-        streaming_detokenize(
-            pipe.codec, frames_tensor, save_path,
-            on_chunk_ready=_on_chunk,
-        )
+            streaming_detokenize(
+                pipe.codec, frames_tensor, save_path,
+                on_chunk_ready=_on_chunk,
+            )
+            logger.info("Guided audio saved to %s (%d frames)", save_path, frames_tensor.shape[-1])
 
-        logger.info("Guided audio saved to %s (%d frames)", save_path, frames_tensor.shape[-1])
         return frames_tensor

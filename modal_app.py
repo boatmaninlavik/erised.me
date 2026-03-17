@@ -2,6 +2,8 @@
 Modal serverless deployment for Erised GPU backend.
 
 Deploys the generation server as a Modal web endpoint with:
+- A100-80GB: token generation (mula model + DPO)
+- T4: codec decode (streaming audio while generating)
 - Auto cold-start: container boots when users visit erised.me (~45s)
 - Auto shutdown: container stops after 5 min idle (no charges)
 - Permanent URL: stored once in Supabase, never changes
@@ -53,6 +55,131 @@ image = (
 )
 
 
+# ── T4 Codec Worker ──────────────────────────────────────────────────
+# Separate GPU for streaming codec decode while A100 generates tokens.
+# Polls for new frames on the shared volume and decodes incrementally.
+
+@app.cls(
+    image=image,
+    gpu="L4",
+    volumes={"/data": erised_vol},
+    timeout=600,
+    scaledown_window=300,
+)
+class CodecWorker:
+    @modal.enter()
+    def load_codec(self):
+        import sys
+        import logging
+        import torch
+
+        sys.path.insert(0, "/root/heartlib_pkg")
+        sys.path.insert(0, "/root")
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        )
+        self.logger = logging.getLogger("erised.codec_worker")
+
+        model_path = os.environ.get("ERISED_MODEL_PATH", "/data/ckpt")
+        self.logger.info("Loading codec from %s ...", model_path)
+
+        from heartlib import HeartMuLaGenPipeline
+
+        pipe = HeartMuLaGenPipeline.from_pretrained(
+            model_path,
+            device={"mula": torch.device("cpu"), "codec": torch.device("cuda:0")},
+            dtype={"mula": torch.bfloat16, "codec": torch.float32},
+            version="3B",
+            lazy_load=False,
+        )
+        self.codec = pipe.codec
+        self.logger.info(
+            "Codec loaded. VRAM: %.2f GB",
+            torch.cuda.memory_allocated() / 1024**3,
+        )
+
+    @modal.method()
+    def decode_job(self, job_id: str, audio_filename: str):
+        """Poll for frames on volume and decode incrementally."""
+        import json
+        import time
+        import torch
+        from erised.streaming import StreamingDecoder
+
+        save_path = os.path.join("/data/outputs", audio_filename)
+        signal_path = os.path.join("/data/frames", f"{job_id}.json")
+        frames_path = os.path.join("/data/frames", f"{job_id}.pt")
+        decode_status_path = os.path.join("/data/frames", f"{job_id}_decoded.json")
+
+        os.makedirs("/data/outputs", exist_ok=True)
+
+        decoder = StreamingDecoder(self.codec, save_path)
+        last_num_frames = 0
+
+        self.logger.info("Starting decode loop for job %s → %s", job_id, audio_filename)
+
+        while True:
+            # See latest writes from A100
+            erised_vol.reload()
+
+            if not os.path.isfile(signal_path):
+                time.sleep(1)
+                continue
+
+            with open(signal_path) as f:
+                signal = json.load(f)
+
+            current_num_frames = signal.get("num_frames", 0)
+            is_final = signal.get("is_final", False)
+
+            # Only decode if we have new frames
+            if current_num_frames > last_num_frames or is_final:
+                frames = torch.load(frames_path, map_location="cuda:0", weights_only=True)
+                new_chunks = decoder.decode_available(frames)
+                last_num_frames = current_num_frames
+
+                if new_chunks > 0:
+                    self.logger.info(
+                        "Job %s: decoded %d new chunks (total: %d, frames: %d)",
+                        job_id, new_chunks, decoder.chunks_decoded, current_num_frames,
+                    )
+                    # Write decode status for A100 to read
+                    with open(decode_status_path, "w") as f:
+                        json.dump({
+                            "chunks": decoder.chunks_decoded,
+                            "audio_file": audio_filename,
+                            "done": is_final,
+                        }, f)
+                    erised_vol.commit()
+
+            if is_final:
+                # One final decode pass to catch any remaining
+                frames = torch.load(frames_path, map_location="cuda:0", weights_only=True)
+                extra = decoder.decode_available(frames)
+                if extra > 0:
+                    self.logger.info("Job %s: final pass decoded %d more chunks", job_id, extra)
+                # Write final status
+                with open(decode_status_path, "w") as f:
+                    json.dump({
+                        "chunks": decoder.chunks_decoded,
+                        "audio_file": audio_filename,
+                        "done": True,
+                    }, f)
+                erised_vol.commit()
+                break
+
+            time.sleep(2)
+
+        self.logger.info(
+            "Decode complete for job %s: %d chunks → %s",
+            job_id, decoder.chunks_decoded, save_path,
+        )
+
+
+# ── A100 Generation Server ───────────────────────────────────────────
+
 @app.function(
     image=image,
     gpu="A100-80GB",
@@ -73,6 +200,8 @@ def serve():
     import time
     import uuid
 
+    import torch
+
     # Make heartlib and erised importable
     sys.path.insert(0, "/root/heartlib_pkg")
     sys.path.insert(0, "/root")
@@ -91,8 +220,10 @@ def serve():
     dpo_path = os.environ.get("ERISED_DPO_PATH", "/data/dpo_checkpoints_v11/dpo_best")
     output_dir = "/data/outputs"
     jobs_dir = "/data/jobs"
+    frames_dir = "/data/frames"
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(jobs_dir, exist_ok=True)
+    os.makedirs(frames_dir, exist_ok=True)
 
     os.environ.setdefault("ERISED_MODEL_PATH", model_path)
     os.environ.setdefault("ERISED_OUTPUT_DIR", output_dir)
@@ -111,8 +242,6 @@ def serve():
     logger.info("DPO Guided ready.")
 
     # ── Job persistence (survives deploys & container routing) ─────
-    # In-memory dict for fast access; important state changes also
-    # written to /data/jobs/ on the Modal Volume.
     jobs: dict[str, dict] = {}
     jobs_lock = threading.Lock()
 
@@ -157,6 +286,9 @@ def serve():
 
     DPO_USER_EMAIL = os.environ.get("ERISED_DPO_USER_EMAIL", "zsean@berkeley.edu")
 
+    # Handle to the T4 codec worker
+    codec_worker = CodecWorker()
+
     def generation_worker():
         while True:
             job_id, prompt, lyrics, max_sec, model_name, dpo_scale = job_queue.get()
@@ -166,6 +298,11 @@ def serve():
             gen_stats["generating"] = True
 
             last_save_time = 0.0
+            t4_spawned = [False]
+            t4_audio_filename = [None]
+            decode_status_path = os.path.join(frames_dir, f"{job_id}_decoded.json")
+            # Track T4 decode progress for streaming audio to frontend
+            t4_decode_info = [None]  # Updated by background checker thread
 
             def on_progress(current_frame, total_frames, partial_audio_file=None, partial_version=None):
                 nonlocal last_save_time
@@ -178,11 +315,76 @@ def serve():
                         jobs[job_id]["partial_audio_file"] = partial_audio_file
                     if partial_version is not None:
                         jobs[job_id]["partial_version"] = partial_version
-                    # Persist to disk at most every 5 seconds (or on audio chunk)
+
+                    # Check T4 decode progress (non-blocking, uses cached info)
+                    info = t4_decode_info[0]
+                    if info and info.get("chunks", 0) > 0:
+                        jobs[job_id]["partial_audio_file"] = info["audio_file"]
+                        jobs[job_id]["partial_version"] = info["chunks"]
+
                     now = time.time()
                     if partial_audio_file or (now - last_save_time > 5):
                         _save_job(job_id)
                         last_save_time = now
+
+            def _t4_decode_checker():
+                """Background thread: polls volume for T4 decode status."""
+                while not t4_spawned[0]:
+                    time.sleep(1)
+                while True:
+                    try:
+                        erised_vol.reload()
+                        if os.path.isfile(decode_status_path):
+                            with open(decode_status_path) as f:
+                                t4_decode_info[0] = json.load(f)
+                            if t4_decode_info[0].get("done"):
+                                break
+                    except Exception:
+                        pass
+                    time.sleep(3)
+
+            checker_thread = threading.Thread(target=_t4_decode_checker, daemon=True)
+            checker_thread.start()
+
+            sync_lock = threading.Lock()  # Serialize background syncs
+
+            def on_frames_checkpoint(frames_tensor, is_final=False):
+                """Save frames to volume and signal T4 codec worker."""
+                cpu_frames = frames_tensor.cpu()
+
+                def _sync():
+                    with sync_lock:  # Ensure sequential commits
+                        frames_path = os.path.join(frames_dir, f"{job_id}.pt")
+                        signal_path = os.path.join(frames_dir, f"{job_id}.json")
+                        torch.save(cpu_frames, frames_path)
+                        with open(signal_path, "w") as f:
+                            json.dump({
+                                "num_frames": cpu_frames.shape[-1],
+                                "is_final": is_final,
+                            }, f)
+                        erised_vol.commit()
+
+                        if not t4_spawned[0]:
+                            t4_spawned[0] = True
+                            t4_audio_filename[0] = f"{job_id}.wav"
+                            logger.info(
+                                "Spawning T4 codec decode for job %s (%d frames, final=%s)",
+                                job_id, cpu_frames.shape[-1], is_final,
+                            )
+                            codec_worker.decode_job.spawn(job_id, t4_audio_filename[0])
+                        else:
+                            logger.info(
+                                "Checkpoint for job %s: %d frames, final=%s",
+                                job_id, cpu_frames.shape[-1], is_final,
+                            )
+
+                if is_final:
+                    # Final checkpoint: BLOCKING — must commit before we
+                    # wait for T4, otherwise T4 never sees final frames.
+                    _sync()
+                else:
+                    # Intermediate checkpoints: non-blocking
+                    threading.Thread(target=_sync, daemon=True).start()
 
             try:
                 with gen_lock:
@@ -193,26 +395,62 @@ def serve():
                             max_audio_length_ms=int(max_sec * 1000),
                             dpo_scale=dpo_scale,
                             on_progress=on_progress,
+                            on_frames_checkpoint=on_frames_checkpoint,
                         )
                     else:
                         result = pipeline.generate(
                             prompt=prompt, lyrics=lyrics,
                             max_audio_length_ms=int(max_sec * 1000),
                             on_progress=on_progress,
+                            on_frames_checkpoint=on_frames_checkpoint,
                         )
                     elapsed = time.time() - t0
                     logger.info("[%s] Generated %s in %.1fs (%d frames)",
                                 model_name, result.audio_path, elapsed, result.num_frames)
 
+                # Wait for T4 to finish decoding the final audio
+                t4_done = False
+                if t4_spawned[0]:
+                    logger.info("Waiting for T4 codec decode to finish for job %s ...", job_id)
+                    for attempt in range(180):  # Max 6 min
+                        erised_vol.reload()
+                        if os.path.isfile(decode_status_path):
+                            with open(decode_status_path) as f:
+                                decode_info = json.load(f)
+                            if decode_info.get("done"):
+                                logger.info("T4 decode complete for job %s (%d chunks)",
+                                            job_id, decode_info.get("chunks", 0))
+                                t4_done = True
+                                break
+                        time.sleep(2)
+                    else:
+                        logger.warning("T4 decode timed out for job %s", job_id)
+
+                if t4_done:
+                    final_audio = t4_audio_filename[0]
+                else:
+                    # Fallback: decode locally on A100 (safe, generation done)
+                    logger.info("Falling back to local decode for job %s", job_id)
+                    from erised.streaming import streaming_detokenize
+                    fallback_frames = torch.load(result.tokens_path, map_location="cuda:0", weights_only=True)
+                    fallback_path = os.path.join(output_dir, f"{job_id}_fallback.wav")
+                    streaming_detokenize(
+                        pipeline.pipe.codec, fallback_frames, fallback_path,
+                    )
+                    final_audio = os.path.basename(fallback_path)
+
                 with jobs_lock:
                     jobs[job_id]["status"] = "done"
                     jobs[job_id]["result"] = {
-                        "audio_file": os.path.basename(result.audio_path),
+                        "audio_file": final_audio,
                         "tags": result.tags_used,
                         "num_frames": result.num_frames,
                         "elapsed": round(elapsed, 1),
                         "model": model_name,
                     }
+                    # Clear partial fields now that we have final result
+                    jobs[job_id].pop("partial_audio_file", None)
+                    jobs[job_id].pop("partial_version", None)
                     _save_job(job_id)
                 gen_stats["completed"] += 1
             except Exception as e:
@@ -225,6 +463,13 @@ def serve():
                 gen_stats["pending"] = max(0, gen_stats["pending"] - 1)
                 gen_stats["generating"] = job_queue.qsize() > 0
                 job_queue.task_done()
+                # Clean up frames files
+                for suffix in [".pt", ".json", "_decoded.json"]:
+                    path = os.path.join(frames_dir, f"{job_id}{suffix}")
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
     worker = threading.Thread(target=generation_worker, daemon=True)
     worker.start()
@@ -252,6 +497,7 @@ def serve():
 
     @fapi.post("/api/submit")
     def submit(req: SubmitRequest):
+        import uuid as _uuid
         if not req.prompt.strip() or not req.lyrics.strip():
             raise HTTPException(400, "Prompt and lyrics required")
         if req.model not in ("original", "dpo"):
@@ -261,7 +507,7 @@ def serve():
         if req.model == "dpo" and req.user_email != DPO_USER_EMAIL:
             effective_model = "original"
 
-        job_id = str(uuid.uuid4())[:8]
+        job_id = str(_uuid.uuid4())[:8]
         with jobs_lock:
             jobs[job_id] = {"status": "pending"}
             _save_job(job_id)
@@ -295,7 +541,10 @@ def serve():
     def serve_audio(filename: str):
         path = os.path.join(output_dir, filename)
         if not os.path.isfile(path):
-            raise HTTPException(404, "Audio file not found")
+            # T4 may have written the file — reload volume and retry
+            erised_vol.reload()
+            if not os.path.isfile(path):
+                raise HTTPException(404, "Audio file not found")
         media = "audio/wav" if filename.endswith(".wav") else "audio/mpeg"
         return FileResponse(path, media_type=media)
 
@@ -318,6 +567,7 @@ def serve():
 
     @fapi.post("/api/queue")
     def queue_pairs(req: QueueRequest):
+        import uuid as _uuid
         if not req.prompt.strip() or not req.lyrics.strip():
             raise HTTPException(400, "Prompt and lyrics required")
 
@@ -325,9 +575,9 @@ def serve():
         second_model = "dpo" if use_dpo else "original"
 
         for _ in range(min(req.count, 10)):
-            pair_id = str(uuid.uuid4())[:8]
-            orig_job_id = str(uuid.uuid4())[:8]
-            dpo_job_id = str(uuid.uuid4())[:8]
+            pair_id = str(_uuid.uuid4())[:8]
+            orig_job_id = str(_uuid.uuid4())[:8]
+            dpo_job_id = str(_uuid.uuid4())[:8]
 
             with jobs_lock:
                 jobs[orig_job_id] = {"status": "pending"}

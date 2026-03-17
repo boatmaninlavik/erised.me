@@ -105,9 +105,9 @@ function SongCard({
     ? Math.round((progress.current_frame / progress.total_frames) * 100)
     : 0;
 
-  // Two phases: composing tokens (no audio yet) vs decoding audio (chunks arriving)
+  // Phases: composing tokens (no audio) → streaming (audio playing while still generating)
   const isComposing = isLoading && !partialAudio;
-  const isDecoding = isLoading && !!partialAudio;
+  const isStreaming = isLoading && !!partialAudio;
 
   if (status === "idle") return null;
 
@@ -121,8 +121,8 @@ function SongCard({
               Composing{progressPct > 0 ? ` (${progressPct}%)` : "..."}
             </span>
           )}
-          {isDecoding && !audioSrc && (
-            <span className="text-xs text-zinc-500 animate-pulse">Preparing audio...</span>
+          {isStreaming && !audioSrc && (
+            <span className="text-xs text-zinc-500 animate-pulse">Streaming audio...</span>
           )}
         </div>
       )}
@@ -131,8 +131,8 @@ function SongCard({
           Composing{progressPct > 0 ? ` (${progressPct}%)` : "..."}
         </span>
       )}
-      {!label && isDecoding && !audioSrc && (
-        <span className="text-xs text-zinc-500 animate-pulse">Preparing audio...</span>
+      {!label && isStreaming && !audioSrc && (
+        <span className="text-xs text-zinc-500 animate-pulse">Streaming audio...</span>
       )}
 
       {/* Single audio player — appears as soon as first chunk is ready, stays forever */}

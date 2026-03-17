@@ -80,6 +80,7 @@ class ErisedPipeline:
         topk: Optional[int] = None,
         cfg_scale: Optional[float] = None,
         on_progress: Optional[Callable] = None,
+        on_frames_checkpoint: Optional[Callable] = None,
     ) -> GenerationResult:
         """Generate a song from a musical prompt + lyrics. Returns audio path + saved tokens."""
 
@@ -97,7 +98,8 @@ class ErisedPipeline:
             "cfg_scale": cfg_scale or self.config.cfg_scale,
         }
 
-        frames = self._generate_and_capture(tags, lyrics, audio_path, on_progress=on_progress, **kwargs)
+        frames = self._generate_and_capture(tags, lyrics, audio_path, on_progress=on_progress,
+                                              on_frames_checkpoint=on_frames_checkpoint, **kwargs)
 
         torch.save(frames.cpu(), tokens_path)
         logger.info("Saved tokens (%d frames) to %s", frames.shape[-1], tokens_path)
@@ -152,6 +154,7 @@ class ErisedPipeline:
         lyrics: str,
         save_path: str,
         on_progress: Optional[Callable] = None,
+        on_frames_checkpoint: Optional[Callable] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -229,6 +232,12 @@ class ErisedPipeline:
 
         max_audio_frames = max_audio_length_ms // 80
 
+        # Frame checkpoint thresholds for streaming decode on separate GPU.
+        # First chunk needs 372 frames, then every 320 frames after that.
+        _FIRST_CHUNK = int(29.76 * 12.5)   # 372
+        _HOP = _FIRST_CHUNK // 93 * 80     # 320
+        next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
+
         # Autoregressive generation loop — NO codec decode here.
         # Running codec (flow_matching + scalar_model) while mula has
         # active KV caches causes SIGABRT / GPU state corruption.
@@ -252,23 +261,35 @@ class ErisedPipeline:
             if len(frames) % 10 == 0 and on_progress:
                 on_progress(len(frames), max_audio_frames, None, None)
 
-        # Stack frames and decode to audio (safe — generation is complete)
+            # Send frames to external codec worker at checkpoint thresholds
+            if next_checkpoint and len(frames) >= next_checkpoint:
+                frames_tensor_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+                on_frames_checkpoint(frames_tensor_cp, is_final=False)
+                next_checkpoint += _HOP
+
+        # Stack frames and decode to audio
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
         num_gen_frames = len(frames)
 
-        def _on_chunk(chunk_idx, total_chunks):
-            if on_progress:
-                on_progress(
-                    num_gen_frames, max_audio_frames,
-                    os.path.basename(save_path), chunk_idx,
-                )
+        if on_frames_checkpoint:
+            # External decoder handles all audio — send final frames
+            on_frames_checkpoint(frames_tensor, is_final=True)
+            logger.info("Frames sent to external decoder (%d frames)", frames_tensor.shape[-1])
+        else:
+            # No external decoder — decode locally (original path)
+            def _on_chunk(chunk_idx, total_chunks):
+                if on_progress:
+                    on_progress(
+                        num_gen_frames, max_audio_frames,
+                        os.path.basename(save_path), chunk_idx,
+                    )
 
-        streaming_detokenize(
-            self.pipe.codec, frames_tensor, save_path,
-            on_chunk_ready=_on_chunk,
-        )
+            streaming_detokenize(
+                self.pipe.codec, frames_tensor, save_path,
+                on_chunk_ready=_on_chunk,
+            )
+            logger.info("Audio saved to %s (%d frames)", save_path, frames_tensor.shape[-1])
 
-        logger.info("Audio saved to %s (%d frames)", save_path, frames_tensor.shape[-1])
         return frames_tensor
 
     def get_model(self):
@@ -315,6 +336,7 @@ class ErisedPipeline:
         cfg_scale: Optional[float] = None,
         dpo_scale: float = 1.0,
         on_progress: Optional[Callable] = None,
+        on_frames_checkpoint: Optional[Callable] = None,
     ) -> GenerationResult:
         """
         Generate a song using DPO Guided inference.
@@ -351,6 +373,7 @@ class ErisedPipeline:
             cfg_scale=cfg_scale or self.config.cfg_scale,
             dpo_scale=dpo_scale,
             on_progress=on_progress,
+            on_frames_checkpoint=on_frames_checkpoint,
         )
 
         torch.save(frames.cpu(), tokens_path)
