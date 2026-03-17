@@ -66,6 +66,7 @@ image = (
 def serve():
     """Create and return the FastAPI app."""
     import sys
+    import json
     import logging
     import queue
     import threading
@@ -89,7 +90,9 @@ def serve():
     model_path = os.environ.get("ERISED_MODEL_PATH", "/data/ckpt")
     dpo_path = os.environ.get("ERISED_DPO_PATH", "/data/dpo_checkpoints_v11/dpo_best")
     output_dir = "/data/outputs"
+    jobs_dir = "/data/jobs"
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(jobs_dir, exist_ok=True)
 
     os.environ.setdefault("ERISED_MODEL_PATH", model_path)
     os.environ.setdefault("ERISED_OUTPUT_DIR", output_dir)
@@ -107,29 +110,79 @@ def serve():
     pipeline.init_guided(dpo_checkpoint_path=dpo_path)
     logger.info("DPO Guided ready.")
 
-    # ── Job queue (same as compare_local.py) ──────────────────────────
+    # ── Job persistence (survives deploys & container routing) ─────
+    # In-memory dict for fast access; important state changes also
+    # written to /data/jobs/ on the Modal Volume.
+    jobs: dict[str, dict] = {}
+    jobs_lock = threading.Lock()
+
+    def _job_path(job_id: str) -> str:
+        return os.path.join(jobs_dir, f"{job_id}.json")
+
+    def _save_job(job_id: str):
+        """Write job state to volume (atomic via temp file)."""
+        data = jobs.get(job_id)
+        if data is None:
+            return
+        tmp = _job_path(job_id) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _job_path(job_id))
+
+    def _load_job(job_id: str) -> dict | None:
+        """Load job from volume if not in memory."""
+        path = _job_path(job_id)
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            jobs[job_id] = data
+            return data
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    # Load any existing jobs from a previous container
+    for fname in os.listdir(jobs_dir):
+        if fname.endswith(".json") and not fname.endswith(".tmp"):
+            jid = fname[:-5]
+            _load_job(jid)
+    if jobs:
+        logger.info("Loaded %d existing jobs from volume", len(jobs))
+
+    # ── Job queue ──────────────────────────────────────────────────
     gen_lock = threading.Lock()
     gen_stats = {"pending": 0, "completed": 0, "generating": False}
-    jobs = {}
-    job_queue = queue.Queue()
+    job_queue: queue.Queue = queue.Queue()
 
     DPO_USER_EMAIL = os.environ.get("ERISED_DPO_USER_EMAIL", "zsean@berkeley.edu")
 
     def generation_worker():
         while True:
             job_id, prompt, lyrics, max_sec, model_name, dpo_scale = job_queue.get()
-            jobs[job_id]["status"] = "running"
+            with jobs_lock:
+                jobs[job_id]["status"] = "running"
+                _save_job(job_id)
             gen_stats["generating"] = True
 
+            last_save_time = 0.0
+
             def on_progress(current_frame, total_frames, partial_audio_file=None, partial_version=None):
-                jobs[job_id]["progress"] = {
-                    "current_frame": current_frame,
-                    "total_frames": total_frames,
-                }
-                if partial_audio_file:
-                    jobs[job_id]["partial_audio_file"] = partial_audio_file
-                if partial_version is not None:
-                    jobs[job_id]["partial_version"] = partial_version
+                nonlocal last_save_time
+                with jobs_lock:
+                    jobs[job_id]["progress"] = {
+                        "current_frame": current_frame,
+                        "total_frames": total_frames,
+                    }
+                    if partial_audio_file:
+                        jobs[job_id]["partial_audio_file"] = partial_audio_file
+                    if partial_version is not None:
+                        jobs[job_id]["partial_version"] = partial_version
+                    # Persist to disk at most every 5 seconds (or on audio chunk)
+                    now = time.time()
+                    if partial_audio_file or (now - last_save_time > 5):
+                        _save_job(job_id)
+                        last_save_time = now
 
             try:
                 with gen_lock:
@@ -151,19 +204,23 @@ def serve():
                     logger.info("[%s] Generated %s in %.1fs (%d frames)",
                                 model_name, result.audio_path, elapsed, result.num_frames)
 
-                jobs[job_id]["status"] = "done"
-                jobs[job_id]["result"] = {
-                    "audio_file": os.path.basename(result.audio_path),
-                    "tags": result.tags_used,
-                    "num_frames": result.num_frames,
-                    "elapsed": round(elapsed, 1),
-                    "model": model_name,
-                }
+                with jobs_lock:
+                    jobs[job_id]["status"] = "done"
+                    jobs[job_id]["result"] = {
+                        "audio_file": os.path.basename(result.audio_path),
+                        "tags": result.tags_used,
+                        "num_frames": result.num_frames,
+                        "elapsed": round(elapsed, 1),
+                        "model": model_name,
+                    }
+                    _save_job(job_id)
                 gen_stats["completed"] += 1
             except Exception as e:
                 logger.exception("Generation error for job %s", job_id)
-                jobs[job_id]["status"] = "error"
-                jobs[job_id]["error"] = str(e)
+                with jobs_lock:
+                    jobs[job_id]["status"] = "error"
+                    jobs[job_id]["error"] = str(e)
+                    _save_job(job_id)
             finally:
                 gen_stats["pending"] = max(0, gen_stats["pending"] - 1)
                 gen_stats["generating"] = job_queue.qsize() > 0
@@ -205,7 +262,9 @@ def serve():
             effective_model = "original"
 
         job_id = str(uuid.uuid4())[:8]
-        jobs[job_id] = {"status": "pending"}
+        with jobs_lock:
+            jobs[job_id] = {"status": "pending"}
+            _save_job(job_id)
         gen_stats["pending"] += 1
         job_queue.put((job_id, req.prompt, req.lyrics, req.max_sec, effective_model, req.dpo_scale))
         logger.info("Job %s: model=%s, user=%s", job_id, effective_model, req.user_email)
@@ -213,9 +272,14 @@ def serve():
 
     @fapi.get("/api/job/{job_id}")
     def get_job(job_id: str):
-        if job_id not in jobs:
-            raise HTTPException(404, "Unknown job_id")
-        return jobs[job_id]
+        with jobs_lock:
+            if job_id in jobs:
+                return jobs[job_id]
+        # Try loading from volume (handles multi-container / post-deploy)
+        data = _load_job(job_id)
+        if data is not None:
+            return data
+        raise HTTPException(404, "Unknown job_id")
 
     @fapi.get("/api/status")
     def status():
@@ -265,8 +329,11 @@ def serve():
             orig_job_id = str(uuid.uuid4())[:8]
             dpo_job_id = str(uuid.uuid4())[:8]
 
-            jobs[orig_job_id] = {"status": "pending"}
-            jobs[dpo_job_id] = {"status": "pending"}
+            with jobs_lock:
+                jobs[orig_job_id] = {"status": "pending"}
+                jobs[dpo_job_id] = {"status": "pending"}
+                _save_job(orig_job_id)
+                _save_job(dpo_job_id)
             gen_stats["pending"] += 2
 
             rate_pending_pairs[pair_id] = {
