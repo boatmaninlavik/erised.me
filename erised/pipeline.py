@@ -210,22 +210,17 @@ class ErisedPipeline:
     def init_guided(
         self,
         dpo_checkpoint_path: str,
-        n_dpo_layers: int = 2,
+        **kwargs,
     ):
         """
         Initialize the DPO Guided system. Call this once after pipeline init.
 
-        Creates a DPOGuider that holds only the top N DPO-trained layers,
-        sharing the bottom layers with the original model to minimize VRAM.
-
-        Args:
-            dpo_checkpoint_path: Path to the DPO checkpoint (e.g. dpo_best).
-            n_dpo_layers: Number of top backbone layers that were DPO-trained.
+        Creates a full deep copy of the model and loads DPO weights into it
+        (same proven approach as v8). Requires A100-80GB.
         """
         self.guider = DPOGuider(
             orig_model=self.pipe.mula,
             dpo_checkpoint_path=dpo_checkpoint_path,
-            n_dpo_layers=n_dpo_layers,
         )
         logger.info("DPO Guided system initialized from %s", dpo_checkpoint_path)
 

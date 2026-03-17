@@ -1,18 +1,9 @@
 """
-DPO Logit Guidance — memory-efficient version of v8's two-model approach.
-
-v8 used two full model copies (~38GB) and called model.backbone() on each.
-That OOMs on A100-40GB. Instead, we keep only the DPO-trained layers as
-separate copies. The original model's backbone runs ONCE (proven code path),
-a forward hook captures the hidden state after the last shared layer, then
-the DPO top layers run separately on that captured state.
+DPO Logit Guidance — exact v8 approach with two full model copies.
 
     logits_final = logits_orig + scale * (logits_dpo - logits_orig)
 
-Key insight: torchtune's KVCache uses a monotonic counter (cache_pos),
-NOT input_pos, for cache indexing. Running backbone() twice per frame
-would corrupt the shared layers' caches. The hook approach avoids this
-by running shared layers exactly once.
+Requires A100-80GB to fit both models in VRAM.
 """
 
 import glob
@@ -59,7 +50,7 @@ def _generate_frame_logits(model, tokens, tokens_mask, input_pos, cfg_scale,
                            continuous_segments=None, starts=None):
     """
     Run one frame through a model's backbone and return (c0_logits, last_h).
-    Same logic as v8's generate_frame_logits — proven code path.
+    Identical to v8's generate_frame_logits.
     """
     b, s, _ = tokens.size()
     backbone_mask = _index_causal_mask(model.backbone_causal_mask, input_pos)
@@ -93,46 +84,99 @@ def _generate_frame_logits(model, tokens, tokens_mask, input_pos, cfg_scale,
     return c0_logits, last_h
 
 
+def _guided_generate_frame(orig_model, dpo_model, tokens, tokens_mask, input_pos,
+                           temperature, topk, cfg_scale, dpo_scale,
+                           continuous_segments=None, starts=None):
+    """
+    Generate one frame using logit guidance from two models.
+    Identical to v8's guided_generate_frame.
+    """
+    b = tokens.size(0)
+    embeds_dtype = next(orig_model.parameters()).dtype
+
+    # Get logits from both models independently
+    orig_c0_logits, orig_last_h = _generate_frame_logits(
+        orig_model, tokens, tokens_mask, input_pos, cfg_scale,
+        continuous_segments, starts,
+    )
+    dpo_c0_logits, _ = _generate_frame_logits(
+        dpo_model, tokens, tokens_mask, input_pos, cfg_scale,
+        continuous_segments, starts,
+    )
+
+    # Combine logits with CFG + DPO guidance
+    if cfg_scale > 1.0 and b > 1 and (b % 2 == 0):
+        actual_B = b // 2
+        orig_cond = orig_c0_logits[:actual_B]
+        orig_uncond = orig_c0_logits[actual_B:]
+        orig_guided = orig_uncond + (orig_cond - orig_uncond) * cfg_scale
+
+        dpo_cond = dpo_c0_logits[:actual_B]
+        dpo_uncond = dpo_c0_logits[actual_B:]
+        dpo_guided = dpo_uncond + (dpo_cond - dpo_uncond) * cfg_scale
+
+        final_logits = orig_guided + dpo_scale * (dpo_guided - orig_guided)
+        c0_sample = _sample_topk(final_logits, topk, temperature)
+        c0_sample = c0_sample.repeat(2, 1)
+    else:
+        final_logits = orig_c0_logits + dpo_scale * (dpo_c0_logits - orig_c0_logits)
+        c0_sample = _sample_topk(final_logits, topk, temperature)
+
+    # Decoder: codebooks 1-7 (original model only, same as v8)
+    orig_model.decoder.reset_caches()
+    c0_embed = orig_model._embed_audio(0, c0_sample)
+    curr_h = torch.cat([orig_last_h.unsqueeze(1), c0_embed], dim=1)
+    curr_sample = c0_sample.clone()
+    curr_pos = (
+        torch.arange(0, curr_h.size(1), device=curr_h.device)
+        .unsqueeze(0).repeat(curr_h.size(0), 1)
+    )
+    curr_h = curr_h.to(embeds_dtype)
+
+    for i in range(1, orig_model.config.audio_num_codebooks):
+        curr_decoder_mask = _index_causal_mask(orig_model.decoder_causal_mask, curr_pos)
+        decoder_h = orig_model.decoder(
+            orig_model.projection(curr_h),
+            input_pos=curr_pos,
+            mask=curr_decoder_mask,
+        )
+        ci_logits = torch.mm(decoder_h[:, -1, :], orig_model.audio_head[i - 1])
+
+        if cfg_scale > 1.0 and b > 1 and (b % 2 == 0):
+            actual_B = b // 2
+            cond_ci = ci_logits[:actual_B]
+            uncond_ci = ci_logits[actual_B:]
+            guided_ci = uncond_ci + (cond_ci - uncond_ci) * cfg_scale
+            ci_sample = _sample_topk(guided_ci, topk, temperature)
+            ci_sample = ci_sample.repeat(2, 1)
+        else:
+            ci_sample = _sample_topk(ci_logits, topk, temperature)
+
+        ci_embed = orig_model._embed_audio(i, ci_sample)
+        curr_h = ci_embed
+        curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
+        curr_pos = curr_pos[:, -1:] + 1
+
+    return curr_sample
+
+
 class DPOGuider:
     """
-    Memory-efficient DPO guided generation.
-
-    Instead of deepcopy-ing the entire model (~19GB), we only copy the
-    DPO-trained layers. The original backbone runs once per frame (proven
-    code path). A forward hook captures the hidden state after the last
-    shared layer. The DPO top layers then run separately on that state
-    to produce DPO logits. This avoids KV cache corruption (torchtune's
-    KVCache uses a monotonic counter, so running backbone twice would
-    double-advance the shared layers' cache positions).
+    Exact v8 approach: two full model copies, each with independent KV caches.
+    Requires A100-80GB.
     """
 
-    def __init__(
-        self,
-        orig_model,
-        dpo_checkpoint_path: str,
-        n_dpo_layers: int = 8,
-    ):
+    def __init__(self, orig_model, dpo_checkpoint_path: str):
         self.orig_model = orig_model
-        self.n_dpo_layers = n_dpo_layers
         self.device = next(orig_model.parameters()).device
         self.dtype = next(orig_model.parameters()).dtype
 
-        n_layers = len(orig_model.backbone.layers)
-        self.n_shared = n_layers - n_dpo_layers
-        logger.info(
-            "DPOGuider: %d total layers, %d shared, %d DPO-branched",
-            n_layers, self.n_shared, n_dpo_layers,
-        )
+        # Full deep copy of the model (same as v8)
+        logger.info("Creating full DPO model copy (deepcopy)...")
+        self.dpo_model = deepcopy(orig_model)
+        self.dpo_model.to(self.device)
 
-        # Deep copy only the DPO-trained parts
-        self.dpo_top_layers = [
-            deepcopy(orig_model.backbone.layers[self.n_shared + i])
-            for i in range(n_dpo_layers)
-        ]
-        self.dpo_backbone_norm = deepcopy(orig_model.backbone.norm)
-        self.dpo_codebook0_head = deepcopy(orig_model.codebook0_head)
-
-        # Load DPO weights from checkpoint (to CPU first to avoid OOM)
+        # Load ALL DPO checkpoint weights (same as v8)
         logger.info("Loading DPO weights from %s ...", dpo_checkpoint_path)
         from safetensors.torch import load_file
         files = sorted(glob.glob(os.path.join(dpo_checkpoint_path, "*.safetensors")))
@@ -143,179 +187,16 @@ class DPOGuider:
 
         full_state = {}
         for f in files:
-            full_state.update(load_file(f, device="cpu"))
-        logger.info("Loaded %d tensors from checkpoint", len(full_state))
-
-        # Extract top layer weights (remap indices)
-        for i in range(n_dpo_layers):
-            src_idx = self.n_shared + i
-            prefix = f"backbone.layers.{src_idx}."
-            layer_state = {
-                k[len(prefix):]: v
-                for k, v in full_state.items()
-                if k.startswith(prefix)
-            }
-            if layer_state:
-                self.dpo_top_layers[i].load_state_dict(layer_state, strict=False)
-                logger.info("Loaded %d tensors into DPO layer %d (backbone.layers.%d)",
-                            len(layer_state), i, src_idx)
-
-        # Extract norm weights
-        norm_state = {
-            k[len("backbone.norm."):]: v
-            for k, v in full_state.items()
-            if k.startswith("backbone.norm.")
-        }
-        if norm_state:
-            self.dpo_backbone_norm.load_state_dict(norm_state, strict=False)
-
-        # Extract codebook0_head weights
-        head_state = {
-            k[len("codebook0_head."):]: v
-            for k, v in full_state.items()
-            if k.startswith("codebook0_head.")
-        }
-        if head_state:
-            self.dpo_codebook0_head.load_state_dict(head_state, strict=False)
-
+            full_state.update(load_file(f, device=str(self.device)))
+        self.dpo_model.load_state_dict(full_state, strict=False)
+        logger.info("Loaded %d DPO tensors", len(full_state))
         del full_state
 
-        # Move to device
-        for layer in self.dpo_top_layers:
-            layer.to(self.device)
-        self.dpo_backbone_norm.to(self.device)
-        self.dpo_codebook0_head.to(self.device)
-
+        self.dpo_model.eval()
         logger.info(
-            "DPOGuider ready. VRAM: %.2f GB",
+            "DPOGuider ready (full copy). VRAM: %.2f GB",
             torch.cuda.memory_allocated(self.device) / 1024**3,
         )
-
-    def _setup_dpo_caches(self, bs_size: int):
-        """Set up KV caches for the DPO layers (mirrors model.setup_caches)."""
-        for layer in self.dpo_top_layers:
-            attn = getattr(layer, "attn", None)
-            if attn is not None:
-                if getattr(attn, "kv_cache", None) is not None:
-                    attn.kv_cache = None
-                    attn.cache_enabled = False
-
-        backbone = self.orig_model.backbone
-        max_seq = getattr(backbone, "decoder_max_cache_seq_len",
-                          getattr(backbone, "max_seq_len", 4096))
-
-        with torch.device(self.device):
-            for layer in self.dpo_top_layers:
-                layer.setup_caches(
-                    bs_size, self.dtype,
-                    encoder_max_seq_len=max_seq,
-                    decoder_max_seq_len=max_seq,
-                )
-
-    def _reset_dpo_caches(self):
-        for layer in self.dpo_top_layers:
-            attn = getattr(layer, "attn", None)
-            if attn is not None:
-                if getattr(attn, "kv_cache", None) is not None:
-                    attn.kv_cache = None
-                    attn.cache_enabled = False
-
-    def _guided_generate_frame(
-        self,
-        tokens, tokens_mask, input_pos,
-        temperature, topk, cfg_scale, dpo_scale,
-        continuous_segments=None, starts=None,
-    ):
-        """
-        Generate one frame with DPO logit guidance.
-
-        1. Register hook on last shared layer to capture hidden state
-        2. Run original model's full backbone ONCE (proven code path)
-        3. Run DPO top layers on captured hidden state
-        4. Combine logits, sample, run decoder
-        """
-        model = self.orig_model
-        b = tokens.size(0)
-        embeds_dtype = self.dtype
-
-        # Hook to capture hidden state after last shared layer
-        captured = {}
-        def capture_hook(module, input, output):
-            captured['h'] = output
-
-        handle = model.backbone.layers[self.n_shared - 1].register_forward_hook(capture_hook)
-
-        # === Original forward (proven code path, backbone runs ONCE) ===
-        orig_c0_logits, orig_last_h = _generate_frame_logits(
-            model, tokens, tokens_mask, input_pos, cfg_scale,
-            continuous_segments, starts,
-        )
-
-        handle.remove()
-
-        # === DPO forward (only top layers on captured hidden state) ===
-        backbone_mask = _index_causal_mask(model.backbone_causal_mask, input_pos)
-        dpo_h = captured['h']
-        for layer in self.dpo_top_layers:
-            dpo_h = layer(dpo_h, mask=backbone_mask, input_pos=input_pos)
-        dpo_h = self.dpo_backbone_norm(dpo_h)
-        dpo_last_h = dpo_h[:, -1, :]
-        dpo_c0_logits = self.dpo_codebook0_head(dpo_last_h)
-
-        # === Combine logits (same as v8) ===
-        if cfg_scale > 1.0 and b > 1 and (b % 2 == 0):
-            actual_B = b // 2
-            orig_cond = orig_c0_logits[:actual_B]
-            orig_uncond = orig_c0_logits[actual_B:]
-            orig_guided = orig_uncond + (orig_cond - orig_uncond) * cfg_scale
-
-            dpo_cond = dpo_c0_logits[:actual_B]
-            dpo_uncond = dpo_c0_logits[actual_B:]
-            dpo_guided = dpo_uncond + (dpo_cond - dpo_uncond) * cfg_scale
-
-            final_logits = orig_guided + dpo_scale * (dpo_guided - orig_guided)
-            c0_sample = _sample_topk(final_logits, topk, temperature)
-            c0_sample = c0_sample.repeat(2, 1)
-        else:
-            final_logits = orig_c0_logits + dpo_scale * (dpo_c0_logits - orig_c0_logits)
-            c0_sample = _sample_topk(final_logits, topk, temperature)
-
-        # === Decoder: codebooks 1-7 (original model, same as v8) ===
-        model.decoder.reset_caches()
-        c0_embed = model._embed_audio(0, c0_sample)
-        curr_h = torch.cat([orig_last_h.unsqueeze(1), c0_embed], dim=1)
-        curr_sample = c0_sample.clone()
-        curr_pos = (
-            torch.arange(0, curr_h.size(1), device=curr_h.device)
-            .unsqueeze(0).repeat(curr_h.size(0), 1)
-        )
-        curr_h = curr_h.to(embeds_dtype)
-
-        for i in range(1, model.config.audio_num_codebooks):
-            curr_decoder_mask = _index_causal_mask(model.decoder_causal_mask, curr_pos)
-            decoder_h = model.decoder(
-                model.projection(curr_h),
-                input_pos=curr_pos,
-                mask=curr_decoder_mask,
-            )
-            ci_logits = torch.mm(decoder_h[:, -1, :], model.audio_head[i - 1])
-
-            if cfg_scale > 1.0 and b > 1 and (b % 2 == 0):
-                actual_B = b // 2
-                cond_ci = ci_logits[:actual_B]
-                uncond_ci = ci_logits[actual_B:]
-                guided_ci = uncond_ci + (cond_ci - uncond_ci) * cfg_scale
-                ci_sample = _sample_topk(guided_ci, topk, temperature)
-                ci_sample = ci_sample.repeat(2, 1)
-            else:
-                ci_sample = _sample_topk(ci_logits, topk, temperature)
-
-            ci_embed = model._embed_audio(i, ci_sample)
-            curr_h = ci_embed
-            curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
-            curr_pos = curr_pos[:, -1:] + 1
-
-        return curr_sample
 
     def generate(
         self,
@@ -330,9 +211,10 @@ class DPOGuider:
         cfg_scale: float = 1.5,
         dpo_scale: float = 1.0,
     ) -> torch.Tensor:
-        """Full guided generation loop (same structure as v8's guided_forward)."""
+        """Full guided generation loop — identical to v8's guided_forward."""
         pipe = pipeline.pipe
-        model = self.orig_model
+        orig_model = self.orig_model
+        dpo_model = self.dpo_model
         device = self.device
 
         model_inputs = pipe.preprocess(
@@ -349,13 +231,13 @@ class DPOGuider:
 
         bs_size = 2 if cfg_scale != 1.0 else 1
 
-        # Reset and setup caches (original model + DPO layers)
-        _reset_model_caches(model)
-        self._reset_dpo_caches()
+        # Reset and setup caches for BOTH models (same as v8)
+        _reset_model_caches(orig_model)
+        _reset_model_caches(dpo_model)
         torch.cuda.empty_cache()
 
-        model.setup_caches(bs_size)
-        self._setup_dpo_caches(bs_size)
+        orig_model.setup_caches(bs_size)
+        dpo_model.setup_caches(bs_size)
 
         parallel_number = 8 + 1
         empty_id = pipe.config.empty_id
@@ -375,7 +257,8 @@ class DPOGuider:
 
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):
             # Initial frame
-            curr_token = self._guided_generate_frame(
+            curr_token = _guided_generate_frame(
+                orig_model, dpo_model,
                 prompt_tokens, prompt_tokens_mask, prompt_pos,
                 temperature, topk, cfg_scale, dpo_scale,
                 continuous_segment, starts,
@@ -385,7 +268,8 @@ class DPOGuider:
             # Autoregressive loop
             for i in tqdm(range(max_audio_frames), desc="Guided generation"):
                 curr_padded, curr_mask = _pad(curr_token)
-                curr_token = self._guided_generate_frame(
+                curr_token = _guided_generate_frame(
+                    orig_model, dpo_model,
                     curr_padded, curr_mask,
                     prompt_pos[..., -1:] + i + 1,
                     temperature, topk, cfg_scale, dpo_scale,

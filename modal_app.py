@@ -55,7 +55,7 @@ image = (
 
 @app.function(
     image=image,
-    gpu="A100",
+    gpu=modal.gpu.A100(size="80GB"),
     volumes={"/data": erised_vol},
     timeout=600,
     scaledown_window=300,  # 5 min idle → shut down
@@ -103,7 +103,7 @@ def serve():
     logger.info("Pipeline loaded.")
 
     logger.info("Initializing DPO Guided from %s ...", dpo_path)
-    pipeline.init_guided(dpo_checkpoint_path=dpo_path, n_dpo_layers=8)
+    pipeline.init_guided(dpo_checkpoint_path=dpo_path)
     logger.info("DPO Guided ready.")
 
     # ── Job queue (same as compare_local.py) ──────────────────────────
