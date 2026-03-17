@@ -55,6 +55,134 @@ async function pollJob(
 
 const SEAN_EMAIL = "zsean@berkeley.edu";
 
+/** Single song player card — handles streaming + final seamlessly */
+function SongCard({
+  backendUrl,
+  status,
+  result,
+  progress,
+  partialAudio,
+  partialVersion,
+  label,
+  onSave,
+  saving,
+  saved,
+}: {
+  backendUrl: string;
+  status: JobStatus;
+  result: GenerationResult | null;
+  progress: Progress | null;
+  partialAudio: string | null;
+  partialVersion: number;
+  label?: string;
+  onSave?: () => void;
+  saving?: boolean;
+  saved?: boolean;
+}) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const prevVersionRef = useRef(0);
+
+  // When partial version bumps, stash playback position before src changes
+  useEffect(() => {
+    if (partialVersion > prevVersionRef.current) {
+      const el = audioRef.current;
+      if (el && !el.paused) {
+        el.dataset.seekTo = String(el.currentTime);
+      }
+      prevVersionRef.current = partialVersion;
+    }
+  }, [partialVersion]);
+
+  // Determine the audio src — partial while generating, final when done
+  const audioSrc = result
+    ? `${backendUrl}/audio/${result.audio_file}`
+    : partialAudio
+    ? `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`
+    : null;
+
+  const isLoading = status === "pending" || status === "running";
+  const progressPct = progress && progress.total_frames > 0
+    ? Math.round((progress.current_frame / progress.total_frames) * 100)
+    : 0;
+
+  if (status === "idle") return null;
+
+  return (
+    <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
+      {label && (
+        <div className="flex items-center justify-between">
+          <h3 className="font-medium text-sm tracking-tight">{label}</h3>
+          {isLoading && (
+            <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
+          )}
+        </div>
+      )}
+      {!label && isLoading && (
+        <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
+      )}
+
+      {/* Progress bar — visible only while generating and no audio yet */}
+      {isLoading && !audioSrc && progressPct > 0 && (
+        <div className="w-full bg-zinc-800 rounded-full h-1.5">
+          <div
+            className="bg-white h-1.5 rounded-full transition-all duration-500"
+            style={{ width: `${progressPct}%` }}
+          />
+        </div>
+      )}
+
+      {/* Single audio player — appears as soon as first chunk is ready, stays forever */}
+      {audioSrc && (
+        <audio
+          ref={audioRef}
+          controls
+          autoPlay={!result}
+          src={audioSrc}
+          className="w-full"
+          onCanPlay={() => {
+            const el = audioRef.current;
+            if (el && el.dataset.seekTo) {
+              el.currentTime = parseFloat(el.dataset.seekTo);
+              delete el.dataset.seekTo;
+              el.play().catch(() => {});
+            }
+          }}
+        />
+      )}
+
+      {/* Thin progress bar under the player while still generating */}
+      {isLoading && audioSrc && progressPct > 0 && (
+        <div className="w-full bg-zinc-800 rounded-full h-1">
+          <div
+            className="bg-zinc-500 h-1 rounded-full transition-all duration-500"
+            style={{ width: `${progressPct}%` }}
+          />
+        </div>
+      )}
+
+      {status === "error" && (
+        <p className="text-xs text-red-400">Generation failed</p>
+      )}
+
+      {/* Tags + save — only when done */}
+      {result && (
+        <>
+          <p className="text-xs text-zinc-600 font-mono break-all">{result.tags}</p>
+          {onSave && (
+            <button
+              onClick={onSave}
+              disabled={saving || saved}
+              className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
+            >
+              {saved ? "Saved" : saving ? "Saving..." : "Save to My Library"}
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function GeneratePage() {
   const { user, guestId } = useAuth();
   const isSean = user?.email === SEAN_EMAIL;
@@ -80,22 +208,16 @@ export default function GeneratePage() {
   const [randomizingLyrics, setRandomizingLyrics] = useState(false);
   const [songTitle, setSongTitle] = useState("Untitled");
 
-  // Streaming playback state
+  // Streaming state
   const [origProgress, setOrigProgress] = useState<Progress | null>(null);
   const [dpoProgress, setDpoProgress] = useState<Progress | null>(null);
   const [singleProgress, setSingleProgress] = useState<Progress | null>(null);
   const [origPartialAudio, setOrigPartialAudio] = useState<string | null>(null);
   const [dpoPartialAudio, setDpoPartialAudio] = useState<string | null>(null);
   const [singlePartialAudio, setSinglePartialAudio] = useState<string | null>(null);
-  const [origPartialVersion, setOrigPartialVersion] = useState<number>(0);
-  const [dpoPartialVersion, setDpoPartialVersion] = useState<number>(0);
-  const [singlePartialVersion, setSinglePartialVersion] = useState<number>(0);
-  const origPartialRef = useRef<HTMLAudioElement>(null);
-  const dpoPartialRef = useRef<HTMLAudioElement>(null);
-  const singlePartialRef = useRef<HTMLAudioElement>(null);
-  const origFullRef = useRef<HTMLAudioElement>(null);
-  const dpoFullRef = useRef<HTMLAudioElement>(null);
-  const singleFullRef = useRef<HTMLAudioElement>(null);
+  const [origPartialVersion, setOrigPartialVersion] = useState(0);
+  const [dpoPartialVersion, setDpoPartialVersion] = useState(0);
+  const [singlePartialVersion, setSinglePartialVersion] = useState(0);
 
   const loadBackendUrl = useCallback(async () => {
     const { data } = await supabase
@@ -111,7 +233,6 @@ export default function GeneratePage() {
       return;
     }
 
-    // Quick check first (5s) — if it responds, GPU is already warm
     try {
       const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
       if (resp.ok) {
@@ -119,11 +240,8 @@ export default function GeneratePage() {
         setGpuStatus("online");
         return;
       }
-    } catch {
-      // Timeout or error — GPU is likely cold-starting on Modal
-    }
+    } catch {}
 
-    // Cold start: show "starting" and wait longer (up to 120s)
     setGpuStatus("starting");
     try {
       const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(120000) });
@@ -178,7 +296,6 @@ export default function GeneratePage() {
       const dpoJob = await dpoResp.json();
       setDpoStatus("running");
 
-      // Show each result as soon as it's ready (original first so user can listen while DPO generates)
       const origPromise = pollJob(backendUrl, origJob.job_id, (prog, partial, ver) => {
         setOrigProgress(prog);
         if (partial) setOrigPartialAudio(partial);
@@ -271,7 +388,6 @@ export default function GeneratePage() {
         model: result.model,
       };
 
-      // Try with identity fields; fall back without them if columns don't exist yet
       const { error: insertErr } = await supabase.from("dpo-songs").insert({
         ...baseRow,
         guest_id: guestId,
@@ -315,37 +431,6 @@ export default function GeneratePage() {
     }
   }
 
-  // When partial version changes, stash current playback position so onCanPlay can seek to it
-  function stashPlaybackPosition(ref: React.RefObject<HTMLAudioElement | null>) {
-    const el = ref.current;
-    if (el && !el.paused) {
-      el.dataset.seekTo = String(el.currentTime);
-    }
-  }
-
-  useEffect(() => { stashPlaybackPosition(origPartialRef); }, [origPartialVersion]);
-  useEffect(() => { stashPlaybackPosition(dpoPartialRef); }, [dpoPartialVersion]);
-  useEffect(() => { stashPlaybackPosition(singlePartialRef); }, [singlePartialVersion]);
-
-  // Seamless transition: when full audio arrives, carry over playback position from partial
-  function handleTransition(
-    partialRef: React.RefObject<HTMLAudioElement | null>,
-    fullRef: React.RefObject<HTMLAudioElement | null>,
-    setPartialAudio: (v: string | null) => void,
-  ) {
-    const partial = partialRef.current;
-    const full = fullRef.current;
-    if (!full) return;
-    if (partial && !partial.paused) {
-      const pos = partial.currentTime;
-      partial.pause();
-      full.currentTime = pos;
-      full.play().catch(() => {});
-    }
-    setPartialAudio(null);
-  }
-
-  // Non-Sean users always use single generate (no A/B with DPO)
   const effectiveTab = isSean ? tab : "single";
 
   const isGenerating =
@@ -401,7 +486,6 @@ export default function GeneratePage() {
             </p>
           </div>
 
-          {/* Tabs — A/B compare only available for Sean (DPO vs Original) */}
           {isSean ? (
             <div className="flex gap-1 bg-zinc-900 rounded-xl p-1">
               {(["ab", "single"] as const).map((t) => (
@@ -422,7 +506,6 @@ export default function GeneratePage() {
             </p>
           )}
 
-          {/* Form */}
           <div className="space-y-4">
             {tab === "single" && isSean && (
               <div className="flex gap-2">
@@ -543,160 +626,48 @@ export default function GeneratePage() {
           )}
 
           {/* A/B Results */}
-          {effectiveTab === "ab" && (origStatus !== "idle" || dpoStatus !== "idle") && (
+          {effectiveTab === "ab" && (origStatus !== "idle" || dpoStatus !== "idle") && backendUrl && (
             <div className="space-y-4">
-              {(["original", "dpo"] as const).map((model) => {
-                const result = model === "original" ? origResult : dpoResult;
-                const status = model === "original" ? origStatus : dpoStatus;
-                const progress = model === "original" ? origProgress : dpoProgress;
-                const partialAudio = model === "original" ? origPartialAudio : dpoPartialAudio;
-                const partialVersion = model === "original" ? origPartialVersion : dpoPartialVersion;
-                const partialRef = model === "original" ? origPartialRef : dpoPartialRef;
-                const fullRef = model === "original" ? origFullRef : dpoFullRef;
-                const setPartialAudio = model === "original" ? setOrigPartialAudio : setDpoPartialAudio;
-                return (
-                  <div key={model} className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <h3 className="font-medium text-sm tracking-tight">
-                        {model === "dpo" ? "DPO Guided" : "Original Model"}
-                      </h3>
-                      {(status === "running" || status === "pending") && (
-                        <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
-                      )}
-                      {result && (
-                        <span className="text-xs text-zinc-500">{result.elapsed}s · {result.num_frames} frames</span>
-                      )}
-                    </div>
-                    {result && backendUrl ? (
-                      <>
-                        <audio
-                          ref={fullRef}
-                          controls
-                          src={`${backendUrl}/audio/${result.audio_file}`}
-                          className="w-full"
-                          onCanPlay={() => handleTransition(partialRef, fullRef, setPartialAudio)}
-                        />
-                        <p className="text-xs text-zinc-600 font-mono break-all">{result.tags}</p>
-                        <button
-                          onClick={() => saveToLibrary(result)}
-                          disabled={saving !== null || savedModels.has(model)}
-                          className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
-                        >
-                          {savedModels.has(model) ? "Saved" : saving === model ? "Saving..." : "Save to My Library"}
-                        </button>
-                      </>
-                    ) : status === "error" ? (
-                      <p className="text-xs text-red-400">Generation failed</p>
-                    ) : (
-                      <div className="space-y-2">
-                        {progress && progress.total_frames > 0 && !partialAudio && (
-                          <div className="w-full bg-zinc-800 rounded-full h-1.5">
-                            <div
-                              className="bg-white h-1.5 rounded-full transition-all duration-500"
-                              style={{ width: `${Math.round((progress.current_frame / progress.total_frames) * 100)}%` }}
-                            />
-                          </div>
-                        )}
-                        <p className="text-xs text-zinc-500">
-                          {partialAudio
-                            ? "Streaming audio..."
-                            : progress
-                            ? `Generating... ${progress.current_frame}/${progress.total_frames} frames`
-                            : "Starting generation..."}
-                        </p>
-                        {partialAudio && backendUrl && (
-                          <audio
-                            ref={partialRef}
-                            controls
-                            autoPlay
-                            src={`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`}
-                            className="w-full"
-                            onCanPlay={() => {
-                              const el = partialRef.current;
-                              if (el && el.dataset.seekTo) {
-                                el.currentTime = parseFloat(el.dataset.seekTo);
-                                delete el.dataset.seekTo;
-                              }
-                              el?.play().catch(() => {});
-                            }}
-                          />
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
+              <SongCard
+                backendUrl={backendUrl}
+                status={origStatus}
+                result={origResult}
+                progress={origProgress}
+                partialAudio={origPartialAudio}
+                partialVersion={origPartialVersion}
+                label="Original Model"
+                onSave={origResult ? () => saveToLibrary(origResult) : undefined}
+                saving={saving === "original"}
+                saved={savedModels.has("original")}
+              />
+              <SongCard
+                backendUrl={backendUrl}
+                status={dpoStatus}
+                result={dpoResult}
+                progress={dpoProgress}
+                partialAudio={dpoPartialAudio}
+                partialVersion={dpoPartialVersion}
+                label="DPO Guided"
+                onSave={dpoResult ? () => saveToLibrary(dpoResult) : undefined}
+                saving={saving === "dpo"}
+                saved={savedModels.has("dpo")}
+              />
             </div>
           )}
 
           {/* Single Result */}
-          {effectiveTab === "single" && singleStatus !== "idle" && (
-            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
-              <div className="flex items-center justify-between">
-                <h3 className="font-medium text-sm tracking-tight">
-                  {selectedModel === "dpo" ? "DPO Guided" : "Original Model"}
-                </h3>
-                {(singleStatus === "running" || singleStatus === "pending") && (
-                  <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
-                )}
-              </div>
-              {singleResult && backendUrl ? (
-                <>
-                  <audio
-                    ref={singleFullRef}
-                    controls
-                    src={`${backendUrl}/audio/${singleResult.audio_file}`}
-                    className="w-full"
-                    onCanPlay={() => handleTransition(singlePartialRef, singleFullRef, setSinglePartialAudio)}
-                  />
-                  <p className="text-xs text-zinc-600 font-mono break-all">{singleResult.tags}</p>
-                  <button
-                    onClick={() => saveToLibrary(singleResult)}
-                    disabled={saving !== null || savedModels.has(selectedModel)}
-                    className="text-xs text-zinc-400 hover:text-white transition-colors disabled:opacity-40"
-                  >
-                    {savedModels.has(selectedModel) ? "Saved" : saving === selectedModel ? "Saving..." : "Save to My Library"}
-                  </button>
-                </>
-              ) : singleStatus === "error" ? (
-                <p className="text-xs text-red-400">Generation failed</p>
-              ) : (
-                <div className="space-y-2">
-                  {singleProgress && singleProgress.total_frames > 0 && !singlePartialAudio && (
-                    <div className="w-full bg-zinc-800 rounded-full h-1.5">
-                      <div
-                        className="bg-white h-1.5 rounded-full transition-all duration-500"
-                        style={{ width: `${Math.round((singleProgress.current_frame / singleProgress.total_frames) * 100)}%` }}
-                      />
-                    </div>
-                  )}
-                  <p className="text-xs text-zinc-500">
-                    {singlePartialAudio
-                      ? "Streaming audio..."
-                      : singleProgress
-                      ? `Generating... ${singleProgress.current_frame}/${singleProgress.total_frames} frames`
-                      : "Starting generation..."}
-                  </p>
-                  {singlePartialAudio && backendUrl && (
-                    <audio
-                      ref={singlePartialRef}
-                      controls
-                      autoPlay
-                      src={`${backendUrl}/audio/${singlePartialAudio}?v=${singlePartialVersion}`}
-                      className="w-full"
-                      onCanPlay={() => {
-                        const el = singlePartialRef.current;
-                        if (el && el.dataset.seekTo) {
-                          el.currentTime = parseFloat(el.dataset.seekTo);
-                          delete el.dataset.seekTo;
-                        }
-                        el?.play().catch(() => {});
-                      }}
-                    />
-                  )}
-                </div>
-              )}
-            </div>
+          {effectiveTab === "single" && singleStatus !== "idle" && backendUrl && (
+            <SongCard
+              backendUrl={backendUrl}
+              status={singleStatus}
+              result={singleResult}
+              progress={singleProgress}
+              partialAudio={singlePartialAudio}
+              partialVersion={singlePartialVersion}
+              onSave={singleResult ? () => saveToLibrary(singleResult) : undefined}
+              saving={saving === selectedModel}
+              saved={savedModels.has(selectedModel)}
+            />
           )}
         </div>
       )}
