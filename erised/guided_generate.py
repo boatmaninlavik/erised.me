@@ -16,6 +16,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from .streaming import streaming_detokenize
+
 logger = logging.getLogger(__name__)
 
 
@@ -256,7 +258,6 @@ class DPOGuider:
             return padded, mask
 
         max_audio_frames = max_audio_length_ms // 80
-        partial_decoded = False
 
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):
             # Initial frame
@@ -268,7 +269,7 @@ class DPOGuider:
             )
             frames.append(curr_token[0:1,])
 
-            # Autoregressive loop
+            # Autoregressive loop — NO codec decode here to keep GPU state clean
             for i in tqdm(range(max_audio_frames), desc="Guided generation"):
                 curr_padded, curr_mask = _pad(curr_token)
                 curr_token = _guided_generate_frame(
@@ -281,21 +282,24 @@ class DPOGuider:
                     break
                 frames.append(curr_token[0:1,])
 
-                # Single early partial decode for streaming preview (~8s of audio)
-                if len(frames) == 100 and not partial_decoded and on_progress:
-                    partial_decoded = True
-                    partial_frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
-                    partial_path = save_path.rsplit(".", 1)[0] + "_partial.wav"
-                    pipe.postprocess({"frames": partial_frames}, save_path=partial_path)
-                    logger.info("Partial audio saved to %s (%d frames)", partial_path, len(frames))
-                    on_progress(len(frames), max_audio_frames, os.path.basename(partial_path), 1)
-                elif len(frames) % 10 == 0 and on_progress:
+                if len(frames) % 10 == 0 and on_progress:
                     on_progress(len(frames), max_audio_frames, None, None)
 
-        frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+        frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+        num_gen_frames = len(frames)
 
-        with torch.no_grad():
-            pipe.postprocess({"frames": frames}, save_path=save_path)
+        # Progressive streaming decode
+        def _on_chunk(chunk_idx, total_chunks):
+            if on_progress:
+                on_progress(
+                    num_gen_frames, max_audio_frames,
+                    os.path.basename(save_path), chunk_idx,
+                )
 
-        logger.info("Guided audio saved to %s (%d frames)", save_path, frames.shape[-1])
-        return frames
+        streaming_detokenize(
+            pipe.codec, frames_tensor, save_path,
+            on_chunk_ready=_on_chunk,
+        )
+
+        logger.info("Guided audio saved to %s (%d frames)", save_path, frames_tensor.shape[-1])
+        return frames_tensor

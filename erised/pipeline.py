@@ -19,6 +19,7 @@ from heartlib import HeartMuLaGenPipeline
 from .config import ErisedConfig
 from .prompt_to_tags import PromptToTags
 from .guided_generate import DPOGuider
+from .streaming import streaming_detokenize
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ class ErisedPipeline:
         logger.info("Prompt → tags: %s", tags)
 
         gen_id = uuid.uuid4().hex[:12]
-        audio_path = os.path.join(self.config.output_dir, f"{gen_id}.mp3")
+        audio_path = os.path.join(self.config.output_dir, f"{gen_id}.wav")
         tokens_path = os.path.join(self.config.output_dir, f"{gen_id}_tokens.pt")
 
         kwargs = {
@@ -227,9 +228,9 @@ class ErisedPipeline:
             return padded, mask
 
         max_audio_frames = max_audio_length_ms // 80
-        partial_decoded = False
 
-        # Autoregressive generation loop
+        # Autoregressive generation loop — NO codec decode here to keep
+        # GPU state clean and avoid the blank-song corruption bug.
         for i in range(max_audio_frames):
             curr_padded, curr_mask = _pad(curr_token)
             with torch.autocast(device_type=device.type, dtype=dtype):
@@ -247,24 +248,28 @@ class ErisedPipeline:
                 break
             frames.append(curr_token[0:1,])
 
-            # Single early partial decode for streaming preview (~8s of audio)
-            if len(frames) == 100 and not partial_decoded and on_progress:
-                partial_decoded = True
-                partial_frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
-                partial_path = save_path.rsplit(".", 1)[0] + "_partial.wav"
-                with torch.no_grad():
-                    self.pipe.postprocess({"frames": partial_frames}, save_path=partial_path)
-                logger.info("Partial audio saved to %s (%d frames)", partial_path, len(frames))
-                on_progress(len(frames), max_audio_frames, os.path.basename(partial_path), 1)
-            elif len(frames) % 10 == 0 and on_progress:
+            if len(frames) % 10 == 0 and on_progress:
                 on_progress(len(frames), max_audio_frames, None, None)
 
         # Stack frames into final tensor
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+        num_gen_frames = len(frames)
 
-        # Final decode
-        with torch.no_grad():
-            self.pipe.postprocess({"frames": frames_tensor}, save_path=save_path)
+        # Progressive streaming decode — interleaves flow-matching and scalar
+        # decode per chunk so the first ~30s of audio is available after only
+        # 1/N of total decode time.  Same wall-clock cost as the original
+        # all-at-once decode.
+        def _on_chunk(chunk_idx, total_chunks):
+            if on_progress:
+                on_progress(
+                    num_gen_frames, max_audio_frames,
+                    os.path.basename(save_path), chunk_idx,
+                )
+
+        streaming_detokenize(
+            self.pipe.codec, frames_tensor, save_path,
+            on_chunk_ready=_on_chunk,
+        )
 
         logger.info("Audio saved to %s (%d frames)", save_path, frames_tensor.shape[-1])
         return frames_tensor
@@ -335,7 +340,7 @@ class ErisedPipeline:
         logger.info("Prompt → tags: %s", tags)
 
         gen_id = uuid.uuid4().hex[:12]
-        audio_path = os.path.join(self.config.output_dir, f"{gen_id}.mp3")
+        audio_path = os.path.join(self.config.output_dir, f"{gen_id}.wav")
         tokens_path = os.path.join(self.config.output_dir, f"{gen_id}_tokens.pt")
 
         frames = self.guider.generate(

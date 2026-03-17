@@ -589,7 +589,7 @@ export default function GeneratePage() {
                       <p className="text-xs text-red-400">Generation failed</p>
                     ) : (
                       <div className="space-y-2">
-                        {progress && progress.total_frames > 0 && (
+                        {progress && progress.total_frames > 0 && !partialAudio && (
                           <div className="w-full bg-zinc-800 rounded-full h-1.5">
                             <div
                               className="bg-white h-1.5 rounded-full transition-all duration-500"
@@ -598,29 +598,28 @@ export default function GeneratePage() {
                           </div>
                         )}
                         <p className="text-xs text-zinc-500">
-                          {progress
+                          {partialAudio
+                            ? "Streaming audio..."
+                            : progress
                             ? `Generating... ${progress.current_frame}/${progress.total_frames} frames`
                             : "Starting generation..."}
                         </p>
                         {partialAudio && backendUrl && (
-                          <div className="space-y-1">
-                            <p className="text-xs text-zinc-400">Streaming preview:</p>
-                            <audio
-                              ref={partialRef}
-                              controls
-                              autoPlay
-                              src={`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`}
-                              className="w-full"
-                              onCanPlay={() => {
-                                const el = partialRef.current;
-                                if (el && el.dataset.seekTo) {
-                                  el.currentTime = parseFloat(el.dataset.seekTo);
-                                  delete el.dataset.seekTo;
-                                  el.play().catch(() => {});
-                                }
-                              }}
-                            />
-                          </div>
+                          <audio
+                            ref={partialRef}
+                            controls
+                            autoPlay
+                            src={`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`}
+                            className="w-full"
+                            onCanPlay={() => {
+                              const el = partialRef.current;
+                              if (el && el.dataset.seekTo) {
+                                el.currentTime = parseFloat(el.dataset.seekTo);
+                                delete el.dataset.seekTo;
+                              }
+                              el?.play().catch(() => {});
+                            }}
+                          />
                         )}
                       </div>
                     )}
@@ -663,7 +662,7 @@ export default function GeneratePage() {
                 <p className="text-xs text-red-400">Generation failed</p>
               ) : (
                 <div className="space-y-2">
-                  {singleProgress && singleProgress.total_frames > 0 && (
+                  {singleProgress && singleProgress.total_frames > 0 && !singlePartialAudio && (
                     <div className="w-full bg-zinc-800 rounded-full h-1.5">
                       <div
                         className="bg-white h-1.5 rounded-full transition-all duration-500"
@@ -672,29 +671,28 @@ export default function GeneratePage() {
                     </div>
                   )}
                   <p className="text-xs text-zinc-500">
-                    {singleProgress
+                    {singlePartialAudio
+                      ? "Streaming audio..."
+                      : singleProgress
                       ? `Generating... ${singleProgress.current_frame}/${singleProgress.total_frames} frames`
                       : "Starting generation..."}
                   </p>
                   {singlePartialAudio && backendUrl && (
-                    <div className="space-y-1">
-                      <p className="text-xs text-zinc-400">Streaming preview:</p>
-                      <audio
-                        ref={singlePartialRef}
-                        controls
-                        autoPlay
-                        src={`${backendUrl}/audio/${singlePartialAudio}?v=${singlePartialVersion}`}
-                        className="w-full"
-                        onCanPlay={() => {
-                          const el = singlePartialRef.current;
-                          if (el && el.dataset.seekTo) {
-                            el.currentTime = parseFloat(el.dataset.seekTo);
-                            delete el.dataset.seekTo;
-                            el.play().catch(() => {});
-                          }
-                        }}
-                      />
-                    </div>
+                    <audio
+                      ref={singlePartialRef}
+                      controls
+                      autoPlay
+                      src={`${backendUrl}/audio/${singlePartialAudio}?v=${singlePartialVersion}`}
+                      className="w-full"
+                      onCanPlay={() => {
+                        const el = singlePartialRef.current;
+                        if (el && el.dataset.seekTo) {
+                          el.currentTime = parseFloat(el.dataset.seekTo);
+                          delete el.dataset.seekTo;
+                        }
+                        el?.play().catch(() => {});
+                      }}
+                    />
                   )}
                 </div>
               )}
