@@ -55,7 +55,7 @@ image = (
 
 @app.function(
     image=image,
-    gpu=modal.gpu.A100(size="80GB"),
+    gpu="A100-80GB",
     volumes={"/data": erised_vol},
     timeout=600,
     scaledown_window=300,  # 5 min idle → shut down
