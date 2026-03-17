@@ -227,8 +227,7 @@ class ErisedPipeline:
             return padded, mask
 
         max_audio_frames = max_audio_length_ms // 80
-        PARTIAL_DECODE_INTERVAL = 100
-        partial_version = 0
+        partial_decoded = False
 
         # Autoregressive generation loop
         for i in range(max_audio_frames):
@@ -248,15 +247,15 @@ class ErisedPipeline:
                 break
             frames.append(curr_token[0:1,])
 
-            # Periodic partial decode for streaming playback
-            if len(frames) >= PARTIAL_DECODE_INTERVAL and len(frames) % PARTIAL_DECODE_INTERVAL == 0 and on_progress:
-                partial_version += 1
+            # Single early partial decode for streaming preview (~8s of audio)
+            if len(frames) == 100 and not partial_decoded and on_progress:
+                partial_decoded = True
                 partial_frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
                 partial_path = save_path.rsplit(".", 1)[0] + "_partial.wav"
                 with torch.no_grad():
                     self.pipe.postprocess({"frames": partial_frames}, save_path=partial_path)
-                logger.info("Partial audio saved to %s (%d frames, v%d)", partial_path, len(frames), partial_version)
-                on_progress(len(frames), max_audio_frames, os.path.basename(partial_path), partial_version)
+                logger.info("Partial audio saved to %s (%d frames)", partial_path, len(frames))
+                on_progress(len(frames), max_audio_frames, os.path.basename(partial_path), 1)
             elif len(frames) % 10 == 0 and on_progress:
                 on_progress(len(frames), max_audio_frames, None, None)
 
