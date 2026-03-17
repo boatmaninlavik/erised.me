@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from .streaming import streaming_detokenize, StreamingDecoder
+from .streaming import streaming_detokenize
 
 logger = logging.getLogger(__name__)
 
@@ -258,12 +258,6 @@ class DPOGuider:
             return padded, mask
 
         max_audio_frames = max_audio_length_ms // 80
-        decoder = StreamingDecoder(pipe.codec, save_path)
-
-        def _on_chunk(ci, tc):
-            if on_progress:
-                on_progress(len(frames), max_audio_frames,
-                            os.path.basename(save_path), ci)
 
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):
             # Initial frame
@@ -275,6 +269,7 @@ class DPOGuider:
             )
             frames.append(curr_token[0:1,])
 
+            # Autoregressive loop — NO codec decode here (causes SIGABRT)
             for i in tqdm(range(max_audio_frames), desc="Guided generation"):
                 curr_padded, curr_mask = _pad(curr_token)
                 curr_token = _guided_generate_frame(
@@ -287,18 +282,24 @@ class DPOGuider:
                     break
                 frames.append(curr_token[0:1,])
 
-                # Decode new chunk(s) as soon as enough frames accumulate
-                if len(frames) >= decoder.next_chunk_at():
-                    interim = torch.stack(frames).permute(1, 2, 0).squeeze(0)
-                    logger.info("Mid-gen decode (guided) at %d frames", len(frames))
-                    with torch.amp.autocast(device.type, enabled=False):
-                        decoder.decode_available(interim, on_chunk_ready=_on_chunk)
-                elif len(frames) % 10 == 0 and on_progress:
+                if len(frames) % 10 == 0 and on_progress:
                     on_progress(len(frames), max_audio_frames, None, None)
 
-        # Final decode — any remaining frames
+        # Decode to audio (safe — generation complete, KV caches released)
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
-        decoder.decode_available(frames_tensor, on_chunk_ready=_on_chunk)
+        num_gen_frames = len(frames)
+
+        def _on_chunk(chunk_idx, total_chunks):
+            if on_progress:
+                on_progress(
+                    num_gen_frames, max_audio_frames,
+                    os.path.basename(save_path), chunk_idx,
+                )
+
+        streaming_detokenize(
+            pipe.codec, frames_tensor, save_path,
+            on_chunk_ready=_on_chunk,
+        )
 
         logger.info("Guided audio saved to %s (%d frames)", save_path, frames_tensor.shape[-1])
         return frames_tensor

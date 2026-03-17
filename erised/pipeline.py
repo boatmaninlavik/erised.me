@@ -19,7 +19,7 @@ from heartlib import HeartMuLaGenPipeline
 from .config import ErisedConfig
 from .prompt_to_tags import PromptToTags
 from .guided_generate import DPOGuider
-from .streaming import streaming_detokenize, StreamingDecoder
+from .streaming import streaming_detokenize
 
 logger = logging.getLogger(__name__)
 
@@ -229,15 +229,9 @@ class ErisedPipeline:
 
         max_audio_frames = max_audio_length_ms // 80
 
-        # Incremental decoder — decodes each new ~30s chunk as soon as
-        # enough frames exist, without re-decoding previous chunks.
-        decoder = StreamingDecoder(self.pipe.codec, save_path)
-
-        def _on_chunk(ci, tc):
-            if on_progress:
-                on_progress(len(frames), max_audio_frames,
-                            os.path.basename(save_path), ci)
-
+        # Autoregressive generation loop — NO codec decode here.
+        # Running codec (flow_matching + scalar_model) while mula has
+        # active KV caches causes SIGABRT / GPU state corruption.
         for i in range(max_audio_frames):
             curr_padded, curr_mask = _pad(curr_token)
             with torch.autocast(device_type=device.type, dtype=dtype):
@@ -255,17 +249,24 @@ class ErisedPipeline:
                 break
             frames.append(curr_token[0:1,])
 
-            # Decode new chunk(s) as soon as enough frames accumulate
-            if len(frames) >= decoder.next_chunk_at():
-                interim = torch.stack(frames).permute(1, 2, 0).squeeze(0)
-                logger.info("Mid-gen decode at %d frames", len(frames))
-                decoder.decode_available(interim, on_chunk_ready=_on_chunk)
-            elif len(frames) % 10 == 0 and on_progress:
+            if len(frames) % 10 == 0 and on_progress:
                 on_progress(len(frames), max_audio_frames, None, None)
 
-        # Final decode — any remaining frames that didn't fill a full chunk
+        # Stack frames and decode to audio (safe — generation is complete)
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
-        decoder.decode_available(frames_tensor, on_chunk_ready=_on_chunk)
+        num_gen_frames = len(frames)
+
+        def _on_chunk(chunk_idx, total_chunks):
+            if on_progress:
+                on_progress(
+                    num_gen_frames, max_audio_frames,
+                    os.path.basename(save_path), chunk_idx,
+                )
+
+        streaming_detokenize(
+            self.pipe.codec, frames_tensor, save_path,
+            on_chunk_ready=_on_chunk,
+        )
 
         logger.info("Audio saved to %s (%d frames)", save_path, frames_tensor.shape[-1])
         return frames_tensor
