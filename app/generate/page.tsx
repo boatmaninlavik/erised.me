@@ -105,6 +105,10 @@ function SongCard({
     ? Math.round((progress.current_frame / progress.total_frames) * 100)
     : 0;
 
+  // Two phases: composing tokens (no audio yet) vs decoding audio (chunks arriving)
+  const isComposing = isLoading && !partialAudio;
+  const isDecoding = isLoading && !!partialAudio;
+
   if (status === "idle") return null;
 
   return (
@@ -112,23 +116,23 @@ function SongCard({
       {label && (
         <div className="flex items-center justify-between">
           <h3 className="font-medium text-sm tracking-tight">{label}</h3>
-          {isLoading && (
-            <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
+          {isComposing && (
+            <span className="text-xs text-zinc-500 animate-pulse">
+              Composing{progressPct > 0 ? ` (${progressPct}%)` : "..."}
+            </span>
+          )}
+          {isDecoding && !audioSrc && (
+            <span className="text-xs text-zinc-500 animate-pulse">Preparing audio...</span>
           )}
         </div>
       )}
-      {!label && isLoading && (
-        <span className="text-xs text-zinc-500 animate-pulse">Generating...</span>
+      {!label && isComposing && (
+        <span className="text-xs text-zinc-500 animate-pulse">
+          Composing{progressPct > 0 ? ` (${progressPct}%)` : "..."}
+        </span>
       )}
-
-      {/* Progress bar — visible only while generating and no audio yet */}
-      {isLoading && !audioSrc && progressPct > 0 && (
-        <div className="w-full bg-zinc-800 rounded-full h-1.5">
-          <div
-            className="bg-white h-1.5 rounded-full transition-all duration-500"
-            style={{ width: `${progressPct}%` }}
-          />
-        </div>
+      {!label && isDecoding && !audioSrc && (
+        <span className="text-xs text-zinc-500 animate-pulse">Preparing audio...</span>
       )}
 
       {/* Single audio player — appears as soon as first chunk is ready, stays forever */}
@@ -148,16 +152,6 @@ function SongCard({
             }
           }}
         />
-      )}
-
-      {/* Thin progress bar under the player while still generating */}
-      {isLoading && audioSrc && progressPct > 0 && (
-        <div className="w-full bg-zinc-800 rounded-full h-1">
-          <div
-            className="bg-zinc-500 h-1 rounded-full transition-all duration-500"
-            style={{ width: `${progressPct}%` }}
-          />
-        </div>
       )}
 
       {status === "error" && (
