@@ -60,8 +60,8 @@ image = (
     timeout=600,
     scaledown_window=300,  # 5 min idle → shut down
     secrets=[modal.Secret.from_name("erised-secrets")],
-    allow_concurrent_inputs=1000,  # keep all requests on ONE container
 )
+@modal.concurrent(max_inputs=1000)  # keep all requests on ONE container
 @modal.asgi_app()
 def serve():
     """Create and return the FastAPI app."""
