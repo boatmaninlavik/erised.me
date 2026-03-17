@@ -103,7 +103,7 @@ def serve():
     logger.info("Pipeline loaded.")
 
     logger.info("Initializing DPO Guided from %s ...", dpo_path)
-    pipeline.init_guided(dpo_checkpoint_path=dpo_path, n_dpo_layers=2)
+    pipeline.init_guided(dpo_checkpoint_path=dpo_path, n_dpo_layers=8)
     logger.info("DPO Guided ready.")
 
     # ── Job queue (same as compare_local.py) ──────────────────────────

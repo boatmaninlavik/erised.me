@@ -1,12 +1,18 @@
 """
-DPO Logit Guidance — same approach as guided_test.py (v8) but memory-efficient.
+DPO Logit Guidance — memory-efficient version of v8's two-model approach.
 
-v8 used two full model copies and called model.backbone() on each.
-That OOMs on A100-40GB. Instead, we keep only the DPO-trained layers
-as separate copies and swap them into the original model for the DPO
-forward pass, then swap back. Same code path, same results, ~7% VRAM overhead.
+v8 used two full model copies (~38GB) and called model.backbone() on each.
+That OOMs on A100-40GB. Instead, we keep only the DPO-trained layers as
+separate copies. The original model's backbone runs ONCE (proven code path),
+a forward hook captures the hidden state after the last shared layer, then
+the DPO top layers run separately on that captured state.
 
     logits_final = logits_orig + scale * (logits_dpo - logits_orig)
+
+Key insight: torchtune's KVCache uses a monotonic counter (cache_pos),
+NOT input_pos, for cache indexing. Running backbone() twice per frame
+would corrupt the shared layers' caches. The hook approach avoids this
+by running shared layers exactly once.
 """
 
 import glob
@@ -53,7 +59,7 @@ def _generate_frame_logits(model, tokens, tokens_mask, input_pos, cfg_scale,
                            continuous_segments=None, starts=None):
     """
     Run one frame through a model's backbone and return (c0_logits, last_h).
-    This is the exact same logic as guided_test.py's generate_frame_logits (v8).
+    Same logic as v8's generate_frame_logits — proven code path.
     """
     b, s, _ = tokens.size()
     backbone_mask = _index_causal_mask(model.backbone_causal_mask, input_pos)
@@ -89,21 +95,22 @@ def _generate_frame_logits(model, tokens, tokens_mask, input_pos, cfg_scale,
 
 class DPOGuider:
     """
-    Same as v8's two-model guided generation, but memory-efficient.
+    Memory-efficient DPO guided generation.
 
     Instead of deepcopy-ing the entire model (~19GB), we only copy the
-    DPO-trained layers (~1.3GB for 2 layers + norm + head). For the DPO
-    forward pass, we temporarily swap these into the original model's
-    backbone, call model.backbone() (same proven code path as v8), then
-    swap the original layers back. Each set of layers carries its own
-    KV caches, so both branches maintain independent cache histories.
+    DPO-trained layers. The original backbone runs once per frame (proven
+    code path). A forward hook captures the hidden state after the last
+    shared layer. The DPO top layers then run separately on that state
+    to produce DPO logits. This avoids KV cache corruption (torchtune's
+    KVCache uses a monotonic counter, so running backbone twice would
+    double-advance the shared layers' cache positions).
     """
 
     def __init__(
         self,
         orig_model,
         dpo_checkpoint_path: str,
-        n_dpo_layers: int = 2,
+        n_dpo_layers: int = 8,
     ):
         self.orig_model = orig_model
         self.n_dpo_layers = n_dpo_layers
@@ -213,31 +220,6 @@ class DPOGuider:
                     attn.kv_cache = None
                     attn.cache_enabled = False
 
-    def _swap_in_dpo(self):
-        """Swap DPO layers into the model. Returns saved originals."""
-        model = self.orig_model
-        saved = {
-            "layers": [],
-            "norm": model.backbone.norm,
-            "head": model.codebook0_head,
-        }
-        for i in range(self.n_dpo_layers):
-            idx = self.n_shared + i
-            saved["layers"].append(model.backbone.layers[idx])
-            model.backbone.layers[idx] = self.dpo_top_layers[i]
-        model.backbone.norm = self.dpo_backbone_norm
-        model.codebook0_head = self.dpo_codebook0_head
-        return saved
-
-    def _swap_back(self, saved):
-        """Restore original layers."""
-        model = self.orig_model
-        for i in range(self.n_dpo_layers):
-            idx = self.n_shared + i
-            model.backbone.layers[idx] = saved["layers"][i]
-        model.backbone.norm = saved["norm"]
-        model.codebook0_head = saved["head"]
-
     def _guided_generate_frame(
         self,
         tokens, tokens_mask, input_pos,
@@ -245,32 +227,40 @@ class DPOGuider:
         continuous_segments=None, starts=None,
     ):
         """
-        Generate one frame — same as v8's guided_generate_frame.
+        Generate one frame with DPO logit guidance.
 
-        1. Get original logits via model.backbone() (original layers)
-        2. Swap in DPO layers, get DPO logits via model.backbone() (same code path)
-        3. Swap back original layers
+        1. Register hook on last shared layer to capture hidden state
+        2. Run original model's full backbone ONCE (proven code path)
+        3. Run DPO top layers on captured hidden state
         4. Combine logits, sample, run decoder
         """
         model = self.orig_model
         b = tokens.size(0)
         embeds_dtype = self.dtype
 
-        # === Original forward (proven code path) ===
+        # Hook to capture hidden state after last shared layer
+        captured = {}
+        def capture_hook(module, input, output):
+            captured['h'] = output
+
+        handle = model.backbone.layers[self.n_shared - 1].register_forward_hook(capture_hook)
+
+        # === Original forward (proven code path, backbone runs ONCE) ===
         orig_c0_logits, orig_last_h = _generate_frame_logits(
             model, tokens, tokens_mask, input_pos, cfg_scale,
             continuous_segments, starts,
         )
 
-        # === DPO forward (swap layers, same code path) ===
-        saved = self._swap_in_dpo()
-        try:
-            dpo_c0_logits, _ = _generate_frame_logits(
-                model, tokens, tokens_mask, input_pos, cfg_scale,
-                continuous_segments, starts,
-            )
-        finally:
-            self._swap_back(saved)
+        handle.remove()
+
+        # === DPO forward (only top layers on captured hidden state) ===
+        backbone_mask = _index_causal_mask(model.backbone_causal_mask, input_pos)
+        dpo_h = captured['h']
+        for layer in self.dpo_top_layers:
+            dpo_h = layer(dpo_h, mask=backbone_mask, input_pos=input_pos)
+        dpo_h = self.dpo_backbone_norm(dpo_h)
+        dpo_last_h = dpo_h[:, -1, :]
+        dpo_c0_logits = self.dpo_codebook0_head(dpo_last_h)
 
         # === Combine logits (same as v8) ===
         if cfg_scale > 1.0 and b > 1 and (b % 2 == 0):
