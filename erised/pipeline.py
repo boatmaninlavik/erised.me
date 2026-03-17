@@ -9,7 +9,7 @@ import os
 import uuid
 import json
 import logging
-from typing import Dict, Any, Optional, Tuple
+from typing import Callable, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 
 import torch
@@ -78,6 +78,7 @@ class ErisedPipeline:
         temperature: Optional[float] = None,
         topk: Optional[int] = None,
         cfg_scale: Optional[float] = None,
+        on_progress: Optional[Callable] = None,
     ) -> GenerationResult:
         """Generate a song from a musical prompt + lyrics. Returns audio path + saved tokens."""
 
@@ -95,7 +96,7 @@ class ErisedPipeline:
             "cfg_scale": cfg_scale or self.config.cfg_scale,
         }
 
-        frames = self._generate_and_capture(tags, lyrics, audio_path, **kwargs)
+        frames = self._generate_and_capture(tags, lyrics, audio_path, on_progress=on_progress, **kwargs)
 
         torch.save(frames.cpu(), tokens_path)
         logger.info("Saved tokens (%d frames) to %s", frames.shape[-1], tokens_path)
@@ -149,13 +150,19 @@ class ErisedPipeline:
         tags: str,
         lyrics: str,
         save_path: str,
+        on_progress: Optional[Callable] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
-        Run the HeartMuLa pipeline and intercept the token frames
-        before they are decoded to audio (we need them for DPO later).
+        Run the HeartMuLa generation loop with streaming support.
+
+        Uses an explicit autoregressive loop (matching heartlib's _forward)
+        so we can inject partial audio decoding and progress callbacks.
         """
         cfg_scale = kwargs.get("cfg_scale", self.config.cfg_scale)
+        temperature = kwargs.get("temperature", self.config.temperature)
+        topk = kwargs.get("topk", self.config.topk)
+        max_audio_length_ms = kwargs.get("max_audio_length_ms", self.config.max_audio_length_ms)
 
         model_inputs = self.pipe.preprocess(
             {"tags": tags, "lyrics": lyrics},
@@ -164,10 +171,6 @@ class ErisedPipeline:
 
         # Force-reset KV caches before each generation to avoid shape mismatch
         # when generating back-to-back (e.g. A/B pairs for DPO rating).
-        # torchtune's reset_cache() only zeros tensors but doesn't clear the
-        # kv_cache reference, so setup_caches() thinks caches are "already setup"
-        # and skips re-initialization. We must set kv_cache=None on every
-        # attention layer so setup_caches() can create fresh caches.
         for model_part in (self.pipe.mula.backbone, self.pipe.mula.decoder):
             try:
                 model_part.reset_caches()
@@ -180,16 +183,90 @@ class ErisedPipeline:
                     attn.cache_enabled = False
         torch.cuda.empty_cache()
 
+        device = self.pipe.mula_device
+        dtype = self.pipe.mula_dtype
+        mula = self.pipe.mula
+
+        prompt_tokens = model_inputs["tokens"].to(device)
+        prompt_tokens_mask = model_inputs["tokens_mask"].to(device)
+        continuous_segment = model_inputs["muq_embed"].to(device)
+        starts = model_inputs["muq_idx"]
+        prompt_pos = model_inputs["pos"].to(device)
+        frames = []
+
+        bs_size = 2 if cfg_scale != 1.0 else 1
+        mula.setup_caches(bs_size)
+
+        # Initial frame (processes the full prompt)
+        with torch.autocast(device_type=device.type, dtype=dtype):
+            curr_token = mula.generate_frame(
+                tokens=prompt_tokens,
+                tokens_mask=prompt_tokens_mask,
+                input_pos=prompt_pos,
+                temperature=temperature,
+                topk=topk,
+                cfg_scale=cfg_scale,
+                continuous_segments=continuous_segment,
+                starts=starts,
+            )
+        frames.append(curr_token[0:1,])
+
+        # Padding helper (matches heartlib's _pad_audio_token)
+        parallel_number = 8 + 1
+        empty_id = self.pipe.config.empty_id
+
+        def _pad(token):
+            padded = (
+                torch.ones((token.shape[0], parallel_number), device=device, dtype=torch.long)
+                * empty_id
+            )
+            padded[:, :-1] = token
+            padded = padded.unsqueeze(1)
+            mask = torch.ones_like(padded, dtype=torch.bool)
+            mask[..., -1] = False
+            return padded, mask
+
+        max_audio_frames = max_audio_length_ms // 80
+        PARTIAL_DECODE_FRAME = 100
+
+        # Autoregressive generation loop
+        for i in range(max_audio_frames):
+            curr_padded, curr_mask = _pad(curr_token)
+            with torch.autocast(device_type=device.type, dtype=dtype):
+                curr_token = mula.generate_frame(
+                    tokens=curr_padded,
+                    tokens_mask=curr_mask,
+                    input_pos=prompt_pos[..., -1:] + i + 1,
+                    temperature=temperature,
+                    topk=topk,
+                    cfg_scale=cfg_scale,
+                    continuous_segments=None,
+                    starts=None,
+                )
+            if torch.any(curr_token[0:1, :] >= self.pipe.config.audio_eos_id):
+                break
+            frames.append(curr_token[0:1,])
+
+            # Partial decode at PARTIAL_DECODE_FRAME for streaming playback
+            if len(frames) == PARTIAL_DECODE_FRAME and on_progress:
+                partial_frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+                partial_path = save_path.rsplit(".", 1)[0] + "_partial.wav"
+                with torch.no_grad():
+                    self.pipe.postprocess({"frames": partial_frames}, save_path=partial_path)
+                logger.info("Partial audio saved to %s (%d frames)", partial_path, len(frames))
+                on_progress(len(frames), max_audio_frames, os.path.basename(partial_path))
+            elif len(frames) % 10 == 0 and on_progress:
+                on_progress(len(frames), max_audio_frames, None)
+
+        # Stack frames into final tensor
+        frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+
+        # Final decode
         with torch.no_grad():
-            model_outputs = self.pipe._forward(model_inputs, **kwargs)
+            self.pipe.postprocess({"frames": frames_tensor}, save_path=save_path)
 
-        frames = model_outputs["frames"]  # [8, num_audio_frames]
-
-        with torch.no_grad():
-            self.pipe.postprocess(model_outputs, save_path=save_path)
-
-        logger.info("Audio saved to %s", save_path)
-        return frames
+        logger.info("Audio saved to %s (%d frames)", save_path, frames_tensor.shape[-1])
+        return frames_tensor
 
     def get_model(self):
         """Access the underlying HeartMuLa model (for DPO training)."""
@@ -234,6 +311,7 @@ class ErisedPipeline:
         topk: Optional[int] = None,
         cfg_scale: Optional[float] = None,
         dpo_scale: float = 1.0,
+        on_progress: Optional[Callable] = None,
     ) -> GenerationResult:
         """
         Generate a song using DPO Guided inference.
@@ -269,6 +347,7 @@ class ErisedPipeline:
             topk=topk or self.config.topk,
             cfg_scale=cfg_scale or self.config.cfg_scale,
             dpo_scale=dpo_scale,
+            on_progress=on_progress,
         )
 
         torch.save(frames.cpu(), tokens_path)

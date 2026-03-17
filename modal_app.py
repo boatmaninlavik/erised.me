@@ -86,7 +86,7 @@ def serve():
 
     # Paths inside the Modal volume
     model_path = os.environ.get("ERISED_MODEL_PATH", "/data/ckpt")
-    dpo_path = os.environ.get("ERISED_DPO_PATH", "/data/dpo_checkpoints_v8/dpo_best")
+    dpo_path = os.environ.get("ERISED_DPO_PATH", "/data/dpo_checkpoints_v11/dpo_best")
     output_dir = "/data/outputs"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -119,6 +119,15 @@ def serve():
             job_id, prompt, lyrics, max_sec, model_name, dpo_scale = job_queue.get()
             jobs[job_id]["status"] = "running"
             gen_stats["generating"] = True
+
+            def on_progress(current_frame, total_frames, partial_audio_file=None):
+                jobs[job_id]["progress"] = {
+                    "current_frame": current_frame,
+                    "total_frames": total_frames,
+                }
+                if partial_audio_file:
+                    jobs[job_id]["partial_audio_file"] = partial_audio_file
+
             try:
                 with gen_lock:
                     t0 = time.time()
@@ -127,11 +136,13 @@ def serve():
                             prompt=prompt, lyrics=lyrics,
                             max_audio_length_ms=int(max_sec * 1000),
                             dpo_scale=dpo_scale,
+                            on_progress=on_progress,
                         )
                     else:
                         result = pipeline.generate(
                             prompt=prompt, lyrics=lyrics,
                             max_audio_length_ms=int(max_sec * 1000),
+                            on_progress=on_progress,
                         )
                     elapsed = time.time() - t0
                     logger.info("[%s] Generated %s in %.1fs (%d frames)",

@@ -10,6 +10,7 @@ import glob
 import logging
 import os
 from copy import deepcopy
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -210,6 +211,7 @@ class DPOGuider:
         topk: int = 50,
         cfg_scale: float = 1.5,
         dpo_scale: float = 1.0,
+        on_progress: Optional[Callable] = None,
     ) -> torch.Tensor:
         """Full guided generation loop — identical to v8's guided_forward."""
         pipe = pipeline.pipe
@@ -254,6 +256,7 @@ class DPOGuider:
             return padded, mask
 
         max_audio_frames = max_audio_length_ms // 80
+        PARTIAL_DECODE_FRAME = 100
 
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):
             # Initial frame
@@ -277,6 +280,16 @@ class DPOGuider:
                 if torch.any(curr_token[0:1, :] >= pipe.config.audio_eos_id):
                     break
                 frames.append(curr_token[0:1,])
+
+                # Partial decode at PARTIAL_DECODE_FRAME for streaming playback
+                if len(frames) == PARTIAL_DECODE_FRAME and on_progress:
+                    partial_frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+                    partial_path = save_path.rsplit(".", 1)[0] + "_partial.wav"
+                    pipe.postprocess({"frames": partial_frames}, save_path=partial_path)
+                    logger.info("Partial audio saved to %s (%d frames)", partial_path, len(frames))
+                    on_progress(len(frames), max_audio_frames, os.path.basename(partial_path))
+                elif len(frames) % 10 == 0 and on_progress:
+                    on_progress(len(frames), max_audio_frames, None)
 
         frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
 
