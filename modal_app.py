@@ -120,13 +120,15 @@ def serve():
             jobs[job_id]["status"] = "running"
             gen_stats["generating"] = True
 
-            def on_progress(current_frame, total_frames, partial_audio_file=None):
+            def on_progress(current_frame, total_frames, partial_audio_file=None, partial_version=None):
                 jobs[job_id]["progress"] = {
                     "current_frame": current_frame,
                     "total_frames": total_frames,
                 }
                 if partial_audio_file:
                     jobs[job_id]["partial_audio_file"] = partial_audio_file
+                if partial_version is not None:
+                    jobs[job_id]["partial_version"] = partial_version
 
             try:
                 with gen_lock:

@@ -39,7 +39,7 @@ async function fetchRetry(url: string, options?: RequestInit, maxRetries = 30): 
 async function pollJob(
   backendUrl: string,
   jobId: string,
-  onProgress?: (progress: Progress, partialAudio: string | null) => void,
+  onProgress?: (progress: Progress, partialAudio: string | null, partialVersion: number | null) => void,
 ): Promise<GenerationResult> {
   while (true) {
     await new Promise((r) => setTimeout(r, 2000));
@@ -48,7 +48,7 @@ async function pollJob(
     if (data.status === "done") return data.result;
     if (data.status === "error") throw new Error(data.error);
     if (onProgress && data.progress) {
-      onProgress(data.progress, data.partial_audio_file || null);
+      onProgress(data.progress, data.partial_audio_file || null, data.partial_version ?? null);
     }
   }
 }
@@ -87,6 +87,9 @@ export default function GeneratePage() {
   const [origPartialAudio, setOrigPartialAudio] = useState<string | null>(null);
   const [dpoPartialAudio, setDpoPartialAudio] = useState<string | null>(null);
   const [singlePartialAudio, setSinglePartialAudio] = useState<string | null>(null);
+  const [origPartialVersion, setOrigPartialVersion] = useState<number>(0);
+  const [dpoPartialVersion, setDpoPartialVersion] = useState<number>(0);
+  const [singlePartialVersion, setSinglePartialVersion] = useState<number>(0);
   const origPartialRef = useRef<HTMLAudioElement>(null);
   const dpoPartialRef = useRef<HTMLAudioElement>(null);
   const singlePartialRef = useRef<HTMLAudioElement>(null);
@@ -155,6 +158,8 @@ export default function GeneratePage() {
     setDpoProgress(null);
     setOrigPartialAudio(null);
     setDpoPartialAudio(null);
+    setOrigPartialVersion(0);
+    setDpoPartialVersion(0);
 
     try {
       const origResp = await fetchRetry(`${backendUrl}/api/submit`, {
@@ -174,9 +179,10 @@ export default function GeneratePage() {
       setDpoStatus("running");
 
       // Show each result as soon as it's ready (original first so user can listen while DPO generates)
-      const origPromise = pollJob(backendUrl, origJob.job_id, (prog, partial) => {
+      const origPromise = pollJob(backendUrl, origJob.job_id, (prog, partial, ver) => {
         setOrigProgress(prog);
         if (partial) setOrigPartialAudio(partial);
+        if (ver !== null) setOrigPartialVersion(ver);
       }).then((res) => {
         setOrigResult(res);
         setOrigStatus("done");
@@ -185,9 +191,10 @@ export default function GeneratePage() {
         throw e;
       });
 
-      const dpoPromise = pollJob(backendUrl, dpoJob.job_id, (prog, partial) => {
+      const dpoPromise = pollJob(backendUrl, dpoJob.job_id, (prog, partial, ver) => {
         setDpoProgress(prog);
         if (partial) setDpoPartialAudio(partial);
+        if (ver !== null) setDpoPartialVersion(ver);
       }).then((res) => {
         setDpoResult(res);
         setDpoStatus("done");
@@ -210,6 +217,7 @@ export default function GeneratePage() {
     setSingleStatus("pending");
     setSingleProgress(null);
     setSinglePartialAudio(null);
+    setSinglePartialVersion(0);
 
     try {
       const effectiveModel = isSean ? selectedModel : "original";
@@ -220,9 +228,10 @@ export default function GeneratePage() {
       });
       const job = await resp.json();
       setSingleStatus("running");
-      const result = await pollJob(backendUrl, job.job_id, (prog, partial) => {
+      const result = await pollJob(backendUrl, job.job_id, (prog, partial, ver) => {
         setSingleProgress(prog);
         if (partial) setSinglePartialAudio(partial);
+        if (ver !== null) setSinglePartialVersion(ver);
       });
       setSingleResult(result);
       setSingleStatus("done");
@@ -305,6 +314,18 @@ export default function GeneratePage() {
       setLoading(false);
     }
   }
+
+  // When partial version changes, stash current playback position so onCanPlay can seek to it
+  function stashPlaybackPosition(ref: React.RefObject<HTMLAudioElement | null>) {
+    const el = ref.current;
+    if (el && !el.paused) {
+      el.dataset.seekTo = String(el.currentTime);
+    }
+  }
+
+  useEffect(() => { stashPlaybackPosition(origPartialRef); }, [origPartialVersion]);
+  useEffect(() => { stashPlaybackPosition(dpoPartialRef); }, [dpoPartialVersion]);
+  useEffect(() => { stashPlaybackPosition(singlePartialRef); }, [singlePartialVersion]);
 
   // Seamless transition: when full audio arrives, carry over playback position from partial
   function handleTransition(
@@ -529,6 +550,7 @@ export default function GeneratePage() {
                 const status = model === "original" ? origStatus : dpoStatus;
                 const progress = model === "original" ? origProgress : dpoProgress;
                 const partialAudio = model === "original" ? origPartialAudio : dpoPartialAudio;
+                const partialVersion = model === "original" ? origPartialVersion : dpoPartialVersion;
                 const partialRef = model === "original" ? origPartialRef : dpoPartialRef;
                 const fullRef = model === "original" ? origFullRef : dpoFullRef;
                 const setPartialAudio = model === "original" ? setOrigPartialAudio : setDpoPartialAudio;
@@ -582,13 +604,21 @@ export default function GeneratePage() {
                         </p>
                         {partialAudio && backendUrl && (
                           <div className="space-y-1">
-                            <p className="text-xs text-zinc-400">Preview:</p>
+                            <p className="text-xs text-zinc-400">Streaming preview:</p>
                             <audio
                               ref={partialRef}
                               controls
                               autoPlay
-                              src={`${backendUrl}/audio/${partialAudio}`}
+                              src={`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`}
                               className="w-full"
+                              onCanPlay={() => {
+                                const el = partialRef.current;
+                                if (el && el.dataset.seekTo) {
+                                  el.currentTime = parseFloat(el.dataset.seekTo);
+                                  delete el.dataset.seekTo;
+                                  el.play().catch(() => {});
+                                }
+                              }}
                             />
                           </div>
                         )}
@@ -648,13 +678,21 @@ export default function GeneratePage() {
                   </p>
                   {singlePartialAudio && backendUrl && (
                     <div className="space-y-1">
-                      <p className="text-xs text-zinc-400">Preview:</p>
+                      <p className="text-xs text-zinc-400">Streaming preview:</p>
                       <audio
                         ref={singlePartialRef}
                         controls
                         autoPlay
-                        src={`${backendUrl}/audio/${singlePartialAudio}`}
+                        src={`${backendUrl}/audio/${singlePartialAudio}?v=${singlePartialVersion}`}
                         className="w-full"
+                        onCanPlay={() => {
+                          const el = singlePartialRef.current;
+                          if (el && el.dataset.seekTo) {
+                            el.currentTime = parseFloat(el.dataset.seekTo);
+                            delete el.dataset.seekTo;
+                            el.play().catch(() => {});
+                          }
+                        }}
                       />
                     </div>
                   )}
