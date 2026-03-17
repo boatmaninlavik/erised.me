@@ -162,7 +162,7 @@ def streaming_detokenize(
         # ── save partial audio (atomic via temp file) ──
         partial = output[:, 0:min(output.shape[-1], target_len)]
         temp_path = save_path + ".tmp"
-        torchaudio.save(temp_path, partial.to(torch.float32), 48000)
+        torchaudio.save(temp_path, partial.to(torch.float32), 48000, format="wav")
         os.replace(temp_path, save_path)
         logger.info(
             "Streaming chunk %d/%d saved (%d samples, %.1fs)",
