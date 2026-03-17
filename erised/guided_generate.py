@@ -20,6 +20,11 @@ from .streaming import streaming_detokenize
 
 logger = logging.getLogger(__name__)
 
+# Number of backbone layers shared between orig and DPO models during
+# guided inference.  v11 DPO only trains the top 2 layers (26-27 of 28),
+# so layers 0-25 produce identical outputs and need only run once.
+N_SHARED_LAYERS = 26
+
 
 def _sample_topk(logits: torch.Tensor, topk: int, temperature: float) -> torch.Tensor:
     logits = logits / temperature
@@ -92,20 +97,59 @@ def _guided_generate_frame(orig_model, dpo_model, tokens, tokens_mask, input_pos
                            continuous_segments=None, starts=None):
     """
     Generate one frame using logit guidance from two models.
-    Identical to v8's guided_generate_frame.
+
+    Shares backbone layers 0..(N_SHARED_LAYERS-1) between orig and dpo
+    models, only branching for the top layers that DPO actually trained.
+    This cuts redundant backbone compute by ~93% (26/28 layers shared).
     """
     b = tokens.size(0)
     embeds_dtype = next(orig_model.parameters()).dtype
+    backbone_mask = _index_causal_mask(orig_model.backbone_causal_mask, input_pos)
 
-    # Get logits from both models independently
-    orig_c0_logits, orig_last_h = _generate_frame_logits(
-        orig_model, tokens, tokens_mask, input_pos, cfg_scale,
-        continuous_segments, starts,
-    )
-    dpo_c0_logits, _ = _generate_frame_logits(
-        dpo_model, tokens, tokens_mask, input_pos, cfg_scale,
-        continuous_segments, starts,
-    )
+    # ── Embedding (identical for both models — all frozen) ──
+    uncond_mask = None
+    if cfg_scale > 1.0 and b > 1:
+        actual_B = b // 2
+        uncond_mask = torch.cat([
+            torch.zeros(actual_B, dtype=torch.bool, device=tokens.device),
+            torch.ones(actual_B, dtype=torch.bool, device=tokens.device),
+        ])
+
+    embeds = orig_model._embed_tokens(tokens, uncond_mask=uncond_mask)
+    masked_embeds = embeds * tokens_mask.unsqueeze(-1)
+    h = masked_embeds.sum(dim=2, dtype=embeds.dtype)
+
+    if continuous_segments is not None:
+        continuous_segments = orig_model.muq_linear(continuous_segments)
+        if uncond_mask is not None:
+            uncond_embed = orig_model.unconditional_text_embedding(
+                torch.zeros(1, device=tokens.device, dtype=torch.long)
+            )
+            mask_expanded = uncond_mask.view(b, 1).expand_as(continuous_segments)
+            continuous_segments = torch.where(mask_expanded, uncond_embed, continuous_segments)
+        batch_indices = torch.arange(h.shape[0], device=h.device)
+        h[batch_indices, starts] = continuous_segments
+
+    # ── Shared backbone layers 0..(N_SHARED-1): run ONCE on orig model ──
+    for layer in orig_model.backbone.layers[:N_SHARED_LAYERS]:
+        h = layer(h, input_pos=input_pos, mask=backbone_mask)
+
+    # ── Branched layers N_SHARED..27: orig model ──
+    h_orig = h
+    for layer in orig_model.backbone.layers[N_SHARED_LAYERS:]:
+        h_orig = layer(h_orig, input_pos=input_pos, mask=backbone_mask)
+    h_orig = orig_model.backbone.norm(h_orig)
+
+    # ── Branched layers N_SHARED..27: dpo model ──
+    h_dpo = h.clone()
+    for layer in dpo_model.backbone.layers[N_SHARED_LAYERS:]:
+        h_dpo = layer(h_dpo, input_pos=input_pos, mask=backbone_mask)
+    h_dpo = dpo_model.backbone.norm(h_dpo)
+
+    # ── Logits from both models ──
+    orig_last_h = h_orig[:, -1, :]
+    orig_c0_logits = orig_model.codebook0_head(orig_last_h)
+    dpo_c0_logits = dpo_model.codebook0_head(h_dpo[:, -1, :])
 
     # Combine logits with CFG + DPO guidance
     if cfg_scale > 1.0 and b > 1 and (b % 2 == 0):

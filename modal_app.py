@@ -3,7 +3,7 @@ Modal serverless deployment for Erised GPU backend.
 
 Deploys the generation server as a Modal web endpoint with:
 - A100-80GB: token generation (mula model + DPO)
-- T4: codec decode (streaming audio while generating)
+- L4: codec decode (streaming audio while generating, pre-spawned at job start)
 - Auto cold-start: container boots when users visit erised.me (~45s)
 - Auto shutdown: container stops after 5 min idle (no charges)
 - Permanent URL: stored once in Supabase, never changes
@@ -55,8 +55,9 @@ image = (
 )
 
 
-# ── T4 Codec Worker ──────────────────────────────────────────────────
+# ── L4 Codec Worker ──────────────────────────────────────────────────
 # Separate GPU for streaming codec decode while A100 generates tokens.
+# Pre-spawned at job start so cold-start overlaps with token generation.
 # Polls for new frames on the shared volume and decodes incrementally.
 
 @app.cls(
@@ -286,7 +287,7 @@ def serve():
 
     DPO_USER_EMAIL = os.environ.get("ERISED_DPO_USER_EMAIL", "zsean@berkeley.edu")
 
-    # Handle to the T4 codec worker
+    # Handle to the L4 codec worker
     codec_worker = CodecWorker()
 
     def generation_worker():
@@ -298,11 +299,15 @@ def serve():
             gen_stats["generating"] = True
 
             last_save_time = 0.0
-            t4_spawned = [False]
-            t4_audio_filename = [None]
+            t4_audio_filename = [f"{job_id}.wav"]
             decode_status_path = os.path.join(frames_dir, f"{job_id}_decoded.json")
-            # Track T4 decode progress for streaming audio to frontend
+            # Track L4 decode progress for streaming audio to frontend
             t4_decode_info = [None]  # Updated by background checker thread
+
+            # Pre-spawn L4 codec worker NOW so it cold-starts during token
+            # generation (~50-90s) instead of blocking after first checkpoint.
+            logger.info("Pre-spawning L4 codec worker for job %s", job_id)
+            codec_worker.decode_job.spawn(job_id, t4_audio_filename[0])
 
             def on_progress(current_frame, total_frames, partial_audio_file=None, partial_version=None):
                 nonlocal last_save_time
@@ -328,9 +333,7 @@ def serve():
                         last_save_time = now
 
             def _t4_decode_checker():
-                """Background thread: polls volume for T4 decode status."""
-                while not t4_spawned[0]:
-                    time.sleep(1)
+                """Background thread: polls volume for L4 decode status."""
                 while True:
                     try:
                         erised_vol.reload()
@@ -349,7 +352,7 @@ def serve():
             sync_lock = threading.Lock()  # Serialize background syncs
 
             def on_frames_checkpoint(frames_tensor, is_final=False):
-                """Save frames to volume and signal T4 codec worker."""
+                """Save frames to volume and signal L4 codec worker."""
                 cpu_frames = frames_tensor.cpu()
 
                 def _sync():
@@ -363,20 +366,10 @@ def serve():
                                 "is_final": is_final,
                             }, f)
                         erised_vol.commit()
-
-                        if not t4_spawned[0]:
-                            t4_spawned[0] = True
-                            t4_audio_filename[0] = f"{job_id}.wav"
-                            logger.info(
-                                "Spawning T4 codec decode for job %s (%d frames, final=%s)",
-                                job_id, cpu_frames.shape[-1], is_final,
-                            )
-                            codec_worker.decode_job.spawn(job_id, t4_audio_filename[0])
-                        else:
-                            logger.info(
-                                "Checkpoint for job %s: %d frames, final=%s",
-                                job_id, cpu_frames.shape[-1], is_final,
-                            )
+                        logger.info(
+                            "Checkpoint for job %s: %d frames, final=%s",
+                            job_id, cpu_frames.shape[-1], is_final,
+                        )
 
                 if is_final:
                     # Final checkpoint: BLOCKING — must commit before we
@@ -408,23 +401,22 @@ def serve():
                     logger.info("[%s] Generated %s in %.1fs (%d frames)",
                                 model_name, result.audio_path, elapsed, result.num_frames)
 
-                # Wait for T4 to finish decoding the final audio
+                # Wait for L4 to finish decoding the final audio
                 t4_done = False
-                if t4_spawned[0]:
-                    logger.info("Waiting for T4 codec decode to finish for job %s ...", job_id)
-                    for attempt in range(180):  # Max 6 min
-                        erised_vol.reload()
-                        if os.path.isfile(decode_status_path):
-                            with open(decode_status_path) as f:
-                                decode_info = json.load(f)
-                            if decode_info.get("done"):
-                                logger.info("T4 decode complete for job %s (%d chunks)",
-                                            job_id, decode_info.get("chunks", 0))
-                                t4_done = True
-                                break
-                        time.sleep(2)
-                    else:
-                        logger.warning("T4 decode timed out for job %s", job_id)
+                logger.info("Waiting for L4 codec decode to finish for job %s ...", job_id)
+                for attempt in range(180):  # Max 6 min
+                    erised_vol.reload()
+                    if os.path.isfile(decode_status_path):
+                        with open(decode_status_path) as f:
+                            decode_info = json.load(f)
+                        if decode_info.get("done"):
+                            logger.info("L4 decode complete for job %s (%d chunks)",
+                                        job_id, decode_info.get("chunks", 0))
+                            t4_done = True
+                            break
+                    time.sleep(2)
+                else:
+                    logger.warning("L4 decode timed out for job %s", job_id)
 
                 if t4_done:
                     final_audio = t4_audio_filename[0]
@@ -541,7 +533,7 @@ def serve():
     def serve_audio(filename: str):
         path = os.path.join(output_dir, filename)
         if not os.path.isfile(path):
-            # T4 may have written the file — reload volume and retry
+            # L4 may have written the file — reload volume and retry
             erised_vol.reload()
             if not os.path.isfile(path):
                 raise HTTPException(404, "Audio file not found")
