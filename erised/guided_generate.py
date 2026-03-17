@@ -258,6 +258,8 @@ class DPOGuider:
             return padded, mask
 
         max_audio_frames = max_audio_length_ms // 80
+        first_chunk_frames = int(29.76 * 12.5)  # 372 frames
+        first_chunk_sent = False
 
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):
             # Initial frame
@@ -269,7 +271,6 @@ class DPOGuider:
             )
             frames.append(curr_token[0:1,])
 
-            # Autoregressive loop — NO codec decode here to keep GPU state clean
             for i in tqdm(range(max_audio_frames), desc="Guided generation"):
                 curr_padded, curr_mask = _pad(curr_token)
                 curr_token = _guided_generate_frame(
@@ -282,13 +283,31 @@ class DPOGuider:
                     break
                 frames.append(curr_token[0:1,])
 
-                if len(frames) % 10 == 0 and on_progress:
+                # Mid-generation decode for streaming playback
+                if not first_chunk_sent and len(frames) >= first_chunk_frames:
+                    first_chunk_sent = True
+                    nf = len(frames)
+                    interim = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+                    logger.info("Mid-gen decode (guided): %d frames → first audio chunk", nf)
+
+                    def _on_interim(ci, tc, _nf=nf):
+                        if on_progress:
+                            on_progress(_nf, max_audio_frames,
+                                        os.path.basename(save_path), ci)
+
+                    # Disable autocast for codec decode (different model, different precision)
+                    with torch.amp.autocast(device.type, enabled=False):
+                        streaming_detokenize(
+                            pipe.codec, interim, save_path,
+                            on_chunk_ready=_on_interim,
+                        )
+                elif len(frames) % 10 == 0 and on_progress:
                     on_progress(len(frames), max_audio_frames, None, None)
 
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
         num_gen_frames = len(frames)
 
-        # Progressive streaming decode
+        # Final full decode — complete audio file
         def _on_chunk(chunk_idx, total_chunks):
             if on_progress:
                 on_progress(

@@ -229,8 +229,12 @@ class ErisedPipeline:
 
         max_audio_frames = max_audio_length_ms // 80
 
-        # Autoregressive generation loop — NO codec decode here to keep
-        # GPU state clean and avoid the blank-song corruption bug.
+        # Threshold for first codec chunk (~30s of audio).
+        # After this many frames, we pause generation, decode the first
+        # chunk so the frontend can start playback, then resume generating.
+        first_chunk_frames = int(29.76 * 12.5)  # 372 frames
+        first_chunk_sent = False
+
         for i in range(max_audio_frames):
             curr_padded, curr_mask = _pad(curr_token)
             with torch.autocast(device_type=device.type, dtype=dtype):
@@ -248,17 +252,32 @@ class ErisedPipeline:
                 break
             frames.append(curr_token[0:1,])
 
-            if len(frames) % 10 == 0 and on_progress:
+            # Mid-generation decode: after enough frames for the first
+            # codec chunk, pause and decode so audio starts playing while
+            # the rest of the song is still being composed.
+            if not first_chunk_sent and len(frames) >= first_chunk_frames:
+                first_chunk_sent = True
+                nf = len(frames)
+                interim = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+                logger.info("Mid-gen decode: %d frames → first audio chunk", nf)
+
+                def _on_interim(ci, tc, _nf=nf):
+                    if on_progress:
+                        on_progress(_nf, max_audio_frames,
+                                    os.path.basename(save_path), ci)
+
+                streaming_detokenize(
+                    self.pipe.codec, interim, save_path,
+                    on_chunk_ready=_on_interim,
+                )
+            elif len(frames) % 10 == 0 and on_progress:
                 on_progress(len(frames), max_audio_frames, None, None)
 
         # Stack frames into final tensor
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
         num_gen_frames = len(frames)
 
-        # Progressive streaming decode — interleaves flow-matching and scalar
-        # decode per chunk so the first ~30s of audio is available after only
-        # 1/N of total decode time.  Same wall-clock cost as the original
-        # all-at-once decode.
+        # Final full decode — produces the complete audio file.
         def _on_chunk(chunk_idx, total_chunks):
             if on_progress:
                 on_progress(
