@@ -62,7 +62,7 @@ image = (
 
 @app.cls(
     image=image,
-    gpu="L4",
+    gpu="A100",
     volumes={"/data": erised_vol},
     timeout=600,
     scaledown_window=300,
@@ -254,6 +254,7 @@ def serve():
         data = jobs.get(job_id)
         if data is None:
             return
+        os.makedirs(jobs_dir, exist_ok=True)
         tmp = _job_path(job_id) + ".tmp"
         with open(tmp, "w") as f:
             json.dump(data, f)
@@ -531,12 +532,12 @@ def serve():
 
     @fapi.get("/audio/{filename}")
     def serve_audio(filename: str):
+        # Always reload volume — L4 overwrites the file as it decodes
+        # more chunks, so the local cache may be stale.
+        erised_vol.reload()
         path = os.path.join(output_dir, filename)
         if not os.path.isfile(path):
-            # L4 may have written the file — reload volume and retry
-            erised_vol.reload()
-            if not os.path.isfile(path):
-                raise HTTPException(404, "Audio file not found")
+            raise HTTPException(404, "Audio file not found")
         media = "audio/wav" if filename.endswith(".wav") else "audio/mpeg"
         return FileResponse(path, media_type=media)
 
