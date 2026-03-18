@@ -127,9 +127,15 @@ def serve():
     pipeline = ErisedPipeline(config)
     logger.info("Pipeline loaded.")
 
-    logger.info("Initializing DPO Guided from %s ...", dpo_path)
-    pipeline.init_guided(dpo_checkpoint_path=dpo_path)
-    logger.info("DPO Guided ready.")
+    # DPO model loaded lazily on first DPO job — saves 6GB VRAM until needed
+    dpo_initialized = [False]
+
+    def _ensure_dpo():
+        if not dpo_initialized[0]:
+            logger.info("Initializing DPO Guided from %s ...", dpo_path)
+            pipeline.init_guided(dpo_checkpoint_path=dpo_path)
+            logger.info("DPO Guided ready.")
+            dpo_initialized[0] = True
 
     # ── Job persistence (survives deploys & container routing) ─────
     jobs: dict[str, dict] = {}
@@ -218,6 +224,7 @@ def serve():
                 with gen_lock:
                     t0 = time.time()
                     if model_name == "dpo":
+                        _ensure_dpo()
                         gen_result = pipeline.generate_guided(
                             prompt=prompt, lyrics=lyrics,
                             max_audio_length_ms=int(max_sec * 1000),

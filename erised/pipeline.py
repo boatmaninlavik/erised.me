@@ -281,7 +281,6 @@ class ErisedPipeline:
                 frames_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
                 saved = _save_backbone_caches(mula)
                 _reset_model_caches(mula)
-                # Also move DPO model to CPU if loaded (frees ~6GB)
                 dpo_on_gpu = False
                 if hasattr(self, 'guider') and self.guider:
                     _reset_model_caches(self.guider.dpo_model)
@@ -290,12 +289,14 @@ class ErisedPipeline:
                 gc.collect()
                 torch.cuda.empty_cache()
                 new_chunks = stream_decoder.decode_available(frames_cp)
-                # Restore
-                if dpo_on_gpu:
-                    self.guider.dpo_model.to(device)
+                # Free codec intermediates BEFORE restoring models
+                gc.collect()
+                torch.cuda.empty_cache()
                 mula.setup_caches(bs_size)
                 _restore_backbone_caches(mula, saved)
                 del saved
+                if dpo_on_gpu:
+                    self.guider.dpo_model.to(device)
                 gc.collect()
                 torch.cuda.empty_cache()
                 if new_chunks > 0 and on_progress:
