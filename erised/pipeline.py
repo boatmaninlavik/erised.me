@@ -73,7 +73,43 @@ class ErisedPipeline:
         # Compile backbone for ~1.5-2x faster frame generation
         logger.info("Compiling mula backbone with torch.compile...")
         self.pipe.mula.backbone = torch.compile(self.pipe.mula.backbone)
-        logger.info("Backbone compiled (first call will trigger JIT, ~30s).")
+        # Warmup: trigger JIT compilation now so first real generation is fast
+        logger.info("Warming up compiled backbone (JIT compile, ~30-60s)...")
+        self._warmup_compile()
+        logger.info("Backbone compiled and warm.")
+
+    def _warmup_compile(self):
+        """Run a tiny forward pass to trigger torch.compile JIT."""
+        mula = self.pipe.mula
+        device = next(mula.parameters()).device
+        dtype = next(mula.parameters()).dtype
+        bs = 2
+        mula.setup_caches(bs)
+        # Dummy prompt-like input (1 token)
+        dummy_tokens = torch.zeros(bs, 1, 9, device=device, dtype=torch.long)
+        dummy_mask = torch.ones(bs, 1, 9, device=device, dtype=torch.bool)
+        dummy_pos = torch.zeros(bs, 1, device=device, dtype=torch.long)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=dtype):
+            mula.generate_frame(
+                tokens=dummy_tokens,
+                tokens_mask=dummy_mask,
+                input_pos=dummy_pos,
+                temperature=1.0,
+                topk=50,
+                cfg_scale=1.5,
+            )
+        # Clean up
+        for part in (mula.backbone, mula.decoder):
+            try:
+                part.reset_caches()
+            except (RuntimeError, AttributeError):
+                pass
+            for layer in part.layers:
+                attn = getattr(layer, "attn", None)
+                if attn is not None and getattr(attn, "kv_cache", None) is not None:
+                    attn.kv_cache = None
+                    attn.cache_enabled = False
+        torch.cuda.empty_cache()
 
     def generate(
         self,
