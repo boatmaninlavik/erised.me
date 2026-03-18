@@ -304,9 +304,6 @@ def serve():
 
     DPO_USER_EMAIL = os.environ.get("ERISED_DPO_USER_EMAIL", "zsean@berkeley.edu")
 
-    # Handle to the L4 codec worker
-    codec_worker = CodecWorker()
-
     def generation_worker():
         while True:
             job_id, prompt, lyrics, max_sec, model_name, dpo_scale = job_queue.get()
@@ -315,24 +312,11 @@ def serve():
                 _save_job(job_id)
             gen_stats["generating"] = True
 
-            last_save_time = 0.0
-            t4_audio_filename = [f"{job_id}.wav"]
-            decode_status_path = os.path.join(frames_dir, f"{job_id}_decoded.json")
-            # Track L4 decode progress for streaming audio to frontend
-            t4_decode_info = [None]  # Updated by background checker thread
-
-            # Pre-spawn L4 codec worker NOW so it cold-starts during token
-            # generation (~50-90s) instead of blocking after first checkpoint.
-            t4_spawned = [False]
-            try:
-                codec_worker.decode_job.spawn(job_id, t4_audio_filename[0])
-                t4_spawned[0] = True
-                logger.info("Pre-spawned L4 codec worker for job %s", job_id)
-            except Exception:
-                logger.warning("Failed to pre-spawn L4 for job %s, will retry at checkpoint", job_id)
+            last_save_time = [0.0]
+            audio_filename = f"{job_id}.wav"
+            audio_path = os.path.join(output_dir, audio_filename)
 
             def on_progress(current_frame, total_frames, partial_audio_file=None, partial_version=None):
-                nonlocal last_save_time
                 with jobs_lock:
                     jobs[job_id]["progress"] = {
                         "current_frame": current_frame,
@@ -342,79 +326,13 @@ def serve():
                         jobs[job_id]["partial_audio_file"] = partial_audio_file
                     if partial_version is not None:
                         jobs[job_id]["partial_version"] = partial_version
-
-                    # Check T4 decode progress (non-blocking, uses cached info)
-                    info = t4_decode_info[0]
-                    if info and info.get("chunks", 0) > 0:
-                        jobs[job_id]["partial_audio_file"] = info["audio_file"]
-                        jobs[job_id]["partial_version"] = info["chunks"]
-
                     now = time.time()
-                    if partial_audio_file or (now - last_save_time > 5):
+                    if now - last_save_time[0] > 5:
                         _save_job(job_id)
-                        last_save_time = now
-
-            def _t4_decode_checker():
-                """Background thread: polls volume for L4 decode status."""
-                # Wait until codec worker is actually spawned
-                while not t4_spawned[0]:
-                    time.sleep(2)
-                while True:
-                    try:
-                        erised_vol.reload()
-                        if os.path.isfile(decode_status_path):
-                            with open(decode_status_path) as f:
-                                t4_decode_info[0] = json.load(f)
-                            if t4_decode_info[0].get("done"):
-                                break
-                    except Exception:
-                        pass
-                    time.sleep(3)
-
-            checker_thread = threading.Thread(target=_t4_decode_checker, daemon=True)
-            checker_thread.start()
-
-            sync_lock = threading.Lock()  # Serialize background syncs
-
-            def on_frames_checkpoint(frames_tensor, is_final=False):
-                """Save frames to volume and signal L4 codec worker."""
-                cpu_frames = frames_tensor.cpu()
-
-                def _sync():
-                    with sync_lock:  # Ensure sequential commits
-                        frames_path = os.path.join(frames_dir, f"{job_id}.pt")
-                        signal_path = os.path.join(frames_dir, f"{job_id}.json")
-                        torch.save(cpu_frames, frames_path)
-                        with open(signal_path, "w") as f:
-                            json.dump({
-                                "num_frames": cpu_frames.shape[-1],
-                                "is_final": is_final,
-                            }, f)
-                        erised_vol.commit()
-
-                        # If pre-spawn failed, try spawning now
-                        if not t4_spawned[0]:
-                            try:
-                                codec_worker.decode_job.spawn(job_id, t4_audio_filename[0])
-                                t4_spawned[0] = True
-                                logger.info("Spawned L4 at checkpoint for job %s", job_id)
-                            except Exception:
-                                logger.warning("Failed to spawn L4 at checkpoint for job %s", job_id)
-
-                        logger.info(
-                            "Checkpoint for job %s: %d frames, final=%s",
-                            job_id, cpu_frames.shape[-1], is_final,
-                        )
-
-                if is_final:
-                    # Final checkpoint: BLOCKING — must commit before we
-                    # wait for T4, otherwise T4 never sees final frames.
-                    _sync()
-                else:
-                    # Intermediate checkpoints: non-blocking
-                    threading.Thread(target=_sync, daemon=True).start()
+                        last_save_time[0] = now
 
             try:
+                # ── Phase 1: Generate all frames (no codec during gen) ──
                 with gen_lock:
                     t0 = time.time()
                     if model_name == "dpo":
@@ -423,62 +341,65 @@ def serve():
                             max_audio_length_ms=int(max_sec * 1000),
                             dpo_scale=dpo_scale,
                             on_progress=on_progress,
-                            on_frames_checkpoint=on_frames_checkpoint,
                         )
                     else:
                         result = pipeline.generate(
                             prompt=prompt, lyrics=lyrics,
                             max_audio_length_ms=int(max_sec * 1000),
                             on_progress=on_progress,
-                            on_frames_checkpoint=on_frames_checkpoint,
                         )
-                    elapsed = time.time() - t0
-                    logger.info("[%s] Generated %s in %.1fs (%d frames)",
-                                model_name, result.audio_path, elapsed, result.num_frames)
+                    gen_elapsed = time.time() - t0
+                    logger.info("[%s] Generated %d frames in %.1fs",
+                                model_name, result.num_frames, gen_elapsed)
 
-                # Wait for codec worker to finish decoding the final audio
-                t4_done = False
-                if t4_spawned[0]:
-                    logger.info("Waiting for codec decode to finish for job %s ...", job_id)
-                    for attempt in range(180):  # Max 6 min
-                        erised_vol.reload()
-                        if os.path.isfile(decode_status_path):
-                            with open(decode_status_path) as f:
-                                decode_info = json.load(f)
-                            if decode_info.get("done"):
-                                logger.info("Codec decode complete for job %s (%d chunks)",
-                                            job_id, decode_info.get("chunks", 0))
-                                t4_done = True
-                                break
-                        time.sleep(2)
-                    else:
-                        logger.warning("Codec decode timed out for job %s", job_id)
-                else:
-                    logger.warning("Codec worker never spawned for job %s, falling back to local decode", job_id)
+                # ── Phase 2: Free KV caches so codec can use GPU ──
+                from erised.guided_generate import _reset_model_caches
+                _reset_model_caches(pipeline.pipe.mula)
+                if hasattr(pipeline, 'guider') and pipeline.guider:
+                    _reset_model_caches(pipeline.guider.dpo_model)
+                torch.cuda.empty_cache()
 
-                if t4_done:
-                    final_audio = t4_audio_filename[0]
-                else:
-                    # Fallback: decode locally on A100 (safe, generation done)
-                    logger.info("Falling back to local decode for job %s", job_id)
-                    from erised.streaming import streaming_detokenize
-                    fallback_frames = torch.load(result.tokens_path, map_location="cuda:0", weights_only=True)
-                    fallback_path = os.path.join(output_dir, f"{job_id}_fallback.wav")
-                    streaming_detokenize(
-                        pipeline.pipe.codec, fallback_frames, fallback_path,
-                    )
-                    final_audio = os.path.basename(fallback_path)
+                # ── Phase 3: Stream decode on A100 (seamless audio) ──
+                logger.info("Starting local codec decode for job %s (%d frames)",
+                            job_id, result.num_frames)
+                with jobs_lock:
+                    jobs[job_id]["status"] = "decoding"
+                    _save_job(job_id)
+
+                frames = torch.load(result.tokens_path, map_location="cuda:0",
+                                    weights_only=True)
+                from erised.streaming import StreamingDecoder
+                decoder = StreamingDecoder(pipeline.pipe.codec, audio_path)
+
+                def on_decode_chunk(chunk_idx, total_chunks):
+                    try:
+                        erised_vol.commit()
+                    except Exception:
+                        pass
+                    with jobs_lock:
+                        jobs[job_id]["partial_audio_file"] = audio_filename
+                        jobs[job_id]["partial_version"] = chunk_idx
+                        _save_job(job_id)
+                    logger.info("Job %s: decoded chunk %d/%d",
+                                job_id, chunk_idx, total_chunks)
+
+                decoder.decode_available(frames, on_chunk_ready=on_decode_chunk)
+                try:
+                    erised_vol.commit()
+                except Exception:
+                    pass
+                elapsed = time.time() - t0
+                logger.info("Job %s: decode complete in %.1fs total", job_id, elapsed)
 
                 with jobs_lock:
                     jobs[job_id]["status"] = "done"
                     jobs[job_id]["result"] = {
-                        "audio_file": final_audio,
+                        "audio_file": audio_filename,
                         "tags": result.tags_used,
                         "num_frames": result.num_frames,
                         "elapsed": round(elapsed, 1),
                         "model": model_name,
                     }
-                    # Clear partial fields now that we have final result
                     jobs[job_id].pop("partial_audio_file", None)
                     jobs[job_id].pop("partial_version", None)
                     _save_job(job_id)
@@ -493,13 +414,6 @@ def serve():
                 gen_stats["pending"] = max(0, gen_stats["pending"] - 1)
                 gen_stats["generating"] = job_queue.qsize() > 0
                 job_queue.task_done()
-                # Clean up frames files
-                for suffix in [".pt", ".json", "_decoded.json"]:
-                    path = os.path.join(frames_dir, f"{job_id}{suffix}")
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
 
     worker = threading.Thread(target=generation_worker, daemon=True)
     worker.start()
