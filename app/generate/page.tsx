@@ -82,7 +82,7 @@ function SongCard({
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playingSrc, setPlayingSrc] = useState<string | null>(null);
   const loadedVersionRef = useRef<number>(0);
-  const pendingSeekRef = useRef<number | null>(null);
+  const seekOnLoadRef = useRef<number>(0);
 
   // Build latest audio URL
   const latestSrc = result
@@ -91,15 +91,28 @@ function SongCard({
     ? `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`
     : null;
 
+  // Helper: fully reset audio element then set new src
+  const switchAudio = useCallback((newSrc: string, seekTo: number) => {
+    const el = audioRef.current;
+    if (el) {
+      el.pause();
+      el.removeAttribute("src");
+      el.load(); // fully reset — kills any residual playback
+    }
+    seekOnLoadRef.current = seekTo;
+    setPlayingSrc(newSrc);
+  }, []);
+
   // Set src for the FIRST time only
   useEffect(() => {
     if (latestSrc && !playingSrc) {
       loadedVersionRef.current = partialVersion;
+      seekOnLoadRef.current = 0;
       setPlayingSrc(latestSrc);
     }
   }, [latestSrc, playingSrc, partialVersion]);
 
-  // Preload next version in browser cache so switching is instant
+  // Preload next version in browser cache
   useEffect(() => {
     if (partialVersion > loadedVersionRef.current && partialAudio) {
       fetch(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`).catch(() => {});
@@ -113,30 +126,27 @@ function SongCard({
       const currentBase = playingSrc.split("?")[0];
       if (finalSrc !== currentBase) {
         const el = audioRef.current;
-        if (el) {
-          el.muted = true;
-          pendingSeekRef.current = el.currentTime;
-        }
-        setPlayingSrc(finalSrc);
+        switchAudio(finalSrc, el?.currentTime || 0);
       }
     }
-  }, [result, backendUrl, playingSrc]);
+  }, [result, backendUrl, playingSrc, switchAudio]);
 
-  // Poll: when audio is paused/ended and new chunks exist, load them
+  // Poll: when audio ended/paused and new chunks exist, switch
   useEffect(() => {
     if (status !== "running" && status !== "pending") return;
     const interval = setInterval(() => {
       const el = audioRef.current;
-      if (!el || (!el.paused && !el.ended)) return;
-      if (partialVersion > loadedVersionRef.current && partialAudio) {
-        el.pause();
-        pendingSeekRef.current = el.currentTime;
+      if (!el) return;
+      const shouldSwitch = el.paused || el.ended ||
+        (partialVersion > loadedVersionRef.current && el.duration - el.currentTime < 2);
+      if (shouldSwitch && partialVersion > loadedVersionRef.current && partialAudio) {
+        const pos = el.currentTime;
         loadedVersionRef.current = partialVersion;
-        setPlayingSrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
+        switchAudio(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`, pos);
       }
     }, 500);
     return () => clearInterval(interval);
-  }, [status, partialVersion, partialAudio, backendUrl]);
+  }, [status, partialVersion, partialAudio, backendUrl, switchAudio]);
 
   const isLoading = status === "pending" || status === "running";
   const progressPct = progress && progress.total_frames > 0
@@ -183,32 +193,11 @@ function SongCard({
           controls
           src={playingSrc}
           className="w-full"
-          onTimeUpdate={() => {
-            const el = audioRef.current;
-            if (!el || el.paused) return;
-            if (partialVersion > loadedVersionRef.current && partialAudio && el.duration - el.currentTime < 3) {
-              el.pause();
-              pendingSeekRef.current = el.currentTime;
-              loadedVersionRef.current = partialVersion;
-              setPlayingSrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
-            }
-          }}
-          onEnded={() => {
-            const el = audioRef.current;
-            if (!el) return;
-            if (partialVersion > loadedVersionRef.current && partialAudio) {
-              pendingSeekRef.current = el.currentTime;
-              loadedVersionRef.current = partialVersion;
-              setPlayingSrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
-            }
-          }}
           onCanPlay={() => {
             const el = audioRef.current;
             if (!el) return;
-            if (pendingSeekRef.current !== null) {
-              // Resuming after chunk switch — seek then play
-              el.currentTime = pendingSeekRef.current;
-              pendingSeekRef.current = null;
+            if (seekOnLoadRef.current > 0) {
+              el.currentTime = seekOnLoadRef.current;
             }
             el.play().catch(() => {});
           }}

@@ -156,29 +156,17 @@ class StreamingDecoder:
             if cur_output.dim() == 3:
                 cur_output = cur_output[0]
 
-            # ── splice (keep old audio, append only new portion) ──
-            # The overlap region shares the same input codes, so both chunks
-            # decode the same lyrics. Crossfading causes repeated content.
-            # Instead: keep the old output, append only the non-overlapping
-            # new audio, with a tiny 50ms crossfade to avoid clicks.
+            # ── append new audio only (discard overlap to avoid repeated lyrics) ──
             if self.output is None:
                 self.output = cur_output
             else:
-                if self.audio_ovlp_samples == 0:
-                    self.output = torch.cat([self.output, cur_output], -1)
-                else:
-                    fade_len = min(2400, self.audio_ovlp_samples)  # 50ms at 48kHz
-                    # Crossfade just 50ms at the splice point
-                    old_tail = self.output[:, -fade_len:]
-                    new_at_splice = cur_output[:, self.audio_ovlp_samples - fade_len:self.audio_ovlp_samples]
-                    fade_out = torch.linspace(1, 0, fade_len).unsqueeze(0)
-                    fade_in = torch.linspace(0, 1, fade_len).unsqueeze(0)
-                    spliced = old_tail * fade_out + new_at_splice * fade_in
-                    self.output = torch.cat([
-                        self.output[:, :-fade_len],
-                        spliced,
-                        cur_output[:, self.audio_ovlp_samples:],
-                    ], -1)
+                # The overlap region decodes the same lyrics twice (different
+                # noise → slightly different audio). Discard it entirely and
+                # just append the genuinely new audio.
+                self.output = torch.cat([
+                    self.output,
+                    cur_output[:, self.audio_ovlp_samples:],
+                ], -1)
 
             # ── save partial audio ──
             partial = self.output[:, :min(self.output.shape[-1], target_len)]
