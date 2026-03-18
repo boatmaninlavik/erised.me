@@ -74,12 +74,37 @@ def publish_url(url: str) -> None:
     print(f"✓ Published backend URL to Supabase: {url}")
 
 
-def clear_url() -> None:
+def get_current_url() -> str:
+    """Read the current backend_url from Supabase."""
+    import urllib.request
+    import json
+
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/erised_config?key=eq.backend_url&select=value",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+        },
+    )
     try:
-        _supabase_patch({"value": ""})
-        print("✓ Backend URL cleared — site will show GPU offline.")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        return data[0]["value"] if data else ""
+    except Exception:
+        return ""
+
+
+# Modal's permanent URL — restored when RunPod stops
+MODAL_URL = "https://boatmaninlavik--erised-gpu-serve.modal.run"
+
+
+def clear_url() -> None:
+    """Restore Modal URL so erised.me falls back to Modal."""
+    try:
+        _supabase_patch({"value": MODAL_URL})
+        print(f"✓ Restored Modal URL: {MODAL_URL}")
     except Exception as e:
-        print(f"  Warning: could not clear URL from Supabase: {e}")
+        print(f"  Warning: could not restore Modal URL: {e}")
 
 
 def main():
@@ -149,14 +174,14 @@ def main():
         ngrok_proc.terminate()
         sys.exit(1)
 
-    mode_label = "Compare (A/B)" if args.mode == "compare" else "Rate (preference collection)"
+    modes = {"generate": "Streaming Generation", "compare": "Compare (A/B)", "rate": "Rate (preferences)"}
     print(f"\n{'='*55}")
     print(f"  Erised GPU server is LIVE")
-    print(f"  Mode:    {mode_label}")
+    print(f"  Mode:    {modes[args.mode]}")
     print(f"  Users:   https://erised-me.vercel.app")
     print(f"  Direct:  {url}")
     print(f"{'='*55}")
-    print(f"\nPress Ctrl+C to stop and take the server offline.\n")
+    print(f"\nPress Ctrl+C to stop and switch back to Modal.\n")
 
     try:
         server_proc.wait()
