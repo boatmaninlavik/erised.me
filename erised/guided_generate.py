@@ -1,12 +1,7 @@
 """
-DPO Logit Guidance with shared backbone optimization.
+DPO Logit Guidance — two full model copies with independent backbones.
 
     logits_final = logits_orig + scale * (logits_dpo - logits_orig)
-
-v11 DPO only trains backbone layers 26-27 (of 28) + output heads.
-Layers 0-25 are identical between orig and DPO, so we run them once
-and branch only at layer 26. This gives ~1.8x speedup over running
-both full backbones independently.
 
 Requires A100-80GB to fit both models in VRAM.
 """
@@ -97,82 +92,27 @@ def _generate_frame_logits(model, tokens, tokens_mask, input_pos, cfg_scale,
     return c0_logits, last_h
 
 
-def _sync_kv_caches(src_layers, dst_layers, n_layers):
-    """Copy KV cache state from src layers 0..n-1 to dst layers 0..n-1."""
-    for i in range(n_layers):
-        src_cache = src_layers[i].attn.kv_cache
-        dst_cache = dst_layers[i].attn.kv_cache
-        if src_cache is not None and dst_cache is not None:
-            dst_cache.k_cache.copy_(src_cache.k_cache)
-            dst_cache.v_cache.copy_(src_cache.v_cache)
-            dst_cache.cache_pos.copy_(src_cache.cache_pos)
-
-
 def _guided_generate_frame(orig_model, dpo_model, tokens, tokens_mask, input_pos,
                            temperature, topk, cfg_scale, dpo_scale,
                            continuous_segments=None, starts=None):
     """
-    Generate one frame using logit guidance with shared backbone.
-
-    Layers 0-25 are identical between orig and DPO (v11 only trains 26-27),
-    so we run them once on the orig model and sync KV caches to the DPO model.
-    Only layers 26-27 + output heads run on both models (~1.8x faster).
+    Generate one frame using logit guidance from two models.
+    Runs both full backbones independently (safe, proven approach).
     """
     b = tokens.size(0)
     embeds_dtype = next(orig_model.parameters()).dtype
 
-    # ── Prepare embeddings (identical weights, run once) ──
-    b_size, s, _ = tokens.size()
-    backbone_mask = _index_causal_mask(orig_model.backbone_causal_mask, input_pos)
+    # Get logits from both models independently
+    orig_c0_logits, orig_last_h = _generate_frame_logits(
+        orig_model, tokens, tokens_mask, input_pos, cfg_scale,
+        continuous_segments, starts,
+    )
+    dpo_c0_logits, _ = _generate_frame_logits(
+        dpo_model, tokens, tokens_mask, input_pos, cfg_scale,
+        continuous_segments, starts,
+    )
 
-    uncond_mask = None
-    if cfg_scale > 1.0 and b > 1:
-        actual_B = b // 2
-        uncond_mask = torch.cat([
-            torch.zeros(actual_B, dtype=torch.bool, device=tokens.device),
-            torch.ones(actual_B, dtype=torch.bool, device=tokens.device),
-        ])
-
-    embeds = orig_model._embed_tokens(tokens, uncond_mask=uncond_mask)
-    masked_embeds = embeds * tokens_mask.unsqueeze(-1)
-    h = masked_embeds.sum(dim=2, dtype=embeds.dtype)
-
-    if continuous_segments is not None:
-        continuous_segments = orig_model.muq_linear(continuous_segments)
-        if uncond_mask is not None:
-            uncond_embed = orig_model.unconditional_text_embedding(
-                torch.zeros(1, device=tokens.device, dtype=torch.long)
-            )
-            mask_expanded = uncond_mask.view(b, 1).expand_as(continuous_segments)
-            continuous_segments = torch.where(mask_expanded, uncond_embed, continuous_segments)
-        batch_indices = torch.arange(h.shape[0], device=h.device)
-        h[batch_indices, starts] = continuous_segments
-
-    # ── Shared layers 0-25: run once on orig model ──
-    for layer in orig_model.backbone.layers[:N_SHARED_LAYERS]:
-        h = layer(h, input_pos=input_pos, mask=backbone_mask)
-
-    # Sync KV caches for shared layers to DPO model
-    _sync_kv_caches(orig_model.backbone.layers, dpo_model.backbone.layers, N_SHARED_LAYERS)
-
-    # ── Branched layers 26-27: run on both models ──
-    h_orig = h.clone()
-    for layer in orig_model.backbone.layers[N_SHARED_LAYERS:]:
-        h_orig = layer(h_orig, input_pos=input_pos, mask=backbone_mask)
-    h_orig = orig_model.backbone.norm(h_orig)
-
-    h_dpo = h
-    for layer in dpo_model.backbone.layers[N_SHARED_LAYERS:]:
-        h_dpo = layer(h_dpo, input_pos=input_pos, mask=backbone_mask)
-    h_dpo = dpo_model.backbone.norm(h_dpo)
-
-    # ── Get logits from both heads ──
-    orig_last_h = h_orig[:, -1, :]
-    dpo_last_h = h_dpo[:, -1, :]
-    orig_c0_logits = orig_model.codebook0_head(orig_last_h)
-    dpo_c0_logits = dpo_model.codebook0_head(dpo_last_h)
-
-    # ── Combine logits with CFG + DPO guidance ──
+    # Combine logits with CFG + DPO guidance
     if cfg_scale > 1.0 and b > 1 and (b % 2 == 0):
         actual_B = b // 2
         orig_cond = orig_c0_logits[:actual_B]
