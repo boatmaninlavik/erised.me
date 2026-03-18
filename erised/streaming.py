@@ -31,7 +31,7 @@ class StreamingDecoder:
         codec,
         save_path: str,
         duration: float = 29.76,
-        num_steps: int = 5,
+        num_steps: int = 3,
         guidance_scale: float = 1.25,
     ):
         self.codec = codec
