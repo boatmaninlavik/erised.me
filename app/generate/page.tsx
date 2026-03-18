@@ -222,7 +222,7 @@ export default function GeneratePage() {
   const [lyrics, setLyrics] = useState("");
   const [maxSec, setMaxSec] = useState(60);
   const [dpoScale, setDpoScale] = useState(3.0);
-  const [tab, setTab] = useState<"ab" | "single">("single");
+  const [tab, setTab] = useState<"ab" | "single">("ab");
   const [selectedModel, setSelectedModel] = useState<"dpo" | "original">("dpo");
 
   const [origStatus, setOrigStatus] = useState<JobStatus>("idle");
@@ -305,7 +305,7 @@ export default function GeneratePage() {
     setDpoResult(null);
     setSavedModels(new Set());
     setOrigStatus("pending");
-    setDpoStatus("pending");
+    setDpoStatus("idle");
     setOrigProgress(null);
     setDpoProgress(null);
     setOrigPartialAudio(null);
@@ -314,6 +314,7 @@ export default function GeneratePage() {
     setDpoPartialVersion(0);
 
     try {
+      // ── Generate Original first ──
       const origResp = await fetchRetry(`${backendUrl}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -322,6 +323,16 @@ export default function GeneratePage() {
       const origJob = await origResp.json();
       setOrigStatus("running");
 
+      const origResult = await pollJob(backendUrl, origJob.job_id, (prog, partial, ver) => {
+        setOrigProgress(prog);
+        if (partial) setOrigPartialAudio(partial);
+        if (ver !== null) setOrigPartialVersion(ver);
+      });
+      setOrigResult(origResult);
+      setOrigStatus("done");
+
+      // ── Then generate DPO ──
+      setDpoStatus("pending");
       const dpoResp = await fetchRetry(`${backendUrl}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -330,31 +341,13 @@ export default function GeneratePage() {
       const dpoJob = await dpoResp.json();
       setDpoStatus("running");
 
-      const origPromise = pollJob(backendUrl, origJob.job_id, (prog, partial, ver) => {
-        setOrigProgress(prog);
-        if (partial) setOrigPartialAudio(partial);
-        if (ver !== null) setOrigPartialVersion(ver);
-      }).then((res) => {
-        setOrigResult(res);
-        setOrigStatus("done");
-      }).catch((e) => {
-        setOrigStatus("error");
-        throw e;
-      });
-
-      const dpoPromise = pollJob(backendUrl, dpoJob.job_id, (prog, partial, ver) => {
+      const dpoResult = await pollJob(backendUrl, dpoJob.job_id, (prog, partial, ver) => {
         setDpoProgress(prog);
         if (partial) setDpoPartialAudio(partial);
         if (ver !== null) setDpoPartialVersion(ver);
-      }).then((res) => {
-        setDpoResult(res);
-        setDpoStatus("done");
-      }).catch((e) => {
-        setDpoStatus("error");
-        throw e;
       });
-
-      await Promise.all([origPromise, dpoPromise]);
+      setDpoResult(dpoResult);
+      setDpoStatus("done");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Generation failed");
     }
