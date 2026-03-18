@@ -533,9 +533,12 @@ def serve():
 
     @fapi.get("/audio/{filename}")
     def serve_audio(filename: str):
-        # Always reload volume — codec worker overwrites the file as it
-        # decodes more chunks, so the local cache may be stale.
-        erised_vol.reload()
+        # Reload volume to see codec worker's latest writes.
+        # May fail if codec worker has open files — serve from cache.
+        try:
+            erised_vol.reload()
+        except Exception:
+            pass
         path = os.path.join(output_dir, filename)
         if not os.path.isfile(path):
             raise HTTPException(404, "Audio file not found")
