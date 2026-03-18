@@ -222,9 +222,14 @@ def serve():
     output_dir = "/data/outputs"
     jobs_dir = "/data/jobs"
     frames_dir = "/data/frames"
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(jobs_dir, exist_ok=True)
-    os.makedirs(frames_dir, exist_ok=True)
+
+    # Reload volume first so FUSE mount is synced, then create dirs
+    erised_vol.reload()
+    for d in (output_dir, jobs_dir, frames_dir):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            logger.warning("makedirs %s: %s (continuing)", d, e)
 
     os.environ.setdefault("ERISED_MODEL_PATH", model_path)
     os.environ.setdefault("ERISED_OUTPUT_DIR", output_dir)
@@ -250,15 +255,21 @@ def serve():
         return os.path.join(jobs_dir, f"{job_id}.json")
 
     def _save_job(job_id: str):
-        """Write job state to volume (atomic via temp file)."""
+        """Write job state to volume (best-effort, jobs also live in memory)."""
         data = jobs.get(job_id)
         if data is None:
             return
-        os.makedirs(jobs_dir, exist_ok=True)
-        tmp = _job_path(job_id) + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, _job_path(job_id))
+        try:
+            os.makedirs(jobs_dir, exist_ok=True)
+        except OSError:
+            pass
+        try:
+            tmp = _job_path(job_id) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, _job_path(job_id))
+        except OSError as e:
+            logger.warning("Failed to persist job %s to disk: %s", job_id, e)
 
     def _load_job(job_id: str) -> dict | None:
         """Load job from volume if not in memory."""
@@ -274,12 +285,15 @@ def serve():
             return None
 
     # Load any existing jobs from a previous container
-    for fname in os.listdir(jobs_dir):
-        if fname.endswith(".json") and not fname.endswith(".tmp"):
-            jid = fname[:-5]
-            _load_job(jid)
-    if jobs:
-        logger.info("Loaded %d existing jobs from volume", len(jobs))
+    try:
+        for fname in os.listdir(jobs_dir):
+            if fname.endswith(".json") and not fname.endswith(".tmp"):
+                jid = fname[:-5]
+                _load_job(jid)
+        if jobs:
+            logger.info("Loaded %d existing jobs from volume", len(jobs))
+    except OSError as e:
+        logger.warning("Could not load existing jobs: %s", e)
 
     # ── Job queue ──────────────────────────────────────────────────
     gen_lock = threading.Lock()
