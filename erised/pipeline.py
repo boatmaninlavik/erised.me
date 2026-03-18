@@ -273,10 +273,10 @@ class ErisedPipeline:
 
         max_audio_frames = max_audio_length_ms // 80
 
-        # Checkpoint thresholds — first decode at 230 frames gives 2 quality
-        # chunks (~22s buffer). At 10fps: 23s gen + 3s decode = ~26s to first
-        # audio. Buffer drains at only 0.7s per 11s cycle → seamless for 75s+.
-        _FIRST_CHUNK = 200
+        # Checkpoint: first decode at 150 frames = exactly 1 clean chunk
+        # (no padding needed with duration=12). At ~15fps: 10s gen + 3s decode
+        # ≈ 13s to first audio. Subsequent _HOP=160 cycles keep buffer ahead.
+        _FIRST_CHUNK = 150
         _HOP = 160
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 

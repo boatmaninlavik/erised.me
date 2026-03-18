@@ -64,6 +64,7 @@ class StreamingDecoder:
         self.latent_list: list[torch.Tensor] = []
         self.output: Optional[torch.Tensor] = None
         self.chunks_decoded = 0
+        self.chunk_paths: list[str] = []
 
     def next_chunk_at(self) -> int:
         """Number of frames needed before the next chunk can be decoded."""
@@ -87,18 +88,16 @@ class StreamingDecoder:
 
         # Pad codes to full-chunk boundaries
         if codes_len_orig < self.min_samples:
-            while codes.shape[-1] < self.min_samples:
-                codes = torch.cat([codes, codes], -1)
-            codes = codes[:, :, :self.min_samples]
+            pad_len = self.min_samples - codes.shape[-1]
+            codes = torch.cat([codes, codes[:, :, -1:].expand(-1, -1, pad_len)], -1)
         codes_len = codes.shape[-1]
         if (codes_len - self.ovlp_samples) % self.hop_samples > 0:
             len_codes = (
                 math.ceil((codes_len - self.ovlp_samples) / float(self.hop_samples))
                 * self.hop_samples + self.ovlp_samples
             )
-            while codes.shape[-1] < len_codes:
-                codes = torch.cat([codes, codes], -1)
-            codes = codes[:, :, :len_codes]
+            pad_len = len_codes - codes.shape[-1]
+            codes = torch.cat([codes, codes[:, :, -1:].expand(-1, -1, pad_len)], -1)
 
         chunk_starts = list(
             range(0, codes.shape[-1] - self.hop_samples + 1, self.hop_samples)
@@ -167,6 +166,15 @@ class StreamingDecoder:
                     self.output,
                     cur_output[:, self.audio_ovlp_samples:],
                 ], -1)
+
+            # ── save individual chunk for incremental streaming ──
+            chunk_audio = cur_output if idx == 0 else cur_output[:, self.audio_ovlp_samples:]
+            chunk_base, chunk_ext = os.path.splitext(self.save_path)
+            chunk_path = f"{chunk_base}_chunk{idx}{chunk_ext}"
+            temp_chunk_path = chunk_path + ".tmp"
+            torchaudio.save(temp_chunk_path, chunk_audio.to(torch.float32), 48000, format="wav")
+            os.replace(temp_chunk_path, chunk_path)
+            self.chunk_paths.append(os.path.basename(chunk_path))
 
             # ── save partial audio ──
             partial = self.output[:, :min(self.output.shape[-1], target_len)]
