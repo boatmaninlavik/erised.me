@@ -81,6 +81,7 @@ class ErisedPipeline:
         cfg_scale: Optional[float] = None,
         on_progress: Optional[Callable] = None,
         on_frames_checkpoint: Optional[Callable] = None,
+        streaming_decode: bool = False,
     ) -> GenerationResult:
         """Generate a song from a musical prompt + lyrics. Returns audio path + saved tokens."""
 
@@ -99,7 +100,8 @@ class ErisedPipeline:
         }
 
         frames = self._generate_and_capture(tags, lyrics, audio_path, on_progress=on_progress,
-                                              on_frames_checkpoint=on_frames_checkpoint, **kwargs)
+                                              on_frames_checkpoint=on_frames_checkpoint,
+                                              streaming_decode=streaming_decode, **kwargs)
 
         torch.save(frames.cpu(), tokens_path)
         logger.info("Saved tokens (%d frames) to %s", frames.shape[-1], tokens_path)
@@ -155,6 +157,7 @@ class ErisedPipeline:
         save_path: str,
         on_progress: Optional[Callable] = None,
         on_frames_checkpoint: Optional[Callable] = None,
+        streaming_decode: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -232,16 +235,20 @@ class ErisedPipeline:
 
         max_audio_frames = max_audio_length_ms // 80
 
-        # Frame checkpoint thresholds for streaming decode on separate GPU.
-        # Codec uses 12s chunks (min_samples=150, hop=80). Send frames early
-        # and often so codec worker can decode new chunks every ~80 frames.
-        _FIRST_CHUNK = 100
+        # Checkpoint thresholds
+        _FIRST_CHUNK = 150  # min_samples for duration=12 codec chunks
         _HOP = 80
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 
-        # Autoregressive generation loop — NO codec decode here.
-        # Running codec (flow_matching + scalar_model) while mula has
-        # active KV caches causes SIGABRT / GPU state corruption.
+        # Streaming decode: pause-decode-resume on same GPU
+        stream_decoder = None
+        next_stream_at = None
+        if streaming_decode:
+            from .streaming import StreamingDecoder
+            from .guided_generate import _save_backbone_caches, _restore_backbone_caches, _reset_model_caches
+            stream_decoder = StreamingDecoder(self.pipe.codec, save_path, duration=12)
+            next_stream_at = _FIRST_CHUNK
+
         for i in range(max_audio_frames):
             curr_padded, curr_mask = _pad(curr_token)
             with torch.autocast(device_type=device.type, dtype=dtype):
@@ -262,17 +269,44 @@ class ErisedPipeline:
             if len(frames) % 10 == 0 and on_progress:
                 on_progress(len(frames), max_audio_frames, None, None)
 
-            # Send frames to external codec worker at checkpoint thresholds
+            # External codec worker checkpoints
             if next_checkpoint and len(frames) >= next_checkpoint:
                 frames_tensor_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
                 on_frames_checkpoint(frames_tensor_cp, is_final=False)
                 next_checkpoint += _HOP
 
+            # Pause-decode-resume on same GPU
+            if next_stream_at and len(frames) >= next_stream_at:
+                frames_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+                saved = _save_backbone_caches(mula)
+                _reset_model_caches(mula)
+                torch.cuda.empty_cache()
+                new_chunks = stream_decoder.decode_available(frames_cp)
+                mula.setup_caches(bs_size)
+                _restore_backbone_caches(mula, saved)
+                del saved
+                torch.cuda.empty_cache()
+                if new_chunks > 0 and on_progress:
+                    on_progress(len(frames), max_audio_frames,
+                               os.path.basename(save_path), stream_decoder.chunks_decoded)
+                next_stream_at += _HOP
+
         # Stack frames and decode to audio
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
         num_gen_frames = len(frames)
 
-        if on_frames_checkpoint:
+        if streaming_decode:
+            # Final decode pass for remaining chunks
+            from .guided_generate import _reset_model_caches
+            _reset_model_caches(mula)
+            torch.cuda.empty_cache()
+            stream_decoder.decode_available(frames_tensor)
+            if on_progress:
+                on_progress(num_gen_frames, max_audio_frames,
+                           os.path.basename(save_path), stream_decoder.chunks_decoded)
+            logger.info("Streaming decode complete: %d chunks, %s",
+                        stream_decoder.chunks_decoded, save_path)
+        elif on_frames_checkpoint:
             # External decoder handles all audio — send final frames
             on_frames_checkpoint(frames_tensor, is_final=True)
             logger.info("Frames sent to external decoder (%d frames)", frames_tensor.shape[-1])
@@ -338,6 +372,7 @@ class ErisedPipeline:
         dpo_scale: float = 1.0,
         on_progress: Optional[Callable] = None,
         on_frames_checkpoint: Optional[Callable] = None,
+        streaming_decode: bool = False,
     ) -> GenerationResult:
         """
         Generate a song using DPO Guided inference.
@@ -375,6 +410,7 @@ class ErisedPipeline:
             dpo_scale=dpo_scale,
             on_progress=on_progress,
             on_frames_checkpoint=on_frames_checkpoint,
+            streaming_decode=streaming_decode,
         )
 
         torch.save(frames.cpu(), tokens_path)

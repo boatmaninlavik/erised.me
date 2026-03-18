@@ -54,6 +54,33 @@ def _reset_model_caches(model):
                 attn.cache_enabled = False
 
 
+def _save_backbone_caches(model):
+    """Save backbone KV caches to CPU for pause-decode-resume."""
+    saved = []
+    for layer in model.backbone.layers:
+        attn = getattr(layer, "attn", None)
+        if attn is None or getattr(attn, "kv_cache", None) is None:
+            continue
+        kv = attn.kv_cache
+        saved.append((kv.k_cache.cpu().clone(), kv.v_cache.cpu().clone()))
+    return saved
+
+
+def _restore_backbone_caches(model, saved):
+    """Restore backbone KV caches from CPU after codec decode."""
+    idx = 0
+    for layer in model.backbone.layers:
+        attn = getattr(layer, "attn", None)
+        if attn is None or getattr(attn, "kv_cache", None) is None:
+            continue
+        if idx >= len(saved):
+            break
+        kv = attn.kv_cache
+        kv.k_cache.copy_(saved[idx][0].to(kv.k_cache.device))
+        kv.v_cache.copy_(saved[idx][1].to(kv.v_cache.device))
+        idx += 1
+
+
 def _generate_frame_logits(model, tokens, tokens_mask, input_pos, cfg_scale,
                            continuous_segments=None, starts=None):
     """
@@ -220,6 +247,7 @@ class DPOGuider:
         dpo_scale: float = 1.0,
         on_progress: Optional[Callable] = None,
         on_frames_checkpoint: Optional[Callable] = None,
+        streaming_decode: bool = False,
     ) -> torch.Tensor:
         """Full guided generation loop — identical to v8's guided_forward."""
         pipe = pipeline.pipe
@@ -265,12 +293,18 @@ class DPOGuider:
 
         max_audio_frames = max_audio_length_ms // 80
 
-        # Frame checkpoint thresholds for streaming decode on separate GPU.
-        # Codec uses 12s chunks (min_samples=150, hop=80). Send frames early
-        # and often so codec worker can decode new chunks every ~80 frames.
-        _FIRST_CHUNK = 100
+        # Checkpoint thresholds
+        _FIRST_CHUNK = 150  # min_samples for duration=12 codec chunks
         _HOP = 80
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
+
+        # Streaming decode: pause-decode-resume on same GPU
+        stream_decoder = None
+        next_stream_at = None
+        if streaming_decode:
+            from .streaming import StreamingDecoder
+            stream_decoder = StreamingDecoder(pipe.codec, save_path, duration=12)
+            next_stream_at = _FIRST_CHUNK
 
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):
             # Initial frame
@@ -282,7 +316,6 @@ class DPOGuider:
             )
             frames.append(curr_token[0:1,])
 
-            # Autoregressive loop — NO codec decode here (causes SIGABRT)
             for i in tqdm(range(max_audio_frames), desc="Guided generation"):
                 curr_padded, curr_mask = _pad(curr_token)
                 curr_token = _guided_generate_frame(
@@ -298,17 +331,47 @@ class DPOGuider:
                 if len(frames) % 10 == 0 and on_progress:
                     on_progress(len(frames), max_audio_frames, None, None)
 
-                # Send frames to external codec worker at checkpoint thresholds
+                # External codec worker checkpoints
                 if next_checkpoint and len(frames) >= next_checkpoint:
                     frames_tensor_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
                     on_frames_checkpoint(frames_tensor_cp, is_final=False)
                     next_checkpoint += _HOP
 
+                # Pause-decode-resume on same GPU
+                if next_stream_at and len(frames) >= next_stream_at:
+                    frames_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+                    saved_orig = _save_backbone_caches(orig_model)
+                    saved_dpo = _save_backbone_caches(dpo_model)
+                    _reset_model_caches(orig_model)
+                    _reset_model_caches(dpo_model)
+                    torch.cuda.empty_cache()
+                    new_chunks = stream_decoder.decode_available(frames_cp)
+                    orig_model.setup_caches(bs_size)
+                    dpo_model.setup_caches(bs_size)
+                    _restore_backbone_caches(orig_model, saved_orig)
+                    _restore_backbone_caches(dpo_model, saved_dpo)
+                    del saved_orig, saved_dpo
+                    torch.cuda.empty_cache()
+                    if new_chunks > 0 and on_progress:
+                        on_progress(len(frames), max_audio_frames,
+                                   os.path.basename(save_path), stream_decoder.chunks_decoded)
+                    next_stream_at += _HOP
+
         # Stack frames and decode to audio
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
         num_gen_frames = len(frames)
 
-        if on_frames_checkpoint:
+        if streaming_decode:
+            # Final decode pass for remaining chunks
+            _reset_model_caches(orig_model)
+            _reset_model_caches(dpo_model)
+            torch.cuda.empty_cache()
+            stream_decoder.decode_available(frames_tensor)
+            if on_progress:
+                on_progress(num_gen_frames, max_audio_frames,
+                           os.path.basename(save_path), stream_decoder.chunks_decoded)
+            logger.info("Guided streaming decode complete: %d chunks", stream_decoder.chunks_decoded)
+        elif on_frames_checkpoint:
             # External decoder handles all audio — send final frames
             on_frames_checkpoint(frames_tensor, is_final=True)
             logger.info("Guided frames sent to external decoder (%d frames)", frames_tensor.shape[-1])
