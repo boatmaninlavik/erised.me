@@ -103,11 +103,18 @@ function SongCard({
   const playbackStartRef = useRef(0);
   const streamStartedRef = useRef(false);
   const loadingRef = useRef(false);
+  const chunksFailedRef = useRef(false); // true = backend doesn't support chunks, use legacy
 
   const [streamStarted, setStreamStarted] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [bufferedDuration, setBufferedDuration] = useState(0);
+
+  // ── Legacy fallback: full-file <audio> with src switching ──
+  const [legacyMode, setLegacyMode] = useState(false);
+  const [legacySrc, setLegacySrc] = useState<string | null>(null);
+  const legacyVersionRef = useRef(0);
+  const legacySeekRef = useRef(0);
 
   // ── Final audio (after generation completes) ──
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -128,10 +135,15 @@ function SongCard({
       playbackStartRef.current = 0;
       streamStartedRef.current = false;
       loadingRef.current = false;
+      chunksFailedRef.current = false;
       setStreamStarted(false);
       setIsPlaying(false);
       setCurrentTime(0);
       setBufferedDuration(0);
+      setLegacyMode(false);
+      setLegacySrc(null);
+      legacyVersionRef.current = 0;
+      legacySeekRef.current = 0;
       setUseFinalPlayer(false);
       finalSeekRef.current = 0;
     }
@@ -176,8 +188,10 @@ function SongCard({
   }, []);
 
   // Fetch new chunk files when partialVersion increases
+  // Falls back to legacy (full-file) mode if chunk0 returns 404
   useEffect(() => {
-    if (!partialAudio || partialVersion <= 0 || useFinalPlayer) return;
+    if (!partialAudio || partialVersion <= 0 || useFinalPlayer || legacyMode) return;
+    if (chunksFailedRef.current) return;
     if (loadedChunksRef.current >= partialVersion) return;
 
     const load = async () => {
@@ -192,7 +206,15 @@ function SongCard({
             await loadChunk(`${backendUrl}/audio/${base}_chunk${i}.${ext}`);
             loadedChunksRef.current = i + 1;
           } catch {
-            break; // retry on next poll cycle
+            if (i === 0) {
+              // chunk0 failed — backend doesn't support chunks, use legacy mode
+              chunksFailedRef.current = true;
+              // Clean up any AudioContext we created
+              audioCtxRef.current?.close().catch(() => {});
+              audioCtxRef.current = null;
+              setLegacyMode(true);
+            }
+            break;
           }
         }
       } finally {
@@ -200,7 +222,52 @@ function SongCard({
       }
     };
     load();
-  }, [partialAudio, partialVersion, backendUrl, loadChunk, useFinalPlayer]);
+  }, [partialAudio, partialVersion, backendUrl, loadChunk, useFinalPlayer, legacyMode]);
+
+  // ── Legacy mode: load the full partial audio file ──
+  useEffect(() => {
+    if (!legacyMode || !partialAudio || useFinalPlayer) return;
+    if (partialVersion <= legacyVersionRef.current) return;
+    const newSrc = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
+    // Preload in browser cache
+    fetch(newSrc).catch(() => {});
+    const el = audioRef.current;
+    if (!el) {
+      // First load
+      legacyVersionRef.current = partialVersion;
+      setLegacySrc(newSrc);
+      return;
+    }
+    // Switch when near end of current audio or paused/ended
+    const shouldSwitch = el.paused || el.ended ||
+      (isFinite(el.duration) && el.duration - el.currentTime < 2);
+    if (shouldSwitch) {
+      legacySeekRef.current = el.currentTime || 0;
+      legacyVersionRef.current = partialVersion;
+      el.pause();
+      setLegacySrc(newSrc);
+    }
+  }, [legacyMode, partialAudio, partialVersion, backendUrl, useFinalPlayer]);
+
+  // Legacy mode: poll for switch opportunity
+  useEffect(() => {
+    if (!legacyMode || useFinalPlayer) return;
+    if (status !== "running" && status !== "pending") return;
+    const iv = setInterval(() => {
+      const el = audioRef.current;
+      if (!el || !partialAudio) return;
+      if (partialVersion <= legacyVersionRef.current) return;
+      const shouldSwitch = el.paused || el.ended ||
+        (isFinite(el.duration) && el.duration - el.currentTime < 2);
+      if (shouldSwitch) {
+        legacySeekRef.current = el.currentTime || 0;
+        legacyVersionRef.current = partialVersion;
+        el.pause();
+        setLegacySrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
+      }
+    }, 500);
+    return () => clearInterval(iv);
+  }, [legacyMode, status, partialVersion, partialAudio, backendUrl, useFinalPlayer]);
 
   // Update playback time for UI
   useEffect(() => {
@@ -237,9 +304,9 @@ function SongCard({
     if (ctx) ctx.close().catch(() => {});
     audioCtxRef.current = null;
 
-    finalSeekRef.current = pos;
+    finalSeekRef.current = legacyMode ? 0 : pos;
     setUseFinalPlayer(true);
-  }, [result, useFinalPlayer]);
+  }, [result, useFinalPlayer, legacyMode]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -289,7 +356,7 @@ function SongCard({
       )}
 
       {/* Streaming player — Web Audio API with gapless scheduling */}
-      {!useFinalPlayer && streamStarted && (
+      {!useFinalPlayer && !legacyMode && streamStarted && (
         <div className="flex items-center gap-3">
           <button
             onClick={togglePlay}
@@ -311,16 +378,34 @@ function SongCard({
         </div>
       )}
 
-      {/* Final player — standard <audio> controls after generation completes */}
-      {useFinalPlayer && result && (
+      {/* Legacy player — full-file <audio> when backend doesn't support chunks */}
+      {!useFinalPlayer && legacyMode && legacySrc && (
         <audio
           ref={audioRef}
           controls
-          src={`${backendUrl}/audio/${result.audio_file}`}
+          src={legacySrc}
           className="w-full"
           onCanPlay={() => {
             const el = audioRef.current;
             if (!el) return;
+            if (legacySeekRef.current > 0) {
+              el.currentTime = legacySeekRef.current;
+              legacySeekRef.current = 0;
+            }
+            el.play().catch(() => {});
+          }}
+        />
+      )}
+
+      {/* Final player — standard <audio> controls after generation completes */}
+      {useFinalPlayer && result && (
+        <audio
+          ref={!legacyMode ? audioRef : undefined}
+          controls
+          src={`${backendUrl}/audio/${result.audio_file}`}
+          className="w-full"
+          onCanPlay={(e) => {
+            const el = e.currentTarget;
             if (finalSeekRef.current > 0) {
               el.currentTime = finalSeekRef.current;
               finalSeekRef.current = 0;
