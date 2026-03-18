@@ -70,6 +70,11 @@ class ErisedPipeline:
         )
         logger.info("HeartMuLa pipeline loaded.")
 
+        # Compile backbone for ~1.5-2x faster frame generation
+        logger.info("Compiling mula backbone with torch.compile...")
+        self.pipe.mula.backbone = torch.compile(self.pipe.mula.backbone)
+        logger.info("Backbone compiled (first call will trigger JIT, ~30s).")
+
     def generate(
         self,
         prompt: str,
