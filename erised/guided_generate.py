@@ -1,7 +1,12 @@
 """
-DPO Logit Guidance — exact v8 approach with two full model copies.
+DPO Logit Guidance with shared backbone optimization.
 
     logits_final = logits_orig + scale * (logits_dpo - logits_orig)
+
+v11 DPO only trains backbone layers 26-27 (of 28) + output heads.
+Layers 0-25 are identical between orig and DPO, so we run them once
+and branch only at layer 26. This gives ~1.8x speedup over running
+both full backbones independently.
 
 Requires A100-80GB to fit both models in VRAM.
 """
@@ -92,21 +97,34 @@ def _generate_frame_logits(model, tokens, tokens_mask, input_pos, cfg_scale,
     return c0_logits, last_h
 
 
+def _sync_kv_caches(src_layers, dst_layers, n_layers):
+    """Copy KV cache state from src layers 0..n-1 to dst layers 0..n-1."""
+    for i in range(n_layers):
+        src_cache = src_layers[i].attn.kv_cache
+        dst_cache = dst_layers[i].attn.kv_cache
+        if src_cache is not None and dst_cache is not None:
+            dst_cache.k_cache.copy_(src_cache.k_cache)
+            dst_cache.v_cache.copy_(src_cache.v_cache)
+            dst_cache.cache_pos.copy_(src_cache.cache_pos)
+
+
 def _guided_generate_frame(orig_model, dpo_model, tokens, tokens_mask, input_pos,
                            temperature, topk, cfg_scale, dpo_scale,
                            continuous_segments=None, starts=None):
     """
-    Generate one frame using logit guidance from two models.
+    Generate one frame using logit guidance with shared backbone.
 
-    Shares backbone layers 0..(N_SHARED_LAYERS-1) between orig and dpo
-    models, only branching for the top layers that DPO actually trained.
-    This cuts redundant backbone compute by ~93% (26/28 layers shared).
+    Layers 0-25 are identical between orig and DPO (v11 only trains 26-27),
+    so we run them once on the orig model and sync KV caches to the DPO model.
+    Only layers 26-27 + output heads run on both models (~1.8x faster).
     """
     b = tokens.size(0)
     embeds_dtype = next(orig_model.parameters()).dtype
+
+    # ── Prepare embeddings (identical weights, run once) ──
+    b_size, s, _ = tokens.size()
     backbone_mask = _index_causal_mask(orig_model.backbone_causal_mask, input_pos)
 
-    # ── Embedding (identical for both models — all frozen) ──
     uncond_mask = None
     if cfg_scale > 1.0 and b > 1:
         actual_B = b // 2
@@ -130,28 +148,31 @@ def _guided_generate_frame(orig_model, dpo_model, tokens, tokens_mask, input_pos
         batch_indices = torch.arange(h.shape[0], device=h.device)
         h[batch_indices, starts] = continuous_segments
 
-    # ── Shared backbone layers 0..(N_SHARED-1): run ONCE on orig model ──
+    # ── Shared layers 0-25: run once on orig model ──
     for layer in orig_model.backbone.layers[:N_SHARED_LAYERS]:
         h = layer(h, input_pos=input_pos, mask=backbone_mask)
 
-    # ── Branched layers N_SHARED..27: orig model ──
-    h_orig = h
+    # Sync KV caches for shared layers to DPO model
+    _sync_kv_caches(orig_model.backbone.layers, dpo_model.backbone.layers, N_SHARED_LAYERS)
+
+    # ── Branched layers 26-27: run on both models ──
+    h_orig = h.clone()
     for layer in orig_model.backbone.layers[N_SHARED_LAYERS:]:
         h_orig = layer(h_orig, input_pos=input_pos, mask=backbone_mask)
     h_orig = orig_model.backbone.norm(h_orig)
 
-    # ── Branched layers N_SHARED..27: dpo model ──
-    h_dpo = h.clone()
+    h_dpo = h
     for layer in dpo_model.backbone.layers[N_SHARED_LAYERS:]:
         h_dpo = layer(h_dpo, input_pos=input_pos, mask=backbone_mask)
     h_dpo = dpo_model.backbone.norm(h_dpo)
 
-    # ── Logits from both models ──
+    # ── Get logits from both heads ──
     orig_last_h = h_orig[:, -1, :]
+    dpo_last_h = h_dpo[:, -1, :]
     orig_c0_logits = orig_model.codebook0_head(orig_last_h)
-    dpo_c0_logits = dpo_model.codebook0_head(h_dpo[:, -1, :])
+    dpo_c0_logits = dpo_model.codebook0_head(dpo_last_h)
 
-    # Combine logits with CFG + DPO guidance
+    # ── Combine logits with CFG + DPO guidance ──
     if cfg_scale > 1.0 and b > 1 and (b % 2 == 0):
         actual_B = b // 2
         orig_cond = orig_c0_logits[:actual_B]
@@ -169,7 +190,7 @@ def _guided_generate_frame(orig_model, dpo_model, tokens, tokens_mask, input_pos
         final_logits = orig_c0_logits + dpo_scale * (dpo_c0_logits - orig_c0_logits)
         c0_sample = _sample_topk(final_logits, topk, temperature)
 
-    # Decoder: codebooks 1-7 (original model only, same as v8)
+    # ── Decoder: codebooks 1-7 (original model only, same as v8) ──
     orig_model.decoder.reset_caches()
     c0_embed = orig_model._embed_audio(0, c0_sample)
     curr_h = torch.cat([orig_last_h.unsqueeze(1), c0_embed], dim=1)
@@ -305,8 +326,10 @@ class DPOGuider:
         max_audio_frames = max_audio_length_ms // 80
 
         # Frame checkpoint thresholds for streaming decode on separate GPU.
-        _FIRST_CHUNK = int(29.76 * 12.5)   # 372
-        _HOP = _FIRST_CHUNK // 93 * 80     # 320
+        # First chunk at 125 frames (~10s audio) — codec pads to 372 internally.
+        # This gets first audio to user in ~35s (shared backbone ~7.5fps + decode).
+        _FIRST_CHUNK = 125
+        _HOP = int(29.76 * 12.5) // 93 * 80  # 320 (codec's natural hop)
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):

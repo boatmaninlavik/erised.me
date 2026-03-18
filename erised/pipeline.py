@@ -233,9 +233,9 @@ class ErisedPipeline:
         max_audio_frames = max_audio_length_ms // 80
 
         # Frame checkpoint thresholds for streaming decode on separate GPU.
-        # First chunk needs 372 frames, then every 320 frames after that.
-        _FIRST_CHUNK = int(29.76 * 12.5)   # 372
-        _HOP = _FIRST_CHUNK // 93 * 80     # 320
+        # First chunk at 125 frames (~10s audio) — codec pads to 372 internally.
+        _FIRST_CHUNK = 125
+        _HOP = int(29.76 * 12.5) // 93 * 80  # 320 (codec's natural hop)
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 
         # Autoregressive generation loop — NO codec decode here.

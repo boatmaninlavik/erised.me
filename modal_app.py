@@ -307,8 +307,13 @@ def serve():
 
             # Pre-spawn L4 codec worker NOW so it cold-starts during token
             # generation (~50-90s) instead of blocking after first checkpoint.
-            logger.info("Pre-spawning L4 codec worker for job %s", job_id)
-            codec_worker.decode_job.spawn(job_id, t4_audio_filename[0])
+            t4_spawned = [False]
+            try:
+                codec_worker.decode_job.spawn(job_id, t4_audio_filename[0])
+                t4_spawned[0] = True
+                logger.info("Pre-spawned L4 codec worker for job %s", job_id)
+            except Exception:
+                logger.warning("Failed to pre-spawn L4 for job %s, will retry at checkpoint", job_id)
 
             def on_progress(current_frame, total_frames, partial_audio_file=None, partial_version=None):
                 nonlocal last_save_time
@@ -335,6 +340,9 @@ def serve():
 
             def _t4_decode_checker():
                 """Background thread: polls volume for L4 decode status."""
+                # Wait until codec worker is actually spawned
+                while not t4_spawned[0]:
+                    time.sleep(2)
                 while True:
                     try:
                         erised_vol.reload()
@@ -367,6 +375,16 @@ def serve():
                                 "is_final": is_final,
                             }, f)
                         erised_vol.commit()
+
+                        # If pre-spawn failed, try spawning now
+                        if not t4_spawned[0]:
+                            try:
+                                codec_worker.decode_job.spawn(job_id, t4_audio_filename[0])
+                                t4_spawned[0] = True
+                                logger.info("Spawned L4 at checkpoint for job %s", job_id)
+                            except Exception:
+                                logger.warning("Failed to spawn L4 at checkpoint for job %s", job_id)
+
                         logger.info(
                             "Checkpoint for job %s: %d frames, final=%s",
                             job_id, cpu_frames.shape[-1], is_final,
@@ -402,22 +420,25 @@ def serve():
                     logger.info("[%s] Generated %s in %.1fs (%d frames)",
                                 model_name, result.audio_path, elapsed, result.num_frames)
 
-                # Wait for L4 to finish decoding the final audio
+                # Wait for codec worker to finish decoding the final audio
                 t4_done = False
-                logger.info("Waiting for L4 codec decode to finish for job %s ...", job_id)
-                for attempt in range(180):  # Max 6 min
-                    erised_vol.reload()
-                    if os.path.isfile(decode_status_path):
-                        with open(decode_status_path) as f:
-                            decode_info = json.load(f)
-                        if decode_info.get("done"):
-                            logger.info("L4 decode complete for job %s (%d chunks)",
-                                        job_id, decode_info.get("chunks", 0))
-                            t4_done = True
-                            break
-                    time.sleep(2)
+                if t4_spawned[0]:
+                    logger.info("Waiting for codec decode to finish for job %s ...", job_id)
+                    for attempt in range(180):  # Max 6 min
+                        erised_vol.reload()
+                        if os.path.isfile(decode_status_path):
+                            with open(decode_status_path) as f:
+                                decode_info = json.load(f)
+                            if decode_info.get("done"):
+                                logger.info("Codec decode complete for job %s (%d chunks)",
+                                            job_id, decode_info.get("chunks", 0))
+                                t4_done = True
+                                break
+                        time.sleep(2)
+                    else:
+                        logger.warning("Codec decode timed out for job %s", job_id)
                 else:
-                    logger.warning("L4 decode timed out for job %s", job_id)
+                    logger.warning("Codec worker never spawned for job %s, falling back to local decode", job_id)
 
                 if t4_done:
                     final_audio = t4_audio_filename[0]
