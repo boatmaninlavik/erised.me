@@ -295,7 +295,7 @@ class DPOGuider:
 
         # Checkpoint thresholds — first decode at 230 frames gives 2 quality
         # chunks (~22s buffer) for seamless playback.
-        _FIRST_CHUNK = 230
+        _FIRST_CHUNK = 200
         _HOP = 80
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 

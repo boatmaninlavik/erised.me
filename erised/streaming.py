@@ -156,26 +156,29 @@ class StreamingDecoder:
             if cur_output.dim() == 3:
                 cur_output = cur_output[0]
 
-            # ── overlap-add ──
+            # ── splice (keep old audio, append only new portion) ──
+            # The overlap region shares the same input codes, so both chunks
+            # decode the same lyrics. Crossfading causes repeated content.
+            # Instead: keep the old output, append only the non-overlapping
+            # new audio, with a tiny 50ms crossfade to avoid clicks.
             if self.output is None:
                 self.output = cur_output
             else:
                 if self.audio_ovlp_samples == 0:
                     self.output = torch.cat([self.output, cur_output], -1)
                 else:
-                    ov_win = torch.from_numpy(
-                        np.linspace(0, 1, self.audio_ovlp_samples)[None, :]
-                    )
-                    ov_win = torch.cat([ov_win, 1 - ov_win], -1)
-                    self.output[:, -self.audio_ovlp_samples:] = (
-                        self.output[:, -self.audio_ovlp_samples:]
-                        * ov_win[:, -self.audio_ovlp_samples:]
-                        + cur_output[:, :self.audio_ovlp_samples]
-                        * ov_win[:, :self.audio_ovlp_samples]
-                    )
-                    self.output = torch.cat(
-                        [self.output, cur_output[:, self.audio_ovlp_samples:]], -1
-                    )
+                    fade_len = min(2400, self.audio_ovlp_samples)  # 50ms at 48kHz
+                    # Crossfade just 50ms at the splice point
+                    old_tail = self.output[:, -fade_len:]
+                    new_at_splice = cur_output[:, self.audio_ovlp_samples - fade_len:self.audio_ovlp_samples]
+                    fade_out = torch.linspace(1, 0, fade_len).unsqueeze(0)
+                    fade_in = torch.linspace(0, 1, fade_len).unsqueeze(0)
+                    spliced = old_tail * fade_out + new_at_splice * fade_in
+                    self.output = torch.cat([
+                        self.output[:, :-fade_len],
+                        spliced,
+                        cur_output[:, self.audio_ovlp_samples:],
+                    ], -1)
 
             # ── save partial audio ──
             partial = self.output[:, :min(self.output.shape[-1], target_len)]

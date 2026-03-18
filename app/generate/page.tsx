@@ -129,7 +129,7 @@ function SongCard({
       const el = audioRef.current;
       if (!el || (!el.paused && !el.ended)) return;
       if (partialVersion > loadedVersionRef.current && partialAudio) {
-        el.muted = true;
+        el.pause();
         pendingSeekRef.current = el.currentTime;
         loadedVersionRef.current = partialVersion;
         setPlayingSrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
@@ -181,15 +181,13 @@ function SongCard({
         <audio
           ref={audioRef}
           controls
-          autoPlay
           src={playingSrc}
           className="w-full"
           onTimeUpdate={() => {
             const el = audioRef.current;
             if (!el || el.paused) return;
-            // Switch 3s before end so new file has time to load
             if (partialVersion > loadedVersionRef.current && partialAudio && el.duration - el.currentTime < 3) {
-              el.muted = true; // prevent hearing pos-0 audio during switch
+              el.pause();
               pendingSeekRef.current = el.currentTime;
               loadedVersionRef.current = partialVersion;
               setPlayingSrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
@@ -199,21 +197,20 @@ function SongCard({
             const el = audioRef.current;
             if (!el) return;
             if (partialVersion > loadedVersionRef.current && partialAudio) {
-              el.muted = true;
               pendingSeekRef.current = el.currentTime;
               loadedVersionRef.current = partialVersion;
               setPlayingSrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
             }
-            // If no new version, polling useEffect will pick it up
           }}
           onCanPlay={() => {
             const el = audioRef.current;
-            if (el && pendingSeekRef.current !== null) {
+            if (!el) return;
+            if (pendingSeekRef.current !== null) {
+              // Resuming after chunk switch — seek then play
               el.currentTime = pendingSeekRef.current;
               pendingSeekRef.current = null;
-              el.muted = false; // unmute after seek
-              el.play().catch(() => {});
             }
+            el.play().catch(() => {});
           }}
         />
       )}
