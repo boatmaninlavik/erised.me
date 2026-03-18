@@ -248,10 +248,13 @@ def serve():
                 except Exception:
                     pass
 
+                # Use the actual audio filename from the pipeline (gen_id based),
+                # NOT the job_id — StreamingDecoder wrote to the gen_id path.
+                actual_audio = os.path.basename(gen_result.audio_path)
                 with jobs_lock:
                     jobs[job_id]["status"] = "done"
                     jobs[job_id]["result"] = {
-                        "audio_file": audio_filename,
+                        "audio_file": actual_audio,
                         "tags": gen_result.tags_used,
                         "num_frames": gen_result.num_frames,
                         "elapsed": round(elapsed, 1),

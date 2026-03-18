@@ -100,11 +100,13 @@ function SongCard({
     }
   }, [latestSrc, playingSrc, partialVersion]);
 
-  // When job is DONE, switch to final audio (preserving position)
+  // When job is DONE, update to final audio URL (same file, no version param)
   useEffect(() => {
-    if (result) {
+    if (result && playingSrc) {
       const finalSrc = `${backendUrl}/audio/${result.audio_file}`;
-      if (finalSrc !== playingSrc) {
+      // Only switch if it's a genuinely different file
+      const currentBase = playingSrc.split("?")[0];
+      if (finalSrc !== currentBase) {
         const el = audioRef.current;
         if (el) pendingSeekRef.current = el.currentTime;
         setPlayingSrc(finalSrc);
@@ -159,10 +161,10 @@ function SongCard({
           src={playingSrc}
           className="w-full"
           onTimeUpdate={() => {
-            // When within 0.5s of the end and a newer version exists, switch
+            // When within 3s of the end and a newer version exists, preload it
             const el = audioRef.current;
             if (!el || el.paused) return;
-            if (partialVersion > loadedVersionRef.current && el.duration - el.currentTime < 0.5) {
+            if (partialVersion > loadedVersionRef.current && partialAudio && el.duration - el.currentTime < 3) {
               const newSrc = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
               pendingSeekRef.current = el.currentTime;
               loadedVersionRef.current = partialVersion;
@@ -170,7 +172,18 @@ function SongCard({
             }
           }}
           onEnded={() => {
-            // Audio ended — if newer version exists, load it and continue
+            // Audio ended — if newer version exists, load and continue
+            const el = audioRef.current;
+            if (!el) return;
+            if (partialVersion > loadedVersionRef.current && partialAudio) {
+              const newSrc = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
+              pendingSeekRef.current = el.currentTime;
+              loadedVersionRef.current = partialVersion;
+              setPlayingSrc(newSrc);
+            }
+          }}
+          onWaiting={() => {
+            // Browser buffering — try loading latest version
             const el = audioRef.current;
             if (!el) return;
             if (partialVersion > loadedVersionRef.current && partialAudio) {

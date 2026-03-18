@@ -131,10 +131,11 @@ def generation_worker():
                 elapsed = time.time() - t0
                 logger.info("[%s] Generated + decoded in %.1fs", model_name, elapsed)
 
+            actual_audio = os.path.basename(gen_result.audio_path)
             with jobs_lock:
                 jobs[job_id]["status"] = "done"
                 jobs[job_id]["result"] = {
-                    "audio_file": audio_filename,
+                    "audio_file": actual_audio,
                     "tags": gen_result.tags_used,
                     "num_frames": gen_result.num_frames,
                     "elapsed": round(elapsed, 1),
