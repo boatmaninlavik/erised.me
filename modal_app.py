@@ -116,7 +116,9 @@ class CodecWorker:
 
         os.makedirs("/data/outputs", exist_ok=True)
 
-        decoder = StreamingDecoder(self.codec, save_path)
+        # Shorter chunks (12s vs 29.76s default) so new audio arrives every
+        # ~20s at 4fps instead of every ~80s. Codec pads internally.
+        decoder = StreamingDecoder(self.codec, save_path, duration=12)
         last_num_frames = 0
 
         self.logger.info("Starting decode loop for job %s → %s", job_id, audio_filename)

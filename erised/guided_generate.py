@@ -266,10 +266,10 @@ class DPOGuider:
         max_audio_frames = max_audio_length_ms // 80
 
         # Frame checkpoint thresholds for streaming decode on separate GPU.
-        # First chunk at 125 frames (~10s audio) — codec pads to 372 internally.
-        # This gets first audio to user in ~35s (shared backbone ~7.5fps + decode).
-        _FIRST_CHUNK = 125
-        _HOP = int(29.76 * 12.5) // 93 * 80  # 320 (codec's natural hop)
+        # Codec uses 12s chunks (min_samples=150, hop=80). Send frames early
+        # and often so codec worker can decode new chunks every ~80 frames.
+        _FIRST_CHUNK = 100
+        _HOP = 80
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):
