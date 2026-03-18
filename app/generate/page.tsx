@@ -55,21 +55,7 @@ async function pollJob(
 
 const SEAN_EMAIL = "zsean@berkeley.edu";
 
-function formatTime(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
-/**
- * Single song player card — streams audio chunks seamlessly via Web Audio API.
- *
- * Instead of downloading the entire growing WAV file and switching <audio> src
- * (which causes gaps), this fetches individual chunk files and schedules them
- * with sample-accurate timing using AudioBufferSourceNode.start(exactTime).
- * Once generation completes, switches to a standard <audio> element for full
- * controls (seeking, scrubbing).
- */
+/** Single song player card — handles streaming + final seamlessly */
 function SongCard({
   backendUrl,
   status,
@@ -93,230 +79,75 @@ function SongCard({
   saving?: boolean;
   saved?: boolean;
 }) {
-  // ── Web Audio API streaming state ──
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const gainRef = useRef<GainNode | null>(null);
-  const scheduledRef = useRef<AudioBufferSourceNode[]>([]);
-  const nextTimeRef = useRef(0);
-  const loadedChunksRef = useRef(0);
-  const totalBufferedRef = useRef(0);
-  const playbackStartRef = useRef(0);
-  const streamStartedRef = useRef(false);
-  const loadingRef = useRef(false);
-  const chunksFailedRef = useRef(false); // true = backend doesn't support chunks, use legacy
-
-  const [streamStarted, setStreamStarted] = useState(false);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [bufferedDuration, setBufferedDuration] = useState(0);
-
-  // ── Legacy fallback: full-file <audio> with src switching ──
-  const [legacyMode, setLegacyMode] = useState(false);
-  const [legacySrc, setLegacySrc] = useState<string | null>(null);
-  const legacyVersionRef = useRef(0);
-  const legacySeekRef = useRef(0);
-
-  // ── Final audio (after generation completes) ──
   const audioRef = useRef<HTMLAudioElement>(null);
-  const [useFinalPlayer, setUseFinalPlayer] = useState(false);
-  const finalSeekRef = useRef(0);
+  const [playingSrc, setPlayingSrc] = useState<string | null>(null);
+  const loadedVersionRef = useRef<number>(0);
+  const seekOnLoadRef = useRef<number>(0);
 
-  // Reset all streaming state when a new generation starts
-  useEffect(() => {
-    if (status === "pending") {
-      scheduledRef.current.forEach((s) => { try { s.stop(); } catch { /* already stopped */ } });
-      audioCtxRef.current?.close().catch(() => {});
-      audioCtxRef.current = null;
-      gainRef.current = null;
-      scheduledRef.current = [];
-      nextTimeRef.current = 0;
-      loadedChunksRef.current = 0;
-      totalBufferedRef.current = 0;
-      playbackStartRef.current = 0;
-      streamStartedRef.current = false;
-      loadingRef.current = false;
-      chunksFailedRef.current = false;
-      setStreamStarted(false);
-      setIsPlaying(false);
-      setCurrentTime(0);
-      setBufferedDuration(0);
-      setLegacyMode(false);
-      setLegacySrc(null);
-      legacyVersionRef.current = 0;
-      legacySeekRef.current = 0;
-      setUseFinalPlayer(false);
-      finalSeekRef.current = 0;
+  // Build latest audio URL
+  const latestSrc = result
+    ? `${backendUrl}/audio/${result.audio_file}`
+    : partialAudio
+    ? `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`
+    : null;
+
+  // Helper: fully reset audio element then set new src
+  const switchAudio = useCallback((newSrc: string, seekTo: number) => {
+    const el = audioRef.current;
+    if (el) {
+      el.pause();
+      el.removeAttribute("src");
+      el.load(); // fully reset — kills any residual playback
     }
-  }, [status]);
-
-  // Load a single chunk WAV, decode it, and schedule for gapless playback
-  const loadChunk = useCallback(async (url: string) => {
-    let ctx = audioCtxRef.current;
-    if (!ctx) {
-      ctx = new AudioContext();
-      audioCtxRef.current = ctx;
-      const gain = ctx.createGain();
-      gain.connect(ctx.destination);
-      gainRef.current = gain;
-    }
-    if (ctx.state === "suspended") await ctx.resume();
-
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`Chunk fetch failed: ${resp.status}`);
-    const buf = await resp.arrayBuffer();
-    const audio = await ctx.decodeAudioData(buf);
-
-    const src = ctx.createBufferSource();
-    src.buffer = audio;
-    src.connect(gainRef.current!);
-
-    // Schedule to start exactly when the previous chunk ends
-    const startAt = Math.max(nextTimeRef.current, ctx.currentTime);
-    src.start(startAt);
-    nextTimeRef.current = startAt + audio.duration;
-    totalBufferedRef.current += audio.duration;
-    scheduledRef.current.push(src);
-
-    if (!streamStartedRef.current) {
-      playbackStartRef.current = startAt;
-      streamStartedRef.current = true;
-      setStreamStarted(true);
-      setIsPlaying(true);
-    }
-
-    setBufferedDuration(totalBufferedRef.current);
+    seekOnLoadRef.current = seekTo;
+    setPlayingSrc(newSrc);
   }, []);
 
-  // Fetch new chunk files when partialVersion increases
-  // Falls back to legacy (full-file) mode if chunk0 returns 404
+  // Set src for the FIRST time only
   useEffect(() => {
-    if (!partialAudio || partialVersion <= 0 || useFinalPlayer || legacyMode) return;
-    if (chunksFailedRef.current) return;
-    if (loadedChunksRef.current >= partialVersion) return;
+    if (latestSrc && !playingSrc) {
+      loadedVersionRef.current = partialVersion;
+      seekOnLoadRef.current = 0;
+      setPlayingSrc(latestSrc);
+    }
+  }, [latestSrc, playingSrc, partialVersion]);
 
-    const load = async () => {
-      if (loadingRef.current) return;
-      loadingRef.current = true;
-      try {
-        const base = partialAudio.replace(/\.[^.]+$/, "");
-        const ext = partialAudio.split(".").pop() || "wav";
-        while (loadedChunksRef.current < partialVersion) {
-          const i = loadedChunksRef.current;
-          try {
-            await loadChunk(`${backendUrl}/audio/${base}_chunk${i}.${ext}`);
-            loadedChunksRef.current = i + 1;
-          } catch {
-            if (i === 0) {
-              // chunk0 failed — backend doesn't support chunks, use legacy mode
-              chunksFailedRef.current = true;
-              // Clean up any AudioContext we created
-              audioCtxRef.current?.close().catch(() => {});
-              audioCtxRef.current = null;
-              setLegacyMode(true);
-            }
-            break;
-          }
-        }
-      } finally {
-        loadingRef.current = false;
+  // Preload next version in browser cache
+  useEffect(() => {
+    if (partialVersion > loadedVersionRef.current && partialAudio) {
+      fetch(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`).catch(() => {});
+    }
+  }, [partialVersion, partialAudio, backendUrl]);
+
+  // When job DONE, switch to final URL if different file
+  useEffect(() => {
+    if (result && playingSrc) {
+      const finalSrc = `${backendUrl}/audio/${result.audio_file}`;
+      const currentBase = playingSrc.split("?")[0];
+      if (finalSrc !== currentBase) {
+        const el = audioRef.current;
+        switchAudio(finalSrc, el?.currentTime || 0);
       }
-    };
-    load();
-  }, [partialAudio, partialVersion, backendUrl, loadChunk, useFinalPlayer, legacyMode]);
-
-  // ── Legacy mode: load the full partial audio file ──
-  useEffect(() => {
-    if (!legacyMode || !partialAudio || useFinalPlayer) return;
-    if (partialVersion <= legacyVersionRef.current) return;
-    const newSrc = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
-    // Preload in browser cache
-    fetch(newSrc).catch(() => {});
-    const el = audioRef.current;
-    if (!el) {
-      // First load
-      legacyVersionRef.current = partialVersion;
-      setLegacySrc(newSrc);
-      return;
     }
-    // Switch when near end of current audio or paused/ended
-    const shouldSwitch = el.paused || el.ended ||
-      (isFinite(el.duration) && el.duration - el.currentTime < 2);
-    if (shouldSwitch) {
-      legacySeekRef.current = el.currentTime || 0;
-      legacyVersionRef.current = partialVersion;
-      el.pause();
-      setLegacySrc(newSrc);
-    }
-  }, [legacyMode, partialAudio, partialVersion, backendUrl, useFinalPlayer]);
+  }, [result, backendUrl, playingSrc, switchAudio]);
 
-  // Legacy mode: poll for switch opportunity
+  // Poll: when audio ended/paused and new chunks exist, switch
   useEffect(() => {
-    if (!legacyMode || useFinalPlayer) return;
     if (status !== "running" && status !== "pending") return;
-    const iv = setInterval(() => {
+    const interval = setInterval(() => {
       const el = audioRef.current;
-      if (!el || !partialAudio) return;
-      if (partialVersion <= legacyVersionRef.current) return;
+      if (!el) return;
       const shouldSwitch = el.paused || el.ended ||
-        (isFinite(el.duration) && el.duration - el.currentTime < 2);
-      if (shouldSwitch) {
-        legacySeekRef.current = el.currentTime || 0;
-        legacyVersionRef.current = partialVersion;
-        el.pause();
-        setLegacySrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
+        (partialVersion > loadedVersionRef.current && el.duration - el.currentTime < 2);
+      if (shouldSwitch && partialVersion > loadedVersionRef.current && partialAudio) {
+        const pos = el.currentTime;
+        loadedVersionRef.current = partialVersion;
+        switchAudio(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`, pos);
       }
     }, 500);
-    return () => clearInterval(iv);
-  }, [legacyMode, status, partialVersion, partialAudio, backendUrl, useFinalPlayer]);
+    return () => clearInterval(interval);
+  }, [status, partialVersion, partialAudio, backendUrl, switchAudio]);
 
-  // Update playback time for UI
-  useEffect(() => {
-    if (!streamStarted || useFinalPlayer) return;
-    const iv = setInterval(() => {
-      const ctx = audioCtxRef.current;
-      if (ctx && ctx.state === "running") {
-        setCurrentTime(ctx.currentTime - playbackStartRef.current);
-      }
-    }, 200);
-    return () => clearInterval(iv);
-  }, [streamStarted, useFinalPlayer]);
-
-  // Pause / resume via AudioContext.suspend/resume
-  const togglePlay = useCallback(async () => {
-    const ctx = audioCtxRef.current;
-    if (!ctx) return;
-    if (ctx.state === "running") {
-      await ctx.suspend();
-      setIsPlaying(false);
-    } else {
-      await ctx.resume();
-      setIsPlaying(true);
-    }
-  }, []);
-
-  // Switch to regular <audio> element when generation completes (for seeking/scrubbing)
-  useEffect(() => {
-    if (!result || useFinalPlayer) return;
-    const ctx = audioCtxRef.current;
-    const pos = ctx ? ctx.currentTime - playbackStartRef.current : 0;
-
-    scheduledRef.current.forEach((s) => { try { s.stop(); } catch { /* already stopped */ } });
-    if (ctx) ctx.close().catch(() => {});
-    audioCtxRef.current = null;
-
-    finalSeekRef.current = legacyMode ? 0 : pos;
-    setUseFinalPlayer(true);
-  }, [result, useFinalPlayer, legacyMode]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      scheduledRef.current.forEach((s) => { try { s.stop(); } catch { /* noop */ } });
-      audioCtxRef.current?.close().catch(() => {});
-    };
-  }, []);
-
-  // ── Render ──
   const isLoading = status === "pending" || status === "running";
   const progressPct = progress && progress.total_frames > 0
     ? Math.round((progress.current_frame / progress.total_frames) * 100)
@@ -355,60 +186,18 @@ function SongCard({
         </span>
       )}
 
-      {/* Streaming player — Web Audio API with gapless scheduling */}
-      {!useFinalPlayer && !legacyMode && streamStarted && (
-        <div className="flex items-center gap-3">
-          <button
-            onClick={togglePlay}
-            className="w-8 h-8 flex items-center justify-center rounded-full bg-zinc-800 text-white hover:bg-zinc-700 transition-colors text-xs shrink-0"
-          >
-            {isPlaying ? "\u23F8" : "\u25B6"}
-          </button>
-          <div className="flex-1 bg-zinc-800 rounded-full h-1.5 overflow-hidden">
-            <div
-              className="bg-white rounded-full h-full transition-all duration-200"
-              style={{
-                width: `${bufferedDuration > 0 ? Math.min(100, (currentTime / bufferedDuration) * 100) : 0}%`,
-              }}
-            />
-          </div>
-          <span className="text-xs text-zinc-500 tabular-nums min-w-[5rem] text-right">
-            {formatTime(currentTime)} / {formatTime(bufferedDuration)}
-          </span>
-        </div>
-      )}
-
-      {/* Legacy player — full-file <audio> when backend doesn't support chunks */}
-      {!useFinalPlayer && legacyMode && legacySrc && (
+      {/* Audio player — src only changes at safe moments (end of playback or job done) */}
+      {playingSrc && (
         <audio
           ref={audioRef}
           controls
-          src={legacySrc}
+          src={playingSrc}
           className="w-full"
           onCanPlay={() => {
             const el = audioRef.current;
             if (!el) return;
-            if (legacySeekRef.current > 0) {
-              el.currentTime = legacySeekRef.current;
-              legacySeekRef.current = 0;
-            }
-            el.play().catch(() => {});
-          }}
-        />
-      )}
-
-      {/* Final player — standard <audio> controls after generation completes */}
-      {useFinalPlayer && result && (
-        <audio
-          ref={!legacyMode ? audioRef : undefined}
-          controls
-          src={`${backendUrl}/audio/${result.audio_file}`}
-          className="w-full"
-          onCanPlay={(e) => {
-            const el = e.currentTarget;
-            if (finalSeekRef.current > 0) {
-              el.currentTime = finalSeekRef.current;
-              finalSeekRef.current = 0;
+            if (seekOnLoadRef.current > 0) {
+              el.currentTime = seekOnLoadRef.current;
             }
             el.play().catch(() => {});
           }}
