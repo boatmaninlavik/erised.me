@@ -85,18 +85,23 @@ def clear_url() -> None:
 def main():
     parser = argparse.ArgumentParser(description="Start Erised GPU server for all users")
     parser.add_argument(
-        "--mode", choices=["compare", "rate"], default="compare",
-        help="compare = A/B compare original vs DPO; rate = collect preferences for DPO training",
+        "--mode", choices=["generate", "compare", "rate"], default="generate",
+        help="generate = streaming music gen; compare = A/B; rate = preferences",
     )
     parser.add_argument(
         "--dpo-path", type=str, default="/workspace/dpo_checkpoints_v6/dpo_best",
-        help="Path to DPO checkpoint (only used in compare mode)",
+        help="Path to DPO checkpoint",
     )
-    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
     # ── Start FastAPI server ─────────────────────────────────────────
-    if args.mode == "compare":
+    if args.mode == "generate":
+        server_cmd = [
+            sys.executable, os.path.join(_repo_root, "runpod_server.py"),
+        ]
+        print("Starting streaming generation server (pause-decode-resume)...")
+    elif args.mode == "compare":
         server_cmd = [
             sys.executable, "-m", "erised.scripts.compare_local",
             "--dpo-path", args.dpo_path,
