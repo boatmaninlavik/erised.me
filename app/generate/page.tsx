@@ -222,7 +222,7 @@ export default function GeneratePage() {
   const [lyrics, setLyrics] = useState("");
   const [maxSec, setMaxSec] = useState(60);
   const [dpoScale, setDpoScale] = useState(3.0);
-  const [tab, setTab] = useState<"ab" | "single">("ab");
+  const [tab, setTab] = useState<"ab" | "single">("single");
   const [selectedModel, setSelectedModel] = useState<"dpo" | "original">("dpo");
 
   const [origStatus, setOrigStatus] = useState<JobStatus>("idle");
