@@ -252,33 +252,37 @@ export default function GeneratePage() {
   const [singlePartialVersion, setSinglePartialVersion] = useState(0);
 
   const loadBackendUrl = useCallback(async () => {
-    const { data } = await supabase
-      .from("erised_config")
-      .select("value")
-      .eq("key", "backend_url")
-      .single();
+    // Try RunPod first (fast 3s check), fall back to Modal
+    const RUNPOD_URL = process.env.NEXT_PUBLIC_RUNPOD_URL;
+    const MODAL_URL = "https://boatmaninlavik--erised-gpu-serve.modal.run";
 
-    const url = data?.value?.trim();
-    if (!url) {
-      setBackendUrl(null);
-      setGpuStatus("offline");
-      return;
+    if (RUNPOD_URL) {
+      try {
+        const resp = await fetch(`${RUNPOD_URL}/health`, { signal: AbortSignal.timeout(3000) });
+        if (resp.ok) {
+          setBackendUrl(RUNPOD_URL);
+          setGpuStatus("online");
+          return;
+        }
+      } catch {}
     }
 
+    // Fall back to Modal
     try {
-      const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
+      const resp = await fetch(`${MODAL_URL}/health`, { signal: AbortSignal.timeout(5000) });
       if (resp.ok) {
-        setBackendUrl(url);
+        setBackendUrl(MODAL_URL);
         setGpuStatus("online");
         return;
       }
     } catch {}
 
+    // Modal cold-starting
     setGpuStatus("starting");
     try {
-      const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(120000) });
+      const resp = await fetch(`${MODAL_URL}/health`, { signal: AbortSignal.timeout(120000) });
       if (resp.ok) {
-        setBackendUrl(url);
+        setBackendUrl(MODAL_URL);
         setGpuStatus("online");
       } else {
         setBackendUrl(null);

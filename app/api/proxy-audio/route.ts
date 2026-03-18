@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
 
 export async function GET(req: NextRequest) {
   const file = req.nextUrl.searchParams.get("file");
@@ -13,21 +12,18 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Invalid filename" }, { status: 400 });
   }
 
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-  );
+  const RUNPOD_URL = process.env.NEXT_PUBLIC_RUNPOD_URL;
+  const MODAL_URL = "https://boatmaninlavik--erised-gpu-serve.modal.run";
 
-  const { data } = await supabase
-    .from("erised_config")
-    .select("value")
-    .eq("key", "backend_url")
-    .single();
-
-  const backendUrl = data?.value?.trim();
-  if (!backendUrl) {
-    return NextResponse.json({ error: "GPU backend is offline" }, { status: 503 });
+  // Try RunPod first, fall back to Modal
+  let backendUrl: string | null = null;
+  if (RUNPOD_URL) {
+    try {
+      const h = await fetch(`${RUNPOD_URL}/health`, { signal: AbortSignal.timeout(2000) });
+      if (h.ok) backendUrl = RUNPOD_URL;
+    } catch {}
   }
+  if (!backendUrl) backendUrl = MODAL_URL;
 
   try {
     const resp = await fetch(`${backendUrl}/audio/${sanitized}`, {

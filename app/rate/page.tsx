@@ -48,37 +48,34 @@ export default function RatePage() {
   const pollingPairId = useRef<string | null>(null);
 
   const loadBackendUrl = useCallback(async () => {
-    const { data } = await supabase
-      .from("erised_config")
-      .select("value")
-      .eq("key", "backend_url")
-      .single();
+    const RUNPOD_URL = process.env.NEXT_PUBLIC_RUNPOD_URL;
+    const MODAL_URL = "https://boatmaninlavik--erised-gpu-serve.modal.run";
 
-    const url = data?.value?.trim();
-    if (!url) {
-      setBackendUrl(null);
-      setGpuStatus("offline");
-      return;
+    if (RUNPOD_URL) {
+      try {
+        const resp = await fetch(`${RUNPOD_URL}/health`, { signal: AbortSignal.timeout(3000) });
+        if (resp.ok) {
+          setBackendUrl(RUNPOD_URL);
+          setGpuStatus("online");
+          return;
+        }
+      } catch {}
     }
 
-    // Quick check first (5s) — if it responds, GPU is already warm
     try {
-      const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
+      const resp = await fetch(`${MODAL_URL}/health`, { signal: AbortSignal.timeout(5000) });
       if (resp.ok) {
-        setBackendUrl(url);
+        setBackendUrl(MODAL_URL);
         setGpuStatus("online");
         return;
       }
-    } catch {
-      // Timeout or error — GPU is likely cold-starting on Modal
-    }
+    } catch {}
 
-    // Cold start: show "starting" and wait longer (up to 120s)
     setGpuStatus("starting");
     try {
-      const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(120000) });
+      const resp = await fetch(`${MODAL_URL}/health`, { signal: AbortSignal.timeout(120000) });
       if (resp.ok) {
-        setBackendUrl(url);
+        setBackendUrl(MODAL_URL);
         setGpuStatus("online");
       } else {
         setBackendUrl(null);
