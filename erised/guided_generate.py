@@ -293,8 +293,9 @@ class DPOGuider:
 
         max_audio_frames = max_audio_length_ms // 80
 
-        # Checkpoint thresholds
-        _FIRST_CHUNK = 150  # min_samples for duration=12 codec chunks
+        # Checkpoint thresholds — first decode at 230 frames gives 2 quality
+        # chunks (~22s buffer) for seamless playback.
+        _FIRST_CHUNK = 230
         _HOP = 80
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 

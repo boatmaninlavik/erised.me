@@ -70,13 +70,10 @@ class ErisedPipeline:
         )
         logger.info("HeartMuLa pipeline loaded.")
 
-        # Compile backbone for ~1.5-2x faster frame generation
-        logger.info("Compiling mula backbone with torch.compile...")
-        self.pipe.mula.backbone = torch.compile(self.pipe.mula.backbone)
-        # Warmup: trigger JIT compilation now so first real generation is fast
-        logger.info("Warming up compiled backbone (JIT compile, ~30-60s)...")
-        self._warmup_compile()
-        logger.info("Backbone compiled and warm.")
+        # torch.compile disabled — causes inplace operation errors with KV caches.
+        # Saved for future: uncomment when torchtune compatibility improves.
+        # self.pipe.mula.backbone = torch.compile(self.pipe.mula.backbone)
+        # self._warmup_compile()
 
     def _warmup_compile(self):
         """Run a tiny forward pass to trigger torch.compile JIT."""
@@ -276,8 +273,10 @@ class ErisedPipeline:
 
         max_audio_frames = max_audio_length_ms // 80
 
-        # Checkpoint thresholds
-        _FIRST_CHUNK = 150  # min_samples for duration=12 codec chunks
+        # Checkpoint thresholds — first decode at 230 frames gives 2 quality
+        # chunks (~22s buffer). At 10fps: 23s gen + 3s decode = ~26s to first
+        # audio. Buffer drains at only 0.7s per 11s cycle → seamless for 75s+.
+        _FIRST_CHUNK = 230
         _HOP = 80
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 
