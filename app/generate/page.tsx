@@ -186,6 +186,7 @@ function SongCard({
               el.currentTime = pendingSeekRef.current;
               pendingSeekRef.current = null;
               el.play().catch(() => {});
+            }
           }}
         />
       )}
