@@ -339,11 +339,13 @@ class DPOGuider:
 
                 # Pause-decode-resume on same GPU
                 if next_stream_at and len(frames) >= next_stream_at:
+                    import gc
                     frames_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
                     saved_orig = _save_backbone_caches(orig_model)
                     saved_dpo = _save_backbone_caches(dpo_model)
                     _reset_model_caches(orig_model)
                     _reset_model_caches(dpo_model)
+                    gc.collect()
                     torch.cuda.empty_cache()
                     new_chunks = stream_decoder.decode_available(frames_cp)
                     orig_model.setup_caches(bs_size)
@@ -351,6 +353,7 @@ class DPOGuider:
                     _restore_backbone_caches(orig_model, saved_orig)
                     _restore_backbone_caches(dpo_model, saved_dpo)
                     del saved_orig, saved_dpo
+                    gc.collect()
                     torch.cuda.empty_cache()
                     if new_chunks > 0 and on_progress:
                         on_progress(len(frames), max_audio_frames,

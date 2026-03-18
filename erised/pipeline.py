@@ -277,14 +277,26 @@ class ErisedPipeline:
 
             # Pause-decode-resume on same GPU
             if next_stream_at and len(frames) >= next_stream_at:
+                import gc
                 frames_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
                 saved = _save_backbone_caches(mula)
                 _reset_model_caches(mula)
+                # Also move DPO model to CPU if loaded (frees ~6GB)
+                dpo_on_gpu = False
+                if hasattr(self, 'guider') and self.guider:
+                    _reset_model_caches(self.guider.dpo_model)
+                    self.guider.dpo_model.cpu()
+                    dpo_on_gpu = True
+                gc.collect()
                 torch.cuda.empty_cache()
                 new_chunks = stream_decoder.decode_available(frames_cp)
+                # Restore
+                if dpo_on_gpu:
+                    self.guider.dpo_model.to(device)
                 mula.setup_caches(bs_size)
                 _restore_backbone_caches(mula, saved)
                 del saved
+                gc.collect()
                 torch.cuda.empty_cache()
                 if new_chunks > 0 and on_progress:
                     on_progress(len(frames), max_audio_frames,
@@ -297,10 +309,17 @@ class ErisedPipeline:
 
         if streaming_decode:
             # Final decode pass for remaining chunks
+            import gc
             from .guided_generate import _reset_model_caches
             _reset_model_caches(mula)
+            if hasattr(self, 'guider') and self.guider:
+                _reset_model_caches(self.guider.dpo_model)
+                self.guider.dpo_model.cpu()
+            gc.collect()
             torch.cuda.empty_cache()
             stream_decoder.decode_available(frames_tensor)
+            if hasattr(self, 'guider') and self.guider:
+                self.guider.dpo_model.to(device)
             if on_progress:
                 on_progress(num_gen_frames, max_audio_frames,
                            os.path.basename(save_path), stream_decoder.chunks_decoded)
