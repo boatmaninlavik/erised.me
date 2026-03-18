@@ -63,97 +63,6 @@ image = (
 )
 
 
-# ── A100 Codec Worker ────────────────────────────────────────────────
-# Separate GPU for streaming codec decode while A100 generates tokens.
-# Receives frames via RPC (no volume polling) and decodes incrementally.
-# Pre-warmed at serve() startup so cold-start overlaps with model load.
-
-@app.cls(
-    image=image,
-    gpu="A100",
-    volumes={"/data": erised_vol},
-    timeout=600,
-    scaledown_window=300,
-)
-class CodecWorker:
-    @modal.enter()
-    def load_codec(self):
-        import sys
-        import logging
-        import torch
-
-        sys.path.insert(0, "/root/heartlib_pkg")
-        sys.path.insert(0, "/root")
-
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        )
-        self.logger = logging.getLogger("erised.codec_worker")
-
-        model_path = os.environ.get("ERISED_MODEL_PATH", "/data/ckpt")
-        self.logger.info("Loading codec from %s ...", model_path)
-
-        from heartlib import HeartMuLaGenPipeline
-
-        pipe = HeartMuLaGenPipeline.from_pretrained(
-            model_path,
-            device={"mula": torch.device("cpu"), "codec": torch.device("cuda:0")},
-            dtype={"mula": torch.bfloat16, "codec": torch.float32},
-            version="3B",
-            lazy_load=False,
-        )
-        self.codec = pipe.codec
-        self.decoders = {}  # job_id → StreamingDecoder (persists across RPC calls)
-        self.logger.info(
-            "Codec loaded. VRAM: %.2f GB",
-            torch.cuda.memory_allocated() / 1024**3,
-        )
-
-    @modal.method()
-    def warmup(self):
-        """Trigger cold-start so container is ready when first job arrives."""
-        import torch
-        self.logger.info(
-            "Warmup ping — VRAM: %.2f GB",
-            torch.cuda.memory_allocated() / 1024**3,
-        )
-        return True
-
-    @modal.method()
-    def decode_chunk(self, frames_cpu, job_id: str, audio_filename: str, is_final: bool) -> dict:
-        """Decode frames received via RPC. StreamingDecoder state persists per job."""
-        import torch
-        from erised.streaming import StreamingDecoder
-
-        frames = frames_cpu.to("cuda:0")
-
-        if job_id not in self.decoders:
-            save_path = os.path.join("/data/outputs", audio_filename)
-            os.makedirs("/data/outputs", exist_ok=True)
-            self.decoders[job_id] = StreamingDecoder(self.codec, save_path, duration=12)
-
-        decoder = self.decoders[job_id]
-        new_chunks = decoder.decode_available(frames)
-
-        if new_chunks > 0 or is_final:
-            try:
-                erised_vol.commit()
-            except Exception:
-                pass
-
-        total = decoder.chunks_decoded
-        self.logger.info(
-            "Job %s: +%d chunks (total: %d, frames: %d, final: %s)",
-            job_id, new_chunks, total, frames.shape[-1], is_final,
-        )
-
-        if is_final:
-            self.decoders.pop(job_id, None)
-
-        return {"chunks_decoded": total, "new_chunks": new_chunks}
-
-
 # ── A100 Generation Server ───────────────────────────────────────────
 
 @app.function(
@@ -221,19 +130,6 @@ def serve():
     logger.info("Initializing DPO Guided from %s ...", dpo_path)
     pipeline.init_guided(dpo_checkpoint_path=dpo_path)
     logger.info("DPO Guided ready.")
-
-    # ── Pre-warm codec worker (cold-start overlaps with model load) ──
-    codec_worker = CodecWorker()
-
-    def _warmup_codec():
-        try:
-            codec_worker.warmup.remote()
-            logger.info("Codec worker pre-warmed")
-        except Exception as e:
-            logger.warning("Codec worker warmup failed: %s", e)
-
-    warmup_thread = threading.Thread(target=_warmup_codec, daemon=True)
-    warmup_thread.start()
 
     # ── Job persistence (survives deploys & container routing) ─────
     jobs: dict[str, dict] = {}
