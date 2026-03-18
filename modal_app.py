@@ -3,10 +3,18 @@ Modal serverless deployment for Erised GPU backend.
 
 Deploys the generation server as a Modal web endpoint with:
 - A100-80GB: token generation (mula model + DPO)
-- L4: codec decode (streaming audio while generating, pre-spawned at job start)
+- A100 codec worker: streaming decode via RPC during generation
+  (frames sent at checkpoints, decoded in parallel on separate GPU)
 - Auto cold-start: container boots when users visit erised.me (~45s)
 - Auto shutdown: container stops after 5 min idle (no charges)
 - Permanent URL: stored once in Supabase, never changes
+
+Streaming flow:
+  1. A100 generates frames, sends checkpoints every ~80 frames via RPC
+  2. Codec worker decodes each checkpoint incrementally (StreamingDecoder)
+  3. After 2+ chunks decoded (~20s audio), frontend starts playback
+  4. Generation continues → codec decodes more chunks → seamless playback
+  5. If codec worker fails, fallback to local A100 decode after generation
 
 Deploy:
     modal deploy modal_app.py
@@ -55,10 +63,10 @@ image = (
 )
 
 
-# ── L4 Codec Worker ──────────────────────────────────────────────────
+# ── A100 Codec Worker ────────────────────────────────────────────────
 # Separate GPU for streaming codec decode while A100 generates tokens.
-# Pre-spawned at job start so cold-start overlaps with token generation.
-# Polls for new frames on the shared volume and decodes incrementally.
+# Receives frames via RPC (no volume polling) and decodes incrementally.
+# Pre-warmed at serve() startup so cold-start overlaps with model load.
 
 @app.cls(
     image=image,
@@ -96,89 +104,54 @@ class CodecWorker:
             lazy_load=False,
         )
         self.codec = pipe.codec
+        self.decoders = {}  # job_id → StreamingDecoder (persists across RPC calls)
         self.logger.info(
             "Codec loaded. VRAM: %.2f GB",
             torch.cuda.memory_allocated() / 1024**3,
         )
 
     @modal.method()
-    def decode_job(self, job_id: str, audio_filename: str):
-        """Poll for frames on volume and decode incrementally."""
-        import json
-        import time
+    def warmup(self):
+        """Trigger cold-start so container is ready when first job arrives."""
+        import torch
+        self.logger.info(
+            "Warmup ping — VRAM: %.2f GB",
+            torch.cuda.memory_allocated() / 1024**3,
+        )
+        return True
+
+    @modal.method()
+    def decode_chunk(self, frames_cpu, job_id: str, audio_filename: str, is_final: bool) -> dict:
+        """Decode frames received via RPC. StreamingDecoder state persists per job."""
         import torch
         from erised.streaming import StreamingDecoder
 
-        save_path = os.path.join("/data/outputs", audio_filename)
-        signal_path = os.path.join("/data/frames", f"{job_id}.json")
-        frames_path = os.path.join("/data/frames", f"{job_id}.pt")
-        decode_status_path = os.path.join("/data/frames", f"{job_id}_decoded.json")
+        frames = frames_cpu.to("cuda:0")
 
-        os.makedirs("/data/outputs", exist_ok=True)
+        if job_id not in self.decoders:
+            save_path = os.path.join("/data/outputs", audio_filename)
+            os.makedirs("/data/outputs", exist_ok=True)
+            self.decoders[job_id] = StreamingDecoder(self.codec, save_path, duration=12)
 
-        # Shorter chunks (12s vs 29.76s default) so new audio arrives every
-        # ~20s at 4fps instead of every ~80s. Codec pads internally.
-        decoder = StreamingDecoder(self.codec, save_path, duration=12)
-        last_num_frames = 0
+        decoder = self.decoders[job_id]
+        new_chunks = decoder.decode_available(frames)
 
-        self.logger.info("Starting decode loop for job %s → %s", job_id, audio_filename)
-
-        while True:
-            # See latest writes from A100
-            erised_vol.reload()
-
-            if not os.path.isfile(signal_path):
-                time.sleep(1)
-                continue
-
-            with open(signal_path) as f:
-                signal = json.load(f)
-
-            current_num_frames = signal.get("num_frames", 0)
-            is_final = signal.get("is_final", False)
-
-            # Only decode if we have new frames
-            if current_num_frames > last_num_frames or is_final:
-                frames = torch.load(frames_path, map_location="cuda:0", weights_only=True)
-                new_chunks = decoder.decode_available(frames)
-                last_num_frames = current_num_frames
-
-                if new_chunks > 0:
-                    self.logger.info(
-                        "Job %s: decoded %d new chunks (total: %d, frames: %d)",
-                        job_id, new_chunks, decoder.chunks_decoded, current_num_frames,
-                    )
-                    # Write decode status for A100 to read
-                    with open(decode_status_path, "w") as f:
-                        json.dump({
-                            "chunks": decoder.chunks_decoded,
-                            "audio_file": audio_filename,
-                            "done": is_final,
-                        }, f)
-                    erised_vol.commit()
-
-            if is_final:
-                # One final decode pass to catch any remaining
-                frames = torch.load(frames_path, map_location="cuda:0", weights_only=True)
-                extra = decoder.decode_available(frames)
-                if extra > 0:
-                    self.logger.info("Job %s: final pass decoded %d more chunks", job_id, extra)
-                # Write final status
-                with open(decode_status_path, "w") as f:
-                    json.dump({
-                        "chunks": decoder.chunks_decoded,
-                        "audio_file": audio_filename,
-                        "done": True,
-                    }, f)
+        if new_chunks > 0 or is_final:
+            try:
                 erised_vol.commit()
-                break
+            except Exception:
+                pass
 
-            time.sleep(2)
-
+        total = decoder.chunks_decoded
         self.logger.info(
-            "Decode complete for job %s: %d chunks → %s",
-            job_id, decoder.chunks_decoded, save_path,
+            "Job %s: +%d chunks (total: %d, frames: %d, final: %s)",
+            job_id, new_chunks, total, frames.shape[-1], is_final,
         )
+
+        if is_final:
+            self.decoders.pop(job_id, None)
+
+        return {"chunks_decoded": total, "new_chunks": new_chunks}
 
 
 # ── A100 Generation Server ───────────────────────────────────────────
@@ -248,6 +221,19 @@ def serve():
     logger.info("Initializing DPO Guided from %s ...", dpo_path)
     pipeline.init_guided(dpo_checkpoint_path=dpo_path)
     logger.info("DPO Guided ready.")
+
+    # ── Pre-warm codec worker (cold-start overlaps with model load) ──
+    codec_worker = CodecWorker()
+
+    def _warmup_codec():
+        try:
+            codec_worker.warmup.remote()
+            logger.info("Codec worker pre-warmed")
+        except Exception as e:
+            logger.warning("Codec worker warmup failed: %s", e)
+
+    warmup_thread = threading.Thread(target=_warmup_codec, daemon=True)
+    warmup_thread.start()
 
     # ── Job persistence (survives deploys & container routing) ─────
     jobs: dict[str, dict] = {}
@@ -331,78 +317,142 @@ def serve():
                         _save_job(job_id)
                         last_save_time[0] = now
 
+            # ── Codec worker streaming: send frames via RPC during gen ──
+            checkpoint_q: queue.Queue = queue.Queue()
+            codec_failed = [False]
+            chunks_decoded = [0]
+
+            def codec_sender():
+                """Background thread: sends frame checkpoints to codec worker."""
+                while True:
+                    item = checkpoint_q.get()
+                    if item is None:  # poison pill
+                        break
+                    frames_cpu, is_final = item
+                    try:
+                        res = codec_worker.decode_chunk.remote(
+                            frames_cpu, job_id, audio_filename, is_final,
+                        )
+                        chunks_decoded[0] = res["chunks_decoded"]
+                        # Expose audio to frontend after 2+ chunks (~20s buffer)
+                        # or on final decode (short songs)
+                        if chunks_decoded[0] >= 2 or is_final:
+                            with jobs_lock:
+                                jobs[job_id]["partial_audio_file"] = audio_filename
+                                jobs[job_id]["partial_version"] = chunks_decoded[0]
+                                _save_job(job_id)
+                            logger.info("Job %s: codec chunks=%d, exposed to frontend",
+                                        job_id, chunks_decoded[0])
+                    except Exception as e:
+                        logger.warning("Codec worker failed for job %s: %s", job_id, e)
+                        codec_failed[0] = True
+                        break
+
+            sender = threading.Thread(target=codec_sender, daemon=True)
+            sender.start()
+
+            def on_frames_checkpoint(frames_tensor, is_final):
+                if not codec_failed[0]:
+                    checkpoint_q.put((frames_tensor.cpu().clone(), is_final))
+
             try:
-                # ── Phase 1: Generate all frames (no codec during gen) ──
+                # ── Phase 1: Generate frames, streaming to codec worker ──
                 with gen_lock:
                     t0 = time.time()
                     if model_name == "dpo":
-                        result = pipeline.generate_guided(
+                        gen_result = pipeline.generate_guided(
                             prompt=prompt, lyrics=lyrics,
                             max_audio_length_ms=int(max_sec * 1000),
                             dpo_scale=dpo_scale,
                             on_progress=on_progress,
+                            on_frames_checkpoint=on_frames_checkpoint,
                         )
                     else:
-                        result = pipeline.generate(
+                        gen_result = pipeline.generate(
                             prompt=prompt, lyrics=lyrics,
                             max_audio_length_ms=int(max_sec * 1000),
                             on_progress=on_progress,
+                            on_frames_checkpoint=on_frames_checkpoint,
                         )
                     gen_elapsed = time.time() - t0
                     logger.info("[%s] Generated %d frames in %.1fs",
-                                model_name, result.num_frames, gen_elapsed)
+                                model_name, gen_result.num_frames, gen_elapsed)
 
-                # ── Phase 2: Free KV caches so codec can use GPU ──
-                from erised.guided_generate import _reset_model_caches
-                _reset_model_caches(pipeline.pipe.mula)
-                if hasattr(pipeline, 'guider') and pipeline.guider:
-                    _reset_model_caches(pipeline.guider.dpo_model)
-                torch.cuda.empty_cache()
+                # Wait for codec sender to finish all queued items
+                checkpoint_q.put(None)  # poison pill
+                sender.join(timeout=180)
 
-                # ── Phase 3: Stream decode on A100 (seamless audio) ──
-                logger.info("Starting local codec decode for job %s (%d frames)",
-                            job_id, result.num_frames)
-                with jobs_lock:
-                    jobs[job_id]["status"] = "decoding"
-                    _save_job(job_id)
+                elapsed = time.time() - t0
 
-                frames = torch.load(result.tokens_path, map_location="cuda:0",
-                                    weights_only=True)
-                from erised.streaming import StreamingDecoder
-                decoder = StreamingDecoder(pipeline.pipe.codec, audio_path)
+                if not codec_failed[0] and chunks_decoded[0] > 0:
+                    # ── Success: codec worker decoded everything ──
+                    logger.info("Job %s: codec streaming complete (%d chunks, %.1fs)",
+                                job_id, chunks_decoded[0], elapsed)
+                    with jobs_lock:
+                        jobs[job_id]["status"] = "done"
+                        jobs[job_id]["result"] = {
+                            "audio_file": audio_filename,
+                            "tags": gen_result.tags_used,
+                            "num_frames": gen_result.num_frames,
+                            "elapsed": round(elapsed, 1),
+                            "model": model_name,
+                        }
+                        jobs[job_id].pop("partial_audio_file", None)
+                        jobs[job_id].pop("partial_version", None)
+                        _save_job(job_id)
+                else:
+                    # ── Fallback: local A100 decode (codec worker failed) ──
+                    logger.warning("Job %s: codec worker unavailable, local decode fallback",
+                                   job_id)
+                    from erised.guided_generate import _reset_model_caches
+                    _reset_model_caches(pipeline.pipe.mula)
+                    if hasattr(pipeline, 'guider') and pipeline.guider:
+                        _reset_model_caches(pipeline.guider.dpo_model)
+                    torch.cuda.empty_cache()
 
-                def on_decode_chunk(chunk_idx, total_chunks):
+                    with jobs_lock:
+                        jobs[job_id]["status"] = "decoding"
+                        _save_job(job_id)
+
+                    frames = torch.load(gen_result.tokens_path, map_location="cuda:0",
+                                        weights_only=True)
+                    from erised.streaming import StreamingDecoder
+                    decoder = StreamingDecoder(pipeline.pipe.codec, audio_path)
+
+                    def on_decode_chunk(chunk_idx, total_chunks):
+                        try:
+                            erised_vol.commit()
+                        except Exception:
+                            pass
+                        with jobs_lock:
+                            jobs[job_id]["partial_audio_file"] = audio_filename
+                            jobs[job_id]["partial_version"] = chunk_idx
+                            _save_job(job_id)
+                        logger.info("Job %s: local decode chunk %d/%d",
+                                    job_id, chunk_idx, total_chunks)
+
+                    decoder.decode_available(frames, on_chunk_ready=on_decode_chunk)
                     try:
                         erised_vol.commit()
                     except Exception:
                         pass
+
+                    elapsed = time.time() - t0
+                    logger.info("Job %s: local decode complete in %.1fs", job_id, elapsed)
+
                     with jobs_lock:
-                        jobs[job_id]["partial_audio_file"] = audio_filename
-                        jobs[job_id]["partial_version"] = chunk_idx
+                        jobs[job_id]["status"] = "done"
+                        jobs[job_id]["result"] = {
+                            "audio_file": audio_filename,
+                            "tags": gen_result.tags_used,
+                            "num_frames": gen_result.num_frames,
+                            "elapsed": round(elapsed, 1),
+                            "model": model_name,
+                        }
+                        jobs[job_id].pop("partial_audio_file", None)
+                        jobs[job_id].pop("partial_version", None)
                         _save_job(job_id)
-                    logger.info("Job %s: decoded chunk %d/%d",
-                                job_id, chunk_idx, total_chunks)
 
-                decoder.decode_available(frames, on_chunk_ready=on_decode_chunk)
-                try:
-                    erised_vol.commit()
-                except Exception:
-                    pass
-                elapsed = time.time() - t0
-                logger.info("Job %s: decode complete in %.1fs total", job_id, elapsed)
-
-                with jobs_lock:
-                    jobs[job_id]["status"] = "done"
-                    jobs[job_id]["result"] = {
-                        "audio_file": audio_filename,
-                        "tags": result.tags_used,
-                        "num_frames": result.num_frames,
-                        "elapsed": round(elapsed, 1),
-                        "model": model_name,
-                    }
-                    jobs[job_id].pop("partial_audio_file", None)
-                    jobs[job_id].pop("partial_version", None)
-                    _save_job(job_id)
                 gen_stats["completed"] += 1
             except Exception as e:
                 logger.exception("Generation error for job %s", job_id)
@@ -483,8 +533,8 @@ def serve():
 
     @fapi.get("/audio/{filename}")
     def serve_audio(filename: str):
-        # Always reload volume — L4 overwrites the file as it decodes
-        # more chunks, so the local cache may be stale.
+        # Always reload volume — codec worker overwrites the file as it
+        # decodes more chunks, so the local cache may be stale.
         erised_vol.reload()
         path = os.path.join(output_dir, filename)
         if not os.path.isfile(path):
