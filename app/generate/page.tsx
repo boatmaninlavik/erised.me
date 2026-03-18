@@ -80,10 +80,10 @@ function SongCard({
   saved?: boolean;
 }) {
   const audioRef = useRef<HTMLAudioElement>(null);
-  // The src currently loaded in the <audio> element (only changes at safe moments)
   const [playingSrc, setPlayingSrc] = useState<string | null>(null);
-  // Track the latest available URL (may be ahead of what's playing)
-  const latestSrcRef = useRef<string | null>(null);
+  // Track what version is currently loaded vs available
+  const loadedVersionRef = useRef<number>(0);
+  const pendingSeekRef = useRef<number | null>(null);
 
   // Compute the latest available audio URL
   const latestSrc = result
@@ -92,17 +92,13 @@ function SongCard({
     ? `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`
     : null;
 
-  // Keep ref in sync
-  useEffect(() => {
-    if (latestSrc) latestSrcRef.current = latestSrc;
-  }, [latestSrc]);
-
   // Set src for the FIRST time when audio becomes available
   useEffect(() => {
     if (latestSrc && !playingSrc) {
+      loadedVersionRef.current = partialVersion;
       setPlayingSrc(latestSrc);
     }
-  }, [latestSrc, playingSrc]);
+  }, [latestSrc, playingSrc, partialVersion]);
 
   // When job is DONE, switch to final audio (preserving position)
   useEffect(() => {
@@ -110,7 +106,7 @@ function SongCard({
       const finalSrc = `${backendUrl}/audio/${result.audio_file}`;
       if (finalSrc !== playingSrc) {
         const el = audioRef.current;
-        if (el) el.dataset.seekTo = String(el.currentTime);
+        if (el) pendingSeekRef.current = el.currentTime;
         setPlayingSrc(finalSrc);
       }
     }
@@ -163,31 +159,33 @@ function SongCard({
           src={playingSrc}
           className="w-full"
           onTimeUpdate={() => {
-            // When within 1s of the end, load the latest version if available
+            // When within 0.5s of the end and a newer version exists, switch
             const el = audioRef.current;
             if (!el || el.paused) return;
-            const latest = latestSrcRef.current;
-            if (latest && latest !== playingSrc && el.duration - el.currentTime < 1) {
-              el.dataset.seekTo = String(el.currentTime);
-              setPlayingSrc(latest);
+            if (partialVersion > loadedVersionRef.current && el.duration - el.currentTime < 0.5) {
+              const newSrc = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
+              pendingSeekRef.current = el.currentTime;
+              loadedVersionRef.current = partialVersion;
+              setPlayingSrc(newSrc);
             }
           }}
           onEnded={() => {
-            // When audio finishes, try to extend with the latest version
+            // Audio ended — if newer version exists, load it and continue
             const el = audioRef.current;
-            const latest = latestSrcRef.current;
-            if (el && latest && latest !== playingSrc) {
-              el.dataset.seekTo = String(el.currentTime);
-              setPlayingSrc(latest);
+            if (!el) return;
+            if (partialVersion > loadedVersionRef.current && partialAudio) {
+              const newSrc = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
+              pendingSeekRef.current = el.currentTime;
+              loadedVersionRef.current = partialVersion;
+              setPlayingSrc(newSrc);
             }
           }}
           onCanPlay={() => {
             const el = audioRef.current;
-            if (el && el.dataset.seekTo) {
-              el.currentTime = parseFloat(el.dataset.seekTo);
-              delete el.dataset.seekTo;
+            if (el && pendingSeekRef.current !== null) {
+              el.currentTime = pendingSeekRef.current;
+              pendingSeekRef.current = null;
               el.play().catch(() => {});
-            }
           }}
         />
       )}

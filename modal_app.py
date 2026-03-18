@@ -314,12 +314,6 @@ def serve():
                         jobs[job_id]["partial_version"] = partial_version
                     now = time.time()
                     if now - last_save_time[0] > 2:
-                        # Commit audio to volume so frontend can fetch it
-                        if partial_audio_file:
-                            try:
-                                erised_vol.commit()
-                            except Exception:
-                                pass
                         _save_job(job_id)
                         last_save_time[0] = now
 
@@ -443,12 +437,8 @@ def serve():
 
     @fapi.get("/audio/{filename}")
     def serve_audio(filename: str):
-        # Reload volume to see codec worker's latest writes.
-        # May fail if codec worker has open files — serve from cache.
-        try:
-            erised_vol.reload()
-        except Exception:
-            pass
+        # Audio is written locally by StreamingDecoder during
+        # pause-decode-resume — no volume reload needed.
         path = os.path.join(output_dir, filename)
         if not os.path.isfile(path):
             raise HTTPException(404, "Audio file not found")
