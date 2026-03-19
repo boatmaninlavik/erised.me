@@ -304,7 +304,7 @@ class DPOGuider:
         next_stream_at = None
         if streaming_decode:
             from .streaming import StreamingDecoder
-            stream_decoder = StreamingDecoder(pipe.codec, save_path, duration=12)
+            stream_decoder = StreamingDecoder(pipe.codec, save_path, duration=12, num_steps=6)
             next_stream_at = _FIRST_CHUNK
 
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):

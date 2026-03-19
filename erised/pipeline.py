@@ -286,7 +286,7 @@ class ErisedPipeline:
         if streaming_decode:
             from .streaming import StreamingDecoder
             from .guided_generate import _save_backbone_caches, _restore_backbone_caches, _reset_model_caches
-            stream_decoder = StreamingDecoder(self.pipe.codec, save_path, duration=12)
+            stream_decoder = StreamingDecoder(self.pipe.codec, save_path, duration=12, num_steps=6)
             next_stream_at = _FIRST_CHUNK
 
         for i in range(max_audio_frames):

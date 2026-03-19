@@ -158,6 +158,13 @@ class StreamingDecoder:
             cur_output = cur_output[:, :self.audio_min_samples].detach().cpu()
             if cur_output.dim() == 3:
                 cur_output = cur_output[0]
+            # Normalize if peaks exceed 1.0 — the codec's energy escalates
+            # on longer songs.  Scaling (not clamping) preserves the waveform
+            # shape so lyrics and melody stay intact instead of turning to
+            # square-wave distortion.
+            peak = cur_output.abs().max()
+            if peak > 1.0:
+                cur_output = cur_output / peak * 0.95
 
             # ── append new audio only (discard overlap to avoid repeated lyrics) ──
             if self.output is None:

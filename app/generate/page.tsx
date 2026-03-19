@@ -165,6 +165,7 @@ function SongCard({
   const [audioSrc, setAudioSrc] = useState<string | null>(null);
   const loadedVersionRef = useRef(0);
   const seekOnSwitch = useRef(0);
+  const pendingUrlRef = useRef<string | null>(null);
 
   // Reset on new generation
   useEffect(() => {
@@ -172,24 +173,34 @@ function SongCard({
       setAudioSrc(null);
       loadedVersionRef.current = 0;
       seekOnSwitch.current = 0;
+      pendingUrlRef.current = null;
     }
   }, [status]);
 
-  // When partial audio becomes available or updates, switch src
+  // When partial audio becomes available or updates
   useEffect(() => {
     if (result || !partialAudio || partialVersion <= 0) return;
     if (partialVersion <= loadedVersionRef.current) return;
 
-    // Save current playback position before switching
-    const el = audioRef.current;
-    if (el && !el.paused && isFinite(el.currentTime)) {
-      seekOnSwitch.current = el.currentTime;
+    const newUrl = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
+    loadedVersionRef.current = partialVersion;
+
+    // First chunk — no audio loaded yet, play immediately
+    if (!audioSrc) {
+      setAudioSrc(newUrl);
+      return;
     }
 
-    loadedVersionRef.current = partialVersion;
-    // Cache-bust so browser fetches the updated file
-    setAudioSrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
-  }, [partialAudio, partialVersion, result, backendUrl]);
+    // If the audio has already ended or is paused near the end,
+    // switch immediately — otherwise queue for when player nears end.
+    const el = audioRef.current;
+    if (el && (el.ended || el.paused)) {
+      seekOnSwitch.current = el.currentTime;
+      setAudioSrc(newUrl);
+      return;
+    }
+    pendingUrlRef.current = newUrl;
+  }, [partialAudio, partialVersion, result, backendUrl, audioSrc]);
 
   // When generation completes, switch to final audio
   useEffect(() => {
@@ -253,6 +264,26 @@ function SongCard({
               seekOnSwitch.current = 0;
             }
             el.play().catch(() => {});
+          }}
+          onTimeUpdate={() => {
+            const el = audioRef.current;
+            if (!el || !pendingUrlRef.current) return;
+            const remaining = el.duration - el.currentTime;
+            // When within 2s of the end, switch to the longer partial file
+            if (isFinite(remaining) && remaining < 2) {
+              seekOnSwitch.current = el.currentTime;
+              setAudioSrc(pendingUrlRef.current);
+              pendingUrlRef.current = null;
+            }
+          }}
+          onEnded={() => {
+            // If audio ends and there's a pending longer version, switch to it
+            const el = audioRef.current;
+            if (pendingUrlRef.current && el) {
+              seekOnSwitch.current = el.currentTime;
+              setAudioSrc(pendingUrlRef.current);
+              pendingUrlRef.current = null;
+            }
           }}
         />
       )}
