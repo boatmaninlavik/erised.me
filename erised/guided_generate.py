@@ -62,7 +62,11 @@ def _save_backbone_caches(model):
         if attn is None or getattr(attn, "kv_cache", None) is None:
             continue
         kv = attn.kv_cache
-        saved.append((kv.k_cache.cpu().clone(), kv.v_cache.cpu().clone()))
+        saved.append((
+            kv.k_cache.cpu().clone(),
+            kv.v_cache.cpu().clone(),
+            kv.cache_pos.cpu().clone(),  # position counter — without this
+        ))                               # the model forgets where it was
     return saved
 
 
@@ -78,6 +82,7 @@ def _restore_backbone_caches(model, saved):
         kv = attn.kv_cache
         kv.k_cache.copy_(saved[idx][0].to(kv.k_cache.device))
         kv.v_cache.copy_(saved[idx][1].to(kv.v_cache.device))
+        kv.cache_pos.copy_(saved[idx][2].to(kv.cache_pos.device))
         idx += 1
 
 
