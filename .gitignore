@@ -24,6 +24,9 @@ outputs/
 # Node
 node_modules/
 package-lock.json
+.next/
+next-env.d.ts
+tsconfig.tsbuildinfo
 
 # Environment
 .env

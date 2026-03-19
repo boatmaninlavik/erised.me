@@ -28,10 +28,10 @@ logging.basicConfig(
 logger = logging.getLogger("erised.server")
 
 # ── Paths ────────────────────────────────────────────────────────────
-model_path = os.environ.get("ERISED_MODEL_PATH", "/data/ckpt")
-dpo_path = os.environ.get("ERISED_DPO_PATH", "/data/dpo_checkpoints_v11/dpo_best")
-output_dir = os.environ.get("ERISED_OUTPUT_DIR", "/data/outputs")
-jobs_dir = os.environ.get("ERISED_JOBS_DIR", "/data/jobs")
+model_path = os.environ.get("ERISED_MODEL_PATH", "/workspace/heartlib/ckpt")
+dpo_path = os.environ.get("ERISED_DPO_PATH", "/workspace/dpo_checkpoints_v11/dpo_best")
+output_dir = os.environ.get("ERISED_OUTPUT_DIR", "/workspace/erised_data/outputs")
+jobs_dir = os.environ.get("ERISED_JOBS_DIR", "/workspace/erised_data/jobs")
 
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(jobs_dir, exist_ok=True)

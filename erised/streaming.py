@@ -49,10 +49,14 @@ class StreamingDecoder:
         self.ovlp_samples = self.min_samples - self.hop_samples  # 52
         self.ovlp_frames = self.ovlp_samples * 2
 
-        # Audio-sample-space geometry
+        # Audio-sample-space geometry — derive from code-frame overlap ratio
+        # so it stays correct for ANY chunk duration (the old // 93 * 80
+        # formula only worked when min_samples was an exact multiple of 93).
         self.audio_min_samples = int(duration * codec.sample_rate)
-        self.audio_hop_samples = self.audio_min_samples // 93 * 80
-        self.audio_ovlp_samples = self.audio_min_samples - self.audio_hop_samples
+        self.audio_ovlp_samples = int(
+            self.audio_min_samples * self.ovlp_samples / self.min_samples
+        )
+        self.audio_hop_samples = self.audio_min_samples - self.audio_ovlp_samples
 
         self.latent_length = int(duration * 25)
         self.first_latent = torch.randn(

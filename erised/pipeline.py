@@ -347,6 +347,7 @@ class ErisedPipeline:
         # Stack frames and decode to audio
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
         num_gen_frames = len(frames)
+        _log_token_diagnostic(frames_tensor)
 
         if streaming_decode:
             # Final decode pass for remaining chunks
@@ -497,3 +498,30 @@ def _parse_dtype(s: str) -> torch.dtype:
         "float16": torch.float16, "fp16": torch.float16,
         "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
     }[s.lower()]
+
+
+def _log_token_diagnostic(frames_tensor: torch.Tensor):
+    """Log token repetition diagnostic — helps pinpoint repeated lyrics bug."""
+    c0 = frames_tensor[0].cpu().tolist()  # codebook 0 values
+    n = len(c0)
+    logger.info("TOKEN_DIAG: %d frames. c0[:20]=%s", n, c0[:20])
+    logger.info("TOKEN_DIAG: c0[-20:]=%s", c0[max(0, n - 20):])
+
+    # Check for exact repeated subsequences at different window sizes
+    for w in (15, 30, 50):
+        if n < w * 2:
+            continue
+        seen: dict[tuple, int] = {}
+        repeats = []
+        for i in range(n - w + 1):
+            key = tuple(c0[i:i + w])
+            if key in seen and i - seen[key] >= w:
+                repeats.append((seen[key], i))
+                if len(repeats) >= 5:
+                    break
+            if key not in seen:
+                seen[key] = i
+        if repeats:
+            logger.warning("TOKEN_DIAG: REPEAT w=%d at %s", w, repeats)
+        else:
+            logger.info("TOKEN_DIAG: no repeat (w=%d)", w)
