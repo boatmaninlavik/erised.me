@@ -380,10 +380,15 @@ class ErisedPipeline:
                         os.path.basename(save_path), chunk_idx,
                     )
 
-            streaming_detokenize(
-                self.pipe.codec, frames_tensor, save_path,
-                on_chunk_ready=_on_chunk,
+            # Use heartlib's original detokenize — its padding strategy
+            # (doubling codes) produces clean audio for the last chunk,
+            # unlike streaming.py's repeated-last-frame padding.
+            audio = self.pipe.codec.detokenize(
+                frames_tensor, duration=29.76, num_steps=10,
+                disable_progress=True,
             )
+            import torchaudio as _ta
+            _ta.save(save_path, audio.to(torch.float32), self.pipe.codec.sample_rate)
             logger.info("Audio saved to %s (%d frames)", save_path, frames_tensor.shape[-1])
 
         return frames_tensor

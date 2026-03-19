@@ -90,18 +90,23 @@ class StreamingDecoder:
         codes_len_orig = codes.shape[-1]
         target_len = int(codes_len_orig / 12.5 * self.codec.sample_rate)
 
-        # Pad codes to full-chunk boundaries
+        # Pad codes to full-chunk boundaries.
+        # Match heartlib's strategy: double the code sequence (wraps real
+        # musical content around) instead of repeating the last frame
+        # which creates a flatline that flow matching turns into noise.
         if codes_len_orig < self.min_samples:
-            pad_len = self.min_samples - codes.shape[-1]
-            codes = torch.cat([codes, codes[:, :, -1:].expand(-1, -1, pad_len)], -1)
+            while codes.shape[-1] < self.min_samples:
+                codes = torch.cat([codes, codes], -1)
+            codes = codes[:, :, :self.min_samples]
         codes_len = codes.shape[-1]
         if (codes_len - self.ovlp_samples) % self.hop_samples > 0:
             len_codes = (
                 math.ceil((codes_len - self.ovlp_samples) / float(self.hop_samples))
                 * self.hop_samples + self.ovlp_samples
             )
-            pad_len = len_codes - codes.shape[-1]
-            codes = torch.cat([codes, codes[:, :, -1:].expand(-1, -1, pad_len)], -1)
+            while codes.shape[-1] < len_codes:
+                codes = torch.cat([codes, codes], -1)
+            codes = codes[:, :, :len_codes]
 
         chunk_starts = list(
             range(0, codes.shape[-1] - self.hop_samples + 1, self.hop_samples)
