@@ -175,15 +175,17 @@ class StreamingDecoder:
             chunk_audio = cur_output if idx == 0 else cur_output[:, self.audio_ovlp_samples:]
             chunk_base, chunk_ext = os.path.splitext(self.save_path)
             chunk_path = f"{chunk_base}_chunk{idx}{chunk_ext}"
-            temp_chunk_path = chunk_path + ".tmp"
-            torchaudio.save(temp_chunk_path, chunk_audio.to(torch.float32), 48000, format="wav")
+            # Use .tmp.wav (not .tmp) so torchaudio's soundfile backend
+            # recognises the format from the extension.
+            temp_chunk_path = f"{chunk_base}_chunk{idx}.tmp{chunk_ext}"
+            torchaudio.save(temp_chunk_path, chunk_audio.to(torch.float32), 48000)
             os.replace(temp_chunk_path, chunk_path)
             self.chunk_paths.append(os.path.basename(chunk_path))
 
             # ── save partial audio ──
             partial = self.output[:, :min(self.output.shape[-1], target_len)]
-            temp_path = self.save_path + ".tmp"
-            torchaudio.save(temp_path, partial.to(torch.float32), 48000, format="wav")
+            temp_path = f"{chunk_base}.tmp{chunk_ext}"
+            torchaudio.save(temp_path, partial.to(torch.float32), 48000)
             os.replace(temp_path, self.save_path)
 
             self.chunks_decoded = idx + 1
