@@ -293,10 +293,11 @@ class DPOGuider:
 
         max_audio_frames = max_audio_length_ms // 80
 
-        # Checkpoint thresholds — first decode at 230 frames gives 2 quality
-        # chunks (~22s buffer) for seamless playback.
-        _FIRST_CHUNK = 200
-        _HOP = 160
+        # duration=24 → min_samples=300, hop=240. Gives only 3 chunks for
+        # a 60s song (vs 9 with duration=12), preventing latent conditioning
+        # error accumulation that causes noise in later chunks.
+        _FIRST_CHUNK = 300
+        _HOP = 260
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 
         # Streaming decode: pause-decode-resume on same GPU
@@ -304,7 +305,7 @@ class DPOGuider:
         next_stream_at = None
         if streaming_decode:
             from .streaming import StreamingDecoder
-            stream_decoder = StreamingDecoder(pipe.codec, save_path, duration=12, num_steps=6)
+            stream_decoder = StreamingDecoder(pipe.codec, save_path, duration=24, num_steps=8)
             next_stream_at = _FIRST_CHUNK
 
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):

@@ -273,11 +273,11 @@ class ErisedPipeline:
 
         max_audio_frames = max_audio_length_ms // 80
 
-        # Checkpoint: first decode at 150 frames = exactly 1 clean chunk
-        # (no padding needed with duration=12). At ~15fps: 10s gen + 3s decode
-        # ≈ 13s to first audio. Subsequent _HOP=160 cycles keep buffer ahead.
-        _FIRST_CHUNK = 150
-        _HOP = 160
+        # duration=24 → min_samples=300, hop=240. Gives only 3 chunks for
+        # a 60s song (vs 9 with duration=12), preventing latent conditioning
+        # error accumulation that causes noise in later chunks.
+        _FIRST_CHUNK = 300
+        _HOP = 260
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 
         # Streaming decode: pause-decode-resume on same GPU
@@ -286,7 +286,7 @@ class ErisedPipeline:
         if streaming_decode:
             from .streaming import StreamingDecoder
             from .guided_generate import _save_backbone_caches, _restore_backbone_caches, _reset_model_caches
-            stream_decoder = StreamingDecoder(self.pipe.codec, save_path, duration=12, num_steps=6)
+            stream_decoder = StreamingDecoder(self.pipe.codec, save_path, duration=24, num_steps=8)
             next_stream_at = _FIRST_CHUNK
 
         for i in range(max_audio_frames):

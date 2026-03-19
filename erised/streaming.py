@@ -112,6 +112,19 @@ class StreamingDecoder:
         for idx in range(self.chunks_decoded, total_chunks):
             sinx = chunk_starts[idx]
 
+            # Skip the last chunk if >40% of its frames are padding —
+            # repeated tokens cause flow matching to produce noise.
+            real_frames = min(codes_len_orig - sinx, self.min_samples)
+            if real_frames < 0:
+                real_frames = 0
+            pad_ratio = 1.0 - real_frames / self.min_samples
+            if idx == total_chunks - 1 and pad_ratio > 0.4:
+                logger.info(
+                    "Skipping chunk %d/%d (%.0f%% padding)",
+                    idx + 1, total_chunks, pad_ratio * 100,
+                )
+                continue
+
             # ── flow matching ──
             codes_input = [codes[:, :, sinx : sinx + self.min_samples]]
             if sinx == 0 or self.ovlp_frames == 0:
