@@ -15,9 +15,12 @@ interface GenerationResult {
   model: string;
 }
 
-interface Progress {
-  current_frame: number;
-  total_frames: number;
+interface StreamState {
+  status: JobStatus;
+  result: GenerationResult | null;
+  progress: { current_frame: number; total_frames: number } | null;
+  partialAudio: string | null;
+  partialVersion: number;
 }
 
 async function fetchRetry(url: string, options?: RequestInit, maxRetries = 30): Promise<Response> {
@@ -36,37 +39,104 @@ async function fetchRetry(url: string, options?: RequestInit, maxRetries = 30): 
   throw new Error("Server unreachable after retries");
 }
 
-async function pollJob(
+/**
+ * Connect to the SSE stream for a job. Falls back to polling if SSE fails.
+ * Returns a cleanup function.
+ */
+function streamJob(
   backendUrl: string,
   jobId: string,
-  onProgress?: (progress: Progress, partialAudio: string | null, partialVersion: number | null) => void,
-): Promise<GenerationResult> {
-  while (true) {
-    await new Promise((r) => setTimeout(r, 2000));
-    const resp = await fetchRetry(`${backendUrl}/api/job/${jobId}`);
-    const data = await resp.json();
-    if (data.status === "done") return data.result;
-    if (data.status === "error") throw new Error(data.error);
-    if (onProgress && data.progress) {
-      onProgress(data.progress, data.partial_audio_file || null, data.partial_version ?? null);
+  onUpdate: (state: Partial<StreamState>) => void,
+): () => void {
+  let cancelled = false;
+
+  // Try SSE first
+  const es = new EventSource(`${backendUrl}/api/job/${jobId}/stream`);
+  let sseWorking = false;
+
+  es.addEventListener("progress", (e) => {
+    sseWorking = true;
+    const data = JSON.parse(e.data);
+    onUpdate({ status: "running", progress: data });
+  });
+
+  es.addEventListener("chunk", (e) => {
+    sseWorking = true;
+    const data = JSON.parse(e.data);
+    onUpdate({
+      status: "running",
+      partialAudio: data.audio_file,
+      partialVersion: data.version,
+    });
+  });
+
+  es.addEventListener("done", (e) => {
+    sseWorking = true;
+    const data = JSON.parse(e.data);
+    onUpdate({ status: "done", result: data });
+    es.close();
+  });
+
+  es.addEventListener("error", (e) => {
+    // If SSE never worked, fall back to polling
+    if (!sseWorking) {
+      es.close();
+      fallbackPoll();
+      return;
+    }
+    // If SSE was working but errored, check if it's a job error
+    try {
+      const me = e as MessageEvent;
+      if (me.data) {
+        const data = JSON.parse(me.data);
+        onUpdate({ status: "error", result: null });
+      }
+    } catch {
+      // Connection error — try reconnecting via polling
+    }
+    es.close();
+  });
+
+  // Fallback polling (for Modal which doesn't have the SSE endpoint)
+  async function fallbackPoll() {
+    while (!cancelled) {
+      await new Promise((r) => setTimeout(r, 2000));
+      if (cancelled) break;
+      try {
+        const resp = await fetchRetry(`${backendUrl}/api/job/${jobId}`);
+        const data = await resp.json();
+        if (data.status === "done") {
+          onUpdate({ status: "done", result: data.result });
+          return;
+        }
+        if (data.status === "error") {
+          onUpdate({ status: "error" });
+          return;
+        }
+        const update: Partial<StreamState> = { status: "running" };
+        if (data.progress) update.progress = data.progress;
+        if (data.partial_audio_file) update.partialAudio = data.partial_audio_file;
+        if (data.partial_version != null) update.partialVersion = data.partial_version;
+        onUpdate(update);
+      } catch {
+        // retry
+      }
     }
   }
+
+  return () => {
+    cancelled = true;
+    es.close();
+  };
 }
 
 const SEAN_EMAIL = "zsean@berkeley.edu";
 
-function formatTime(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
 /**
- * Single song player card.
- * During generation: plays individual chunk WAVs via Web Audio API for gapless
- * streaming (AudioContext must be created in a click handler to satisfy browser
- * autoplay policy). Falls back to <audio> src-switching if chunks unavailable.
- * After generation: standard <audio> element for seeking/scrubbing.
+ * Simple song player. During generation, plays the partial combined audio
+ * file (which the server updates after each chunk). After generation,
+ * switches to the final file. No Web Audio scheduling — just a plain
+ * <audio> element that won't produce overlapping/stacking artifacts.
  */
 function SongCard({
   backendUrl,
@@ -75,7 +145,6 @@ function SongCard({
   progress,
   partialAudio,
   partialVersion,
-  audioCtx,
   label,
   onSave,
   saving,
@@ -84,267 +153,118 @@ function SongCard({
   backendUrl: string;
   status: JobStatus;
   result: GenerationResult | null;
-  progress: Progress | null;
+  progress: { current_frame: number; total_frames: number } | null;
   partialAudio: string | null;
   partialVersion: number;
-  audioCtx: AudioContext | null;
   label?: string;
   onSave?: () => void;
   saving?: boolean;
   saved?: boolean;
 }) {
-  // ── Web Audio gapless streaming ──
-  const streamRef = useRef({
-    active: false,
-    nextTime: 0,
-    startTime: 0,
-    loadedChunks: 0,
-    totalDuration: 0,
-    loading: false,
-    sources: [] as AudioBufferSourceNode[],
-  });
-  const [webAudioFailed, setWebAudioFailed] = useState(false);
-  const [streamPlaying, setStreamPlaying] = useState(false);
-  const [streamTime, setStreamTime] = useState(0);
-  const [streamBuffered, setStreamBuffered] = useState(0);
-
-  // ── Fallback <audio> (when chunks unavailable) ──
   const audioRef = useRef<HTMLAudioElement>(null);
-  const fallbackVersionRef = useRef(0);
-  const fallbackSeekRef = useRef(0);
-  const [fallbackSrc, setFallbackSrc] = useState<string | null>(null);
+  const [audioSrc, setAudioSrc] = useState<string | null>(null);
+  const loadedVersionRef = useRef(0);
+  const seekOnSwitch = useRef(0);
 
-  // ── Final <audio> (after generation complete) ──
-  const [finalSrc, setFinalSrc] = useState<string | null>(null);
-  const finalSeekRef = useRef(0);
-
-  const canWebAudio = !!audioCtx && !webAudioFailed;
-
-  // Reset everything on new generation
+  // Reset on new generation
   useEffect(() => {
-    if (status !== "pending") return;
-    streamRef.current.sources.forEach((s) => { try { s.stop(); } catch { /* already stopped */ } });
-    streamRef.current = {
-      active: false, nextTime: 0, startTime: 0,
-      loadedChunks: 0, totalDuration: 0, loading: false, sources: [],
-    };
-    setWebAudioFailed(false);
-    setStreamPlaying(false);
-    setStreamTime(0);
-    setStreamBuffered(0);
-    setFallbackSrc(null);
-    setFinalSrc(null);
-    fallbackVersionRef.current = 0;
-    fallbackSeekRef.current = 0;
+    if (status === "pending") {
+      setAudioSrc(null);
+      loadedVersionRef.current = 0;
+      seekOnSwitch.current = 0;
+    }
   }, [status]);
 
-  // ── Web Audio: fetch and schedule chunk files gaplessly ──
+  // When partial audio becomes available or updates, switch src
   useEffect(() => {
-    const s = streamRef.current;
-    if (!canWebAudio || !partialAudio || partialVersion <= 0 || finalSrc) return;
-    if (s.loading || s.loadedChunks >= partialVersion) return;
-    s.loading = true;
+    if (result || !partialAudio || partialVersion <= 0) return;
+    if (partialVersion <= loadedVersionRef.current) return;
 
-    const dotIdx = partialAudio.lastIndexOf(".");
-    const base = dotIdx >= 0 ? partialAudio.substring(0, dotIdx) : partialAudio;
-    const target = partialVersion;
-
-    (async () => {
-      try {
-        for (let i = s.loadedChunks; i < target; i++) {
-          const resp = await fetch(`${backendUrl}/audio/${base}_chunk${i}.wav`);
-          if (!resp.ok) {
-            if (i === 0) { setWebAudioFailed(true); return; }
-            break;
-          }
-          const audioBuf = await audioCtx!.decodeAudioData(await resp.arrayBuffer());
-          const source = audioCtx!.createBufferSource();
-          source.buffer = audioBuf;
-          source.connect(audioCtx!.destination);
-
-          if (!s.active) {
-            await audioCtx!.resume();
-            const t0 = audioCtx!.currentTime + 0.05;
-            source.start(t0);
-            s.startTime = t0;
-            s.nextTime = t0 + audioBuf.duration;
-            s.active = true;
-            setStreamPlaying(true);
-          } else {
-            source.start(s.nextTime);
-            s.nextTime += audioBuf.duration;
-          }
-
-          s.sources.push(source);
-          s.totalDuration += audioBuf.duration;
-          s.loadedChunks = i + 1;
-          setStreamBuffered(s.totalDuration);
-        }
-      } catch (e) {
-        console.error("Web Audio chunk error:", e);
-        setWebAudioFailed(true);
-      } finally {
-        s.loading = false;
-      }
-    })();
-  }, [canWebAudio, partialAudio, partialVersion, finalSrc, audioCtx, backendUrl]);
-
-  // ── Fallback: set initial <audio> src ──
-  useEffect(() => {
-    if (canWebAudio || !partialAudio || partialVersion <= 0 || finalSrc) return;
-    if (partialVersion <= fallbackVersionRef.current) return;
-    const newSrc = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
-    if (!fallbackSrc) {
-      fallbackVersionRef.current = partialVersion;
-      setFallbackSrc(newSrc);
+    // Save current playback position before switching
+    const el = audioRef.current;
+    if (el && !el.paused && isFinite(el.currentTime)) {
+      seekOnSwitch.current = el.currentTime;
     }
-  }, [canWebAudio, partialAudio, partialVersion, backendUrl, finalSrc, fallbackSrc]);
 
-  // Fallback: poll for safe switch moment
-  useEffect(() => {
-    if (canWebAudio || finalSrc) return;
-    if (status !== "running") return;
-    const iv = setInterval(() => {
-      const el = audioRef.current;
-      if (!el || !partialAudio) return;
-      if (partialVersion <= fallbackVersionRef.current) return;
-      const shouldSwitch = el.paused || el.ended ||
-        (isFinite(el.duration) && el.duration - el.currentTime < 2);
-      if (shouldSwitch) {
-        fallbackSeekRef.current = el.currentTime || 0;
-        fallbackVersionRef.current = partialVersion;
-        el.pause();
-        el.removeAttribute("src");
-        el.load();
-        setFallbackSrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
-      }
-    }, 500);
-    return () => clearInterval(iv);
-  }, [canWebAudio, status, partialVersion, partialAudio, backendUrl, finalSrc]);
+    loadedVersionRef.current = partialVersion;
+    // Cache-bust so browser fetches the updated file
+    setAudioSrc(`${backendUrl}/audio/${partialAudio}?v=${partialVersion}`);
+  }, [partialAudio, partialVersion, result, backendUrl]);
 
-  // ── Switch to final <audio> when generation complete ──
+  // When generation completes, switch to final audio
   useEffect(() => {
-    if (!result || finalSrc) return;
-    const s = streamRef.current;
-    let seekPos = 0;
-    if (s.active && audioCtx) {
-      seekPos = Math.max(0, audioCtx.currentTime - s.startTime);
-      s.sources.forEach((src) => { try { src.stop(); } catch { /* noop */ } });
-      s.sources = [];
-      s.active = false;
-    } else if (audioRef.current) {
-      seekPos = audioRef.current.currentTime || 0;
-      audioRef.current.pause();
+    if (!result) return;
+    const el = audioRef.current;
+    if (el && !el.paused && isFinite(el.currentTime)) {
+      seekOnSwitch.current = el.currentTime;
     }
-    finalSeekRef.current = seekPos;
-    setStreamPlaying(false);
-    setFinalSrc(`${backendUrl}/audio/${result.audio_file}`);
-  }, [result, finalSrc, audioCtx, backendUrl]);
-
-  // ── Update time display for Web Audio streaming ──
-  useEffect(() => {
-    if (!streamPlaying || !audioCtx) return;
-    const iv = setInterval(() => {
-      if (audioCtx.state === "running") {
-        setStreamTime(Math.max(0, audioCtx.currentTime - streamRef.current.startTime));
-      }
-    }, 250);
-    return () => clearInterval(iv);
-  }, [streamPlaying, audioCtx]);
-
-  // Cleanup on unmount
-  useEffect(() => () => {
-    streamRef.current.sources.forEach((s) => { try { s.stop(); } catch { /* noop */ } });
-  }, []);
+    setAudioSrc(`${backendUrl}/audio/${result.audio_file}`);
+  }, [result, backendUrl]);
 
   const isLoading = status === "pending" || status === "running";
   const progressPct = progress?.total_frames
     ? Math.round((progress.current_frame / progress.total_frames) * 100)
     : 0;
-  const isComposing = isLoading && !partialAudio && !streamPlaying && !fallbackSrc;
-  const isStreaming = isLoading && (streamPlaying || !!fallbackSrc || !!partialAudio);
+  const hasAudio = !!audioSrc;
 
   if (status === "idle") return null;
 
   return (
     <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
-      {label && (
-        <div className="flex items-center justify-between">
-          <h3 className="font-medium text-sm tracking-tight">{label}</h3>
-          {isComposing && (
-            <span className="text-xs text-zinc-500 animate-pulse">
-              Composing{progressPct > 0 ? ` (${progressPct}%)` : "..."}
-            </span>
-          )}
-          {isStreaming && (
-            <span className="text-xs text-zinc-500 animate-pulse">
-              Streaming{progressPct > 0 ? ` (${progressPct}%)` : "..."}
-            </span>
-          )}
-        </div>
-      )}
-      {!label && isComposing && (
-        <span className="text-xs text-zinc-500 animate-pulse">
-          Composing{progressPct > 0 ? ` (${progressPct}%)` : "..."}
-        </span>
-      )}
-      {!label && isStreaming && (
-        <span className="text-xs text-zinc-500 animate-pulse">
-          Streaming{progressPct > 0 ? ` (${progressPct}%)` : "..."}
-        </span>
-      )}
-
-      {/* Web Audio: gapless chunk streaming with progress bar */}
-      {streamPlaying && !finalSrc && (
-        <div className="flex items-center gap-3">
-          <div className="flex-1 bg-zinc-800 rounded-full h-1.5 overflow-hidden">
-            <div
-              className="bg-white rounded-full h-full transition-all duration-200"
-              style={{ width: `${streamBuffered > 0 ? Math.min(100, (streamTime / streamBuffered) * 100) : 0}%` }}
-            />
-          </div>
-          <span className="text-xs text-zinc-500 tabular-nums min-w-[5rem] text-right">
-            {formatTime(streamTime)} / {formatTime(streamBuffered)}
+      <div className="flex items-center justify-between">
+        {label && <h3 className="font-medium text-sm tracking-tight">{label}</h3>}
+        {isLoading && !hasAudio && (
+          <span className="text-xs text-zinc-500 animate-pulse">
+            Composing{progressPct > 0 ? ` (${progressPct}%)` : "..."}
           </span>
+        )}
+        {isLoading && hasAudio && (
+          <span className="text-xs text-zinc-500 animate-pulse">
+            Streaming{progressPct > 0 ? ` (${progressPct}%)` : "..."}
+          </span>
+        )}
+        {result && (
+          <span className="text-xs text-zinc-500">{result.elapsed}s · {result.num_frames} frames</span>
+        )}
+      </div>
+
+      {/* Progress bar while composing (before first audio) */}
+      {isLoading && !hasAudio && progressPct > 0 && (
+        <div className="bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+          <div
+            className="bg-zinc-600 rounded-full h-full transition-all duration-500"
+            style={{ width: `${progressPct}%` }}
+          />
         </div>
       )}
 
-      {/* Fallback: standard <audio> during streaming (when chunks unavailable) */}
-      {!streamPlaying && fallbackSrc && !finalSrc && (
+      {/* Audio player */}
+      {audioSrc && (
         <audio
           ref={audioRef}
           controls
-          src={fallbackSrc}
+          src={audioSrc}
           className="w-full"
           onCanPlay={() => {
             const el = audioRef.current;
             if (!el) return;
-            if (fallbackSeekRef.current > 0) {
-              el.currentTime = fallbackSeekRef.current;
-              fallbackSeekRef.current = 0;
+            if (seekOnSwitch.current > 0 && seekOnSwitch.current < el.duration) {
+              el.currentTime = seekOnSwitch.current;
+              seekOnSwitch.current = 0;
             }
             el.play().catch(() => {});
           }}
         />
       )}
 
-      {/* Final <audio> after generation complete — full controls for seeking */}
-      {finalSrc && (
-        <audio
-          ref={audioRef}
-          controls
-          src={finalSrc}
-          className="w-full"
-          onCanPlay={() => {
-            const el = audioRef.current;
-            if (!el) return;
-            if (finalSeekRef.current > 0) {
-              el.currentTime = finalSeekRef.current;
-              finalSeekRef.current = 0;
-            }
-            el.play().catch(() => {});
-          }}
-        />
+      {/* Streaming indicator while audio is playing */}
+      {isLoading && hasAudio && progressPct > 0 && (
+        <div className="bg-zinc-800 rounded-full h-1 overflow-hidden">
+          <div
+            className="bg-zinc-600 rounded-full h-full transition-all duration-500"
+            style={{ width: `${progressPct}%` }}
+          />
+        </div>
       )}
 
       {status === "error" && (
@@ -381,12 +301,15 @@ export default function GeneratePage() {
   const [tab, setTab] = useState<"ab" | "single">("ab");
   const [selectedModel, setSelectedModel] = useState<"dpo" | "original">("dpo");
 
-  const [origStatus, setOrigStatus] = useState<JobStatus>("idle");
-  const [dpoStatus, setDpoStatus] = useState<JobStatus>("idle");
-  const [singleStatus, setSingleStatus] = useState<JobStatus>("idle");
-  const [origResult, setOrigResult] = useState<GenerationResult | null>(null);
-  const [dpoResult, setDpoResult] = useState<GenerationResult | null>(null);
-  const [singleResult, setSingleResult] = useState<GenerationResult | null>(null);
+  const [origState, setOrigState] = useState<StreamState>({
+    status: "idle", result: null, progress: null, partialAudio: null, partialVersion: 0,
+  });
+  const [dpoState, setDpoState] = useState<StreamState>({
+    status: "idle", result: null, progress: null, partialAudio: null, partialVersion: 0,
+  });
+  const [singleState, setSingleState] = useState<StreamState>({
+    status: "idle", result: null, progress: null, partialAudio: null, partialVersion: 0,
+  });
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
   const [savedModels, setSavedModels] = useState<Set<string>>(new Set());
@@ -394,33 +317,10 @@ export default function GeneratePage() {
   const [randomizingLyrics, setRandomizingLyrics] = useState(false);
   const [songTitle, setSongTitle] = useState("Untitled");
 
-  // Streaming state
-  const [origProgress, setOrigProgress] = useState<Progress | null>(null);
-  const [dpoProgress, setDpoProgress] = useState<Progress | null>(null);
-  const [singleProgress, setSingleProgress] = useState<Progress | null>(null);
-  const [origPartialAudio, setOrigPartialAudio] = useState<string | null>(null);
-  const [dpoPartialAudio, setDpoPartialAudio] = useState<string | null>(null);
-  const [singlePartialAudio, setSinglePartialAudio] = useState<string | null>(null);
-  const [origPartialVersion, setOrigPartialVersion] = useState(0);
-  const [dpoPartialVersion, setDpoPartialVersion] = useState(0);
-  const [singlePartialVersion, setSinglePartialVersion] = useState(0);
-
-  // AudioContext for Web Audio gapless streaming — MUST be created in a click
-  // handler to satisfy browser autoplay policy. Shared across SongCards.
-  const audioCtxRef = useRef<AudioContext | null>(null);
-
-  /** Create or resume AudioContext — call synchronously inside a click handler. */
-  function ensureAudioContext(): AudioContext {
-    if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
-      audioCtxRef.current = new AudioContext({ sampleRate: 48000 });
-    }
-    // resume() in gesture context ensures it won't be blocked
-    audioCtxRef.current.resume();
-    return audioCtxRef.current;
-  }
+  // Keep cleanup refs for SSE connections
+  const cleanupRef = useRef<(() => void)[]>([]);
 
   const loadBackendUrl = useCallback(async () => {
-    // Try RunPod first (fast 3s check), fall back to Modal
     const RUNPOD_URL = process.env.NEXT_PUBLIC_RUNPOD_URL;
     const MODAL_URL = "https://boatmaninlavik--erised-gpu-serve.modal.run";
 
@@ -435,7 +335,6 @@ export default function GeneratePage() {
       } catch {}
     }
 
-    // Fall back to Modal
     try {
       const resp = await fetch(`${MODAL_URL}/health`, { signal: AbortSignal.timeout(5000) });
       if (resp.ok) {
@@ -445,7 +344,6 @@ export default function GeneratePage() {
       }
     } catch {}
 
-    // Modal cold-starting
     setGpuStatus("starting");
     try {
       const resp = await fetch(`${MODAL_URL}/health`, { signal: AbortSignal.timeout(120000) });
@@ -468,59 +366,61 @@ export default function GeneratePage() {
     return () => clearInterval(interval);
   }, [loadBackendUrl]);
 
+  // Cleanup SSE on unmount
+  useEffect(() => () => {
+    cleanupRef.current.forEach((fn) => fn());
+  }, []);
+
   async function generateBoth() {
     if (!backendUrl || !prompt.trim() || !lyrics.trim()) return;
-    // Create AudioContext NOW — inside the click handler (user gesture)
-    ensureAudioContext();
+    // Cancel any existing streams
+    cleanupRef.current.forEach((fn) => fn());
+    cleanupRef.current = [];
 
     setError(null);
-    setOrigResult(null);
-    setDpoResult(null);
     setSavedModels(new Set());
-    setOrigStatus("pending");
-    setDpoStatus("idle");
-    setOrigProgress(null);
-    setDpoProgress(null);
-    setOrigPartialAudio(null);
-    setDpoPartialAudio(null);
-    setOrigPartialVersion(0);
-    setDpoPartialVersion(0);
+    const blank: StreamState = { status: "pending", result: null, progress: null, partialAudio: null, partialVersion: 0 };
+    setOrigState(blank);
+    setDpoState({ ...blank, status: "idle" });
 
     try {
-      // ── Generate Original first ──
+      // Generate Original first
       const origResp = await fetchRetry(`${backendUrl}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: "original", user_email: user?.email || null }),
       });
       const origJob = await origResp.json();
-      setOrigStatus("running");
+      setOrigState((s) => ({ ...s, status: "running" }));
 
-      const origResult = await pollJob(backendUrl, origJob.job_id, (prog, partial, ver) => {
-        setOrigProgress(prog);
-        if (partial) setOrigPartialAudio(partial);
-        if (ver !== null) setOrigPartialVersion(ver);
+      // Wait for original via SSE, then start DPO
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = streamJob(backendUrl, origJob.job_id, (update) => {
+          setOrigState((s) => ({ ...s, ...update }));
+          if (update.status === "done") resolve();
+          if (update.status === "error") reject(new Error("Generation failed"));
+        });
+        cleanupRef.current.push(cleanup);
       });
-      setOrigResult(origResult);
-      setOrigStatus("done");
 
-      // ── Then generate DPO ──
-      setDpoStatus("pending");
+      // Now generate DPO
+      setDpoState({ ...blank, status: "pending" });
       const dpoResp = await fetchRetry(`${backendUrl}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: isSean ? "dpo" : "original", dpo_scale: dpoScale, user_email: user?.email || null }),
       });
       const dpoJob = await dpoResp.json();
-      setDpoStatus("running");
+      setDpoState((s) => ({ ...s, status: "running" }));
 
-      const dpoResult = await pollJob(backendUrl, dpoJob.job_id, (prog, partial, ver) => {
-        setDpoProgress(prog);
-        if (partial) setDpoPartialAudio(partial);
-        if (ver !== null) setDpoPartialVersion(ver);
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = streamJob(backendUrl, dpoJob.job_id, (update) => {
+          setDpoState((s) => ({ ...s, ...update }));
+          if (update.status === "done") resolve();
+          if (update.status === "error") reject(new Error("Generation failed"));
+        });
+        cleanupRef.current.push(cleanup);
       });
-      setDpoResult(dpoResult);
-      setDpoStatus("done");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Generation failed");
     }
@@ -528,16 +428,13 @@ export default function GeneratePage() {
 
   async function generateSingle() {
     if (!backendUrl || !prompt.trim() || !lyrics.trim()) return;
-    // Create AudioContext NOW — inside the click handler (user gesture)
-    ensureAudioContext();
+    cleanupRef.current.forEach((fn) => fn());
+    cleanupRef.current = [];
 
     setError(null);
-    setSingleResult(null);
     setSavedModels(new Set());
-    setSingleStatus("pending");
-    setSingleProgress(null);
-    setSinglePartialAudio(null);
-    setSinglePartialVersion(0);
+    const blank: StreamState = { status: "pending", result: null, progress: null, partialAudio: null, partialVersion: 0 };
+    setSingleState(blank);
 
     try {
       const effectiveModel = isSean ? selectedModel : "original";
@@ -547,17 +444,19 @@ export default function GeneratePage() {
         body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, model: effectiveModel, dpo_scale: dpoScale, user_email: user?.email || null }),
       });
       const job = await resp.json();
-      setSingleStatus("running");
-      const result = await pollJob(backendUrl, job.job_id, (prog, partial, ver) => {
-        setSingleProgress(prog);
-        if (partial) setSinglePartialAudio(partial);
-        if (ver !== null) setSinglePartialVersion(ver);
+      setSingleState((s) => ({ ...s, status: "running" }));
+
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = streamJob(backendUrl, job.job_id, (update) => {
+          setSingleState((s) => ({ ...s, ...update }));
+          if (update.status === "done") resolve();
+          if (update.status === "error") reject(new Error("Generation failed"));
+        });
+        cleanupRef.current.push(cleanup);
       });
-      setSingleResult(result);
-      setSingleStatus("done");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Generation failed");
-      setSingleStatus("error");
+      setSingleState((s) => ({ ...s, status: "error" }));
     }
   }
 
@@ -637,9 +536,9 @@ export default function GeneratePage() {
   const effectiveTab = isSean ? tab : "single";
 
   const isGenerating =
-    origStatus === "pending" || origStatus === "running" ||
-    dpoStatus === "pending" || dpoStatus === "running" ||
-    singleStatus === "pending" || singleStatus === "running";
+    origState.status === "pending" || origState.status === "running" ||
+    dpoState.status === "pending" || dpoState.status === "running" ||
+    singleState.status === "pending" || singleState.status === "running";
 
   return (
     <div className="min-h-screen bg-black text-white">
@@ -829,31 +728,29 @@ export default function GeneratePage() {
           )}
 
           {/* A/B Results */}
-          {effectiveTab === "ab" && (origStatus !== "idle" || dpoStatus !== "idle") && backendUrl && (
+          {effectiveTab === "ab" && (origState.status !== "idle" || dpoState.status !== "idle") && backendUrl && (
             <div className="space-y-4">
               <SongCard
                 backendUrl={backendUrl}
-                status={origStatus}
-                result={origResult}
-                progress={origProgress}
-                partialAudio={origPartialAudio}
-                partialVersion={origPartialVersion}
-                audioCtx={audioCtxRef.current}
+                status={origState.status}
+                result={origState.result}
+                progress={origState.progress}
+                partialAudio={origState.partialAudio}
+                partialVersion={origState.partialVersion}
                 label="Original Model"
-                onSave={origResult ? () => saveToLibrary(origResult) : undefined}
+                onSave={origState.result ? () => saveToLibrary(origState.result!) : undefined}
                 saving={saving === "original"}
                 saved={savedModels.has("original")}
               />
               <SongCard
                 backendUrl={backendUrl}
-                status={dpoStatus}
-                result={dpoResult}
-                progress={dpoProgress}
-                partialAudio={dpoPartialAudio}
-                partialVersion={dpoPartialVersion}
-                audioCtx={audioCtxRef.current}
+                status={dpoState.status}
+                result={dpoState.result}
+                progress={dpoState.progress}
+                partialAudio={dpoState.partialAudio}
+                partialVersion={dpoState.partialVersion}
                 label="DPO Guided"
-                onSave={dpoResult ? () => saveToLibrary(dpoResult) : undefined}
+                onSave={dpoState.result ? () => saveToLibrary(dpoState.result!) : undefined}
                 saving={saving === "dpo"}
                 saved={savedModels.has("dpo")}
               />
@@ -861,16 +758,15 @@ export default function GeneratePage() {
           )}
 
           {/* Single Result */}
-          {effectiveTab === "single" && singleStatus !== "idle" && backendUrl && (
+          {effectiveTab === "single" && singleState.status !== "idle" && backendUrl && (
             <SongCard
               backendUrl={backendUrl}
-              status={singleStatus}
-              result={singleResult}
-              progress={singleProgress}
-              partialAudio={singlePartialAudio}
-              partialVersion={singlePartialVersion}
-              audioCtx={audioCtxRef.current}
-              onSave={singleResult ? () => saveToLibrary(singleResult) : undefined}
+              status={singleState.status}
+              result={singleState.result}
+              progress={singleState.progress}
+              partialAudio={singleState.partialAudio}
+              partialVersion={singleState.partialVersion}
+              onSave={singleState.result ? () => saveToLibrary(singleState.result!) : undefined}
               saving={saving === selectedModel}
               saved={savedModels.has(selectedModel)}
             />

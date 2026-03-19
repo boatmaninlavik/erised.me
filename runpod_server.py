@@ -215,6 +215,56 @@ def get_job(job_id: str):
     raise HTTPException(404, "Unknown job_id")
 
 
+@app.get("/api/job/{job_id}/stream")
+async def stream_job(job_id: str):
+    """SSE endpoint — pushes events as soon as chunks are ready."""
+    import asyncio
+    from starlette.responses import StreamingResponse
+
+    with jobs_lock:
+        if job_id not in jobs:
+            raise HTTPException(404, "Unknown job_id")
+
+    async def event_generator():
+        last_version = 0
+        last_frame = 0
+        while True:
+            with jobs_lock:
+                job = jobs.get(job_id, {})
+            status = job.get("status", "pending")
+            progress = job.get("progress", {})
+            cur_frame = progress.get("current_frame", 0)
+            total = progress.get("total_frames", 0)
+            partial = job.get("partial_audio_file")
+            version = job.get("partial_version", 0)
+
+            # Send progress update when frames advance
+            if cur_frame > last_frame:
+                last_frame = cur_frame
+                yield f"event: progress\ndata: {json.dumps({'current_frame': cur_frame, 'total_frames': total})}\n\n"
+
+            # Send chunk_ready when new chunks are decoded
+            if version > last_version and partial:
+                last_version = version
+                yield f"event: chunk\ndata: {json.dumps({'audio_file': partial, 'version': version})}\n\n"
+
+            if status == "done":
+                result = job.get("result", {})
+                yield f"event: done\ndata: {json.dumps(result)}\n\n"
+                return
+            if status == "error":
+                yield f"event: error\ndata: {json.dumps({'error': job.get('error', 'unknown')})}\n\n"
+                return
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/audio/{filename}")
 def serve_audio(filename: str):
     path = os.path.join(output_dir, filename)
