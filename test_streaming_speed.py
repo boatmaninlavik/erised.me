@@ -98,7 +98,6 @@ def main():
     config = ErisedConfig(
         model_path="/workspace/heartlib/ckpt",
         output_dir="/workspace/erised_data/test_speed",
-        dpo_checkpoint_path=None,
     )
     pipeline = ErisedPipeline(config)
     logger.info("Pipeline loaded.\n")
