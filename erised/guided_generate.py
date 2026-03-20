@@ -257,6 +257,8 @@ class DPOGuider:
         on_progress: Optional[Callable] = None,
         on_frames_checkpoint: Optional[Callable] = None,
         streaming_decode: bool = False,
+        streaming_first_chunk: Optional[int] = None,
+        streaming_lean_gc: bool = False,
     ) -> torch.Tensor:
         """Full guided generation loop — identical to v8's guided_forward."""
         pipe = pipeline.pipe
@@ -305,7 +307,7 @@ class DPOGuider:
         # duration=24 → min_samples=300, hop=240. Gives only 3 chunks for
         # a 60s song (vs 9 with duration=12), preventing latent conditioning
         # error accumulation that causes noise in later chunks.
-        _FIRST_CHUNK = 300
+        _FIRST_CHUNK = streaming_first_chunk if streaming_first_chunk is not None else 300
         _HOP = 260
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 
@@ -363,7 +365,8 @@ class DPOGuider:
                     saved_dpo = _save_backbone_caches(dpo_model)
                     _reset_model_caches(orig_model)
                     _reset_model_caches(dpo_model)
-                    gc.collect()
+                    if not streaming_lean_gc:
+                        gc.collect()
                     torch.cuda.empty_cache()
                     _t_pre_decode = _time.perf_counter()
                     new_chunks = stream_decoder.decode_available(frames_cp)
@@ -373,16 +376,18 @@ class DPOGuider:
                     _restore_backbone_caches(orig_model, saved_orig)
                     _restore_backbone_caches(dpo_model, saved_dpo)
                     del saved_orig, saved_dpo
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    if not streaming_lean_gc:
+                        gc.collect()
+                        torch.cuda.empty_cache()
                     _t_resume = _time.perf_counter()
                     logger.info(
-                        "[streaming] frame=%d | cache_save+gc=%.2fs | codec_decode=%.2fs | restore+gc=%.2fs | total_pause=%.2fs",
+                        "[streaming] frame=%d | pre_decode=%.2fs | codec_decode=%.2fs | post_decode=%.2fs | total_pause=%.2fs | lean_gc=%s",
                         len(frames),
                         _t_pre_decode - _t_pause,
                         _t_post_decode - _t_pre_decode,
                         _t_resume - _t_post_decode,
                         _t_resume - _t_pause,
+                        streaming_lean_gc,
                     )
                     if new_chunks > 0 and on_progress:
                         on_progress(len(frames), max_audio_frames,

@@ -108,6 +108,29 @@ class ErisedPipeline:
                     attn.cache_enabled = False
         torch.cuda.empty_cache()
 
+    def compile_backbone(self):
+        """Compile the AR backbone with torch.compile for faster generation."""
+        self.pipe.mula.backbone = torch.compile(
+            self.pipe.mula.backbone, fullgraph=False,
+        )
+        # Warmup pass to trigger JIT
+        mula = self.pipe.mula
+        device = next(mula.parameters()).device
+        dtype = next(mula.parameters()).dtype
+        mula.setup_caches(2)
+        dummy_tokens = torch.zeros(2, 1, 9, device=device, dtype=torch.long)
+        dummy_mask = torch.ones(2, 1, 9, device=device, dtype=torch.bool)
+        dummy_pos = torch.zeros(2, 1, device=device, dtype=torch.long)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=dtype):
+            mula.generate_frame(dummy_tokens, dummy_mask, dummy_pos, 1.0, 50, 1.5)
+        for part in (mula.backbone, mula.decoder):
+            try:
+                part.reset_caches()
+            except (RuntimeError, AttributeError):
+                pass
+        torch.cuda.empty_cache()
+        logger.info("Backbone compiled and warmed up")
+
     def generate(
         self,
         prompt: str,
@@ -120,6 +143,8 @@ class ErisedPipeline:
         on_progress: Optional[Callable] = None,
         on_frames_checkpoint: Optional[Callable] = None,
         streaming_decode: bool = False,
+        streaming_first_chunk: Optional[int] = None,
+        streaming_lean_gc: bool = False,
     ) -> GenerationResult:
         """Generate a song from a musical prompt + lyrics. Returns audio path + saved tokens."""
 
@@ -139,7 +164,10 @@ class ErisedPipeline:
 
         frames = self._generate_and_capture(tags, lyrics, audio_path, on_progress=on_progress,
                                               on_frames_checkpoint=on_frames_checkpoint,
-                                              streaming_decode=streaming_decode, **kwargs)
+                                              streaming_decode=streaming_decode,
+                                              streaming_first_chunk=streaming_first_chunk,
+                                              streaming_lean_gc=streaming_lean_gc,
+                                              **kwargs)
 
         torch.save(frames.cpu(), tokens_path)
         logger.info("Saved tokens (%d frames) to %s", frames.shape[-1], tokens_path)
@@ -196,6 +224,8 @@ class ErisedPipeline:
         on_progress: Optional[Callable] = None,
         on_frames_checkpoint: Optional[Callable] = None,
         streaming_decode: bool = False,
+        streaming_first_chunk: Optional[int] = None,
+        streaming_lean_gc: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -276,7 +306,7 @@ class ErisedPipeline:
         # duration=24 → min_samples=300, hop=240. Gives only 3 chunks for
         # a 60s song (vs 9 with duration=12), preventing latent conditioning
         # error accumulation that causes noise in later chunks.
-        _FIRST_CHUNK = 300
+        _FIRST_CHUNK = streaming_first_chunk if streaming_first_chunk is not None else 300
         _HOP = 260
         next_checkpoint = _FIRST_CHUNK if on_frames_checkpoint else None
 
@@ -325,60 +355,40 @@ class ErisedPipeline:
                 logger.info("[streaming] AR generated %d frames in %.2fs since last resume",
                             len(frames) - (next_stream_at - _HOP if next_stream_at > _FIRST_CHUNK else 0),
                             _t_pause - _ar_resume_time)
-                _t0 = _time.perf_counter()
                 frames_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
-                _t1 = _time.perf_counter()
                 saved = _save_backbone_caches(mula)
-                _t2 = _time.perf_counter()
                 _reset_model_caches(mula)
-                _t3 = _time.perf_counter()
                 dpo_on_gpu = False
                 if hasattr(self, 'guider') and self.guider:
                     _reset_model_caches(self.guider.dpo_model)
                     self.guider.dpo_model.cpu()
                     dpo_on_gpu = True
-                _t4 = _time.perf_counter()
-                gc.collect()
-                _t5 = _time.perf_counter()
+                if not streaming_lean_gc:
+                    gc.collect()
                 torch.cuda.empty_cache()
-                _t6 = _time.perf_counter()
-                logger.info(
-                    "[streaming] PRE-DECODE breakdown: stack=%.2fs | cache_save=%.2fs | reset=%.2fs | dpo_cpu=%.2fs | gc=%.2fs | empty_cache=%.2fs",
-                    _t1 - _t0, _t2 - _t1, _t3 - _t2, _t4 - _t3, _t5 - _t4, _t6 - _t5,
-                )
                 _t_pre_decode = _time.perf_counter()
                 new_chunks = stream_decoder.decode_available(frames_cp)
                 _t_post_decode = _time.perf_counter()
-                # Free codec intermediates BEFORE restoring models
-                _t7 = _time.perf_counter()
-                gc.collect()
-                _t8 = _time.perf_counter()
-                torch.cuda.empty_cache()
-                _t9 = _time.perf_counter()
+                if not streaming_lean_gc:
+                    gc.collect()
+                    torch.cuda.empty_cache()
                 mula.setup_caches(bs_size)
-                _t10 = _time.perf_counter()
                 _restore_backbone_caches(mula, saved)
-                _t11 = _time.perf_counter()
                 del saved
                 if dpo_on_gpu:
                     self.guider.dpo_model.to(device)
-                _t12 = _time.perf_counter()
-                gc.collect()
-                _t13 = _time.perf_counter()
-                torch.cuda.empty_cache()
-                _t14 = _time.perf_counter()
-                logger.info(
-                    "[streaming] POST-DECODE breakdown: gc=%.2fs | empty_cache=%.2fs | setup_caches=%.2fs | restore=%.2fs | dpo_gpu=%.2fs | gc2=%.2fs | empty_cache2=%.2fs",
-                    _t8 - _t7, _t9 - _t8, _t10 - _t9, _t11 - _t10, _t12 - _t11, _t13 - _t12, _t14 - _t13,
-                )
+                if not streaming_lean_gc:
+                    gc.collect()
+                    torch.cuda.empty_cache()
                 _t_resume = _time.perf_counter()
                 logger.info(
-                    "[streaming] frame=%d | cache_save+gc=%.2fs | codec_decode=%.2fs | restore+gc=%.2fs | total_pause=%.2fs",
+                    "[streaming] frame=%d | pre_decode=%.2fs | codec_decode=%.2fs | post_decode=%.2fs | total_pause=%.2fs | lean_gc=%s",
                     len(frames),
                     _t_pre_decode - _t_pause,
                     _t_post_decode - _t_pre_decode,
                     _t_resume - _t_post_decode,
                     _t_resume - _t_pause,
+                    streaming_lean_gc,
                 )
                 if new_chunks > 0 and on_progress:
                     on_progress(len(frames), max_audio_frames,
@@ -483,6 +493,8 @@ class ErisedPipeline:
         on_progress: Optional[Callable] = None,
         on_frames_checkpoint: Optional[Callable] = None,
         streaming_decode: bool = False,
+        streaming_first_chunk: Optional[int] = None,
+        streaming_lean_gc: bool = False,
     ) -> GenerationResult:
         """
         Generate a song using DPO Guided inference.
@@ -521,6 +533,8 @@ class ErisedPipeline:
             on_progress=on_progress,
             on_frames_checkpoint=on_frames_checkpoint,
             streaming_decode=streaming_decode,
+            streaming_first_chunk=streaming_first_chunk,
+            streaming_lean_gc=streaming_lean_gc,
         )
 
         torch.save(frames.cpu(), tokens_path)
