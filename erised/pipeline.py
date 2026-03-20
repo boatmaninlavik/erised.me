@@ -341,7 +341,8 @@ class ErisedPipeline:
                 torch.cuda.empty_cache()
                 if new_chunks > 0 and on_progress:
                     on_progress(len(frames), max_audio_frames,
-                               os.path.basename(save_path), stream_decoder.chunks_decoded)
+                               os.path.basename(save_path), stream_decoder.chunks_decoded,
+                               chunk_paths=list(stream_decoder.chunk_paths))
                 next_stream_at += _HOP
 
         # Stack frames and decode to audio
@@ -364,7 +365,8 @@ class ErisedPipeline:
                 self.guider.dpo_model.to(device)
             if on_progress:
                 on_progress(num_gen_frames, max_audio_frames,
-                           os.path.basename(save_path), stream_decoder.chunks_decoded)
+                           os.path.basename(save_path), stream_decoder.chunks_decoded,
+                           chunk_paths=list(stream_decoder.chunk_paths))
             logger.info("Streaming decode complete: %d chunks, %s",
                         stream_decoder.chunks_decoded, save_path)
         elif on_frames_checkpoint:

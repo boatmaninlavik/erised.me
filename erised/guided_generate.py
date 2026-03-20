@@ -55,7 +55,11 @@ def _reset_model_caches(model):
 
 
 def _save_backbone_caches(model):
-    """Save backbone KV caches to CPU for pause-decode-resume."""
+    """Save backbone KV caches for pause-decode-resume.
+
+    Clones on GPU (not CPU) to avoid 84 sequential CUDA syncs over PCIe.
+    A100-80GB has plenty of headroom for the ~1-2 GB of cache clones.
+    """
     saved = []
     for layer in model.backbone.layers:
         attn = getattr(layer, "attn", None)
@@ -63,15 +67,15 @@ def _save_backbone_caches(model):
             continue
         kv = attn.kv_cache
         saved.append((
-            kv.k_cache.cpu().clone(),
-            kv.v_cache.cpu().clone(),
-            kv.cache_pos.cpu().clone(),  # position counter — without this
-        ))                               # the model forgets where it was
+            kv.k_cache.clone(),
+            kv.v_cache.clone(),
+            kv.cache_pos.clone(),          # position counter — without this
+        ))                                 # the model forgets where it was
     return saved
 
 
 def _restore_backbone_caches(model, saved):
-    """Restore backbone KV caches from CPU after codec decode."""
+    """Restore backbone KV caches after codec decode."""
     idx = 0
     for layer in model.backbone.layers:
         attn = getattr(layer, "attn", None)
@@ -80,9 +84,9 @@ def _restore_backbone_caches(model, saved):
         if idx >= len(saved):
             break
         kv = attn.kv_cache
-        kv.k_cache.copy_(saved[idx][0].to(kv.k_cache.device))
-        kv.v_cache.copy_(saved[idx][1].to(kv.v_cache.device))
-        kv.cache_pos.copy_(saved[idx][2].to(kv.cache_pos.device))
+        kv.k_cache.copy_(saved[idx][0])
+        kv.v_cache.copy_(saved[idx][1])
+        kv.cache_pos.copy_(saved[idx][2])
         idx += 1
 
 
@@ -364,7 +368,8 @@ class DPOGuider:
                     torch.cuda.empty_cache()
                     if new_chunks > 0 and on_progress:
                         on_progress(len(frames), max_audio_frames,
-                                   os.path.basename(save_path), stream_decoder.chunks_decoded)
+                                   os.path.basename(save_path), stream_decoder.chunks_decoded,
+                                   chunk_paths=list(stream_decoder.chunk_paths))
                     next_stream_at += _HOP
 
         # Stack frames and decode to audio
@@ -379,7 +384,8 @@ class DPOGuider:
             stream_decoder.decode_available(frames_tensor)
             if on_progress:
                 on_progress(num_gen_frames, max_audio_frames,
-                           os.path.basename(save_path), stream_decoder.chunks_decoded)
+                           os.path.basename(save_path), stream_decoder.chunks_decoded,
+                           chunk_paths=list(stream_decoder.chunk_paths))
             logger.info("Guided streaming decode complete: %d chunks", stream_decoder.chunks_decoded)
         elif on_frames_checkpoint:
             # External decoder handles all audio — send final frames

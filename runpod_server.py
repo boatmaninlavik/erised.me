@@ -95,7 +95,8 @@ def generation_worker():
         audio_filename = f"{job_id}.wav"
         last_save = [0.0]
 
-        def on_progress(current_frame, total_frames, partial_audio_file=None, partial_version=None):
+        def on_progress(current_frame, total_frames, partial_audio_file=None, partial_version=None,
+                        chunk_paths=None):
             with jobs_lock:
                 jobs[job_id]["progress"] = {
                     "current_frame": current_frame,
@@ -105,6 +106,8 @@ def generation_worker():
                     jobs[job_id]["partial_audio_file"] = partial_audio_file
                 if partial_version is not None:
                     jobs[job_id]["partial_version"] = partial_version
+                if chunk_paths is not None:
+                    jobs[job_id]["chunk_paths"] = chunk_paths
                 now = time.time()
                 if now - last_save[0] > 2:
                     _save_job(job_id)
@@ -133,6 +136,9 @@ def generation_worker():
 
             actual_audio = os.path.basename(gen_result.audio_path)
             with jobs_lock:
+                # Keep partial_audio_file/version so the SSE can still
+                # send the last chunk event before the done event.
+                # The done event carries the final audio_file anyway.
                 jobs[job_id]["status"] = "done"
                 jobs[job_id]["result"] = {
                     "audio_file": actual_audio,
@@ -141,8 +147,6 @@ def generation_worker():
                     "elapsed": round(elapsed, 1),
                     "model": model_name,
                 }
-                jobs[job_id].pop("partial_audio_file", None)
-                jobs[job_id].pop("partial_version", None)
                 _save_job(job_id)
             gen_stats["completed"] += 1
         except Exception as e:
@@ -228,6 +232,7 @@ async def stream_job(job_id: str):
     async def event_generator():
         last_version = 0
         last_frame = 0
+        heartbeat_counter = 0
         while True:
             with jobs_lock:
                 job = jobs.get(job_id, {})
@@ -238,15 +243,26 @@ async def stream_job(job_id: str):
             partial = job.get("partial_audio_file")
             version = job.get("partial_version", 0)
 
+            sent_event = False
+
             # Send progress update when frames advance
             if cur_frame > last_frame:
                 last_frame = cur_frame
                 yield f"event: progress\ndata: {json.dumps({'current_frame': cur_frame, 'total_frames': total})}\n\n"
+                sent_event = True
 
             # Send chunk_ready when new chunks are decoded
             if version > last_version and partial:
                 last_version = version
-                yield f"event: chunk\ndata: {json.dumps({'audio_file': partial, 'version': version})}\n\n"
+                chunk_data = {'audio_file': partial, 'version': version}
+                # Include individual chunk file paths so the client can
+                # download just the new chunk (~7MB) instead of the full
+                # cumulative file (~16MB) — halves download time.
+                cp = job.get("chunk_paths")
+                if cp:
+                    chunk_data["chunk_files"] = cp
+                yield f"event: chunk\ndata: {json.dumps(chunk_data)}\n\n"
+                sent_event = True
 
             if status == "done":
                 result = job.get("result", {})
@@ -256,7 +272,14 @@ async def stream_job(job_id: str):
                 yield f"event: error\ndata: {json.dumps({'error': job.get('error', 'unknown')})}\n\n"
                 return
 
-            await asyncio.sleep(0.5)
+            # Heartbeat every ~2s to keep the connection alive through
+            # cloudflared tunnel during long decode pauses.
+            heartbeat_counter += 1
+            if not sent_event and heartbeat_counter >= 20:
+                yield f"event: heartbeat\ndata: {{}}\n\n"
+                heartbeat_counter = 0
+
+            await asyncio.sleep(0.1)
 
     return StreamingResponse(
         event_generator(),

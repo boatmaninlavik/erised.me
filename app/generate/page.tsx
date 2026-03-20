@@ -78,23 +78,16 @@ function streamJob(
   });
 
   es.addEventListener("error", (e) => {
-    // If SSE never worked, fall back to polling
+    es.close();
     if (!sseWorking) {
-      es.close();
+      // SSE never worked — fall back to polling
       fallbackPoll();
       return;
     }
-    // If SSE was working but errored, check if it's a job error
-    try {
-      const me = e as MessageEvent;
-      if (me.data) {
-        const data = JSON.parse(me.data);
-        onUpdate({ status: "error", result: null });
-      }
-    } catch {
-      // Connection error — try reconnecting via polling
-    }
-    es.close();
+    // SSE was working but connection dropped (e.g. cloudflared timeout
+    // during a long decode). Fall back to polling so we still catch the
+    // done event instead of getting stuck at "Streaming 99%".
+    fallbackPoll();
   });
 
   // Fallback polling (for Modal which doesn't have the SSE endpoint)
