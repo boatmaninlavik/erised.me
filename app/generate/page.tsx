@@ -159,6 +159,8 @@ function SongCard({
   const loadedVersionRef = useRef(0);
   const seekOnSwitch = useRef(0);
   const pendingUrlRef = useRef<string | null>(null);
+  const blobUrlsRef = useRef<string[]>([]);
+  const fetchControllerRef = useRef<AbortController | null>(null);
 
   // Reset on new generation
   useEffect(() => {
@@ -167,32 +169,63 @@ function SongCard({
       loadedVersionRef.current = 0;
       seekOnSwitch.current = 0;
       pendingUrlRef.current = null;
+      if (fetchControllerRef.current) fetchControllerRef.current.abort();
+      blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      blobUrlsRef.current = [];
     }
   }, [status]);
+
+  // Cleanup blob URLs on unmount
+  useEffect(() => () => {
+    blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+  }, []);
 
   // When partial audio becomes available or updates
   useEffect(() => {
     if (result || !partialAudio || partialVersion <= 0) return;
     if (partialVersion <= loadedVersionRef.current) return;
 
-    const newUrl = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
+    const networkUrl = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
     loadedVersionRef.current = partialVersion;
 
     // First chunk — no audio loaded yet, play immediately
     if (!audioSrc) {
-      setAudioSrc(newUrl);
+      setAudioSrc(networkUrl);
       return;
     }
 
-    // If the audio has already ended or is paused near the end,
-    // switch immediately — otherwise queue for when player nears end.
+    // If the audio has already ended or is paused,
+    // switch immediately with network URL.
     const el = audioRef.current;
     if (el && (el.ended || el.paused)) {
       seekOnSwitch.current = el.currentTime;
-      setAudioSrc(newUrl);
+      setAudioSrc(networkUrl);
       return;
     }
-    pendingUrlRef.current = newUrl;
+
+    // Audio is still playing. Pre-download the longer cumulative file
+    // into browser memory NOW so that when we switch at remaining < 2s,
+    // the browser loads from memory (12ms) instead of network (2000ms).
+    // Set network URL as fallback in case the fetch doesn't finish in time.
+    pendingUrlRef.current = networkUrl;
+
+    if (fetchControllerRef.current) fetchControllerRef.current.abort();
+    const controller = new AbortController();
+    fetchControllerRef.current = controller;
+
+    fetch(networkUrl, { signal: controller.signal })
+      .then((r) => r.blob())
+      .then((blob) => {
+        if (controller.signal.aborted) return;
+        const blobUrl = URL.createObjectURL(blob);
+        blobUrlsRef.current.push(blobUrl);
+        // Upgrade pending URL from network to blob — if the switch
+        // hasn't happened yet, it will now use the in-memory blob.
+        if (pendingUrlRef.current === networkUrl) {
+          pendingUrlRef.current = blobUrl;
+        }
+      })
+      .catch(() => {}); // network URL remains as fallback
   }, [partialAudio, partialVersion, result, backendUrl, audioSrc]);
 
   // When generation completes, switch to final audio
