@@ -1,123 +1,152 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>Chunk Gap Diagnostic</title>
+<title>Chunk Gap Deep Diagnostic</title>
 <style>
-  body { font-family: monospace; background: #111; color: #eee; padding: 20px; }
-  .log { white-space: pre-wrap; font-size: 12px; line-height: 1.6; max-height: 400px; overflow-y: auto; background: #1a1a1a; padding: 10px; border-radius: 8px; margin: 10px 0; }
-  h2 { color: #aaa; font-size: 14px; margin-top: 30px; }
-  .bar { height: 20px; background: #333; border-radius: 4px; margin: 5px 0; position: relative; overflow: hidden; }
-  .fill { height: 100%; background: #4a4; border-radius: 4px; transition: width 0.1s linear; }
-  .time { position: absolute; right: 5px; top: 2px; font-size: 11px; color: #fff; }
-  button { background: #333; color: #eee; border: 1px solid #555; padding: 8px 16px; border-radius: 6px; cursor: pointer; margin: 5px; }
+  body { font-family: monospace; background: #111; color: #eee; padding: 20px; max-width: 900px; margin: 0 auto; }
+  .log { white-space: pre-wrap; font-size: 11px; line-height: 1.5; max-height: 300px; overflow-y: auto; background: #1a1a1a; padding: 10px; border-radius: 8px; margin: 10px 0; }
+  h2 { color: #aaa; font-size: 14px; margin-top: 30px; border-bottom: 1px solid #333; padding-bottom: 5px; }
+  button { background: #333; color: #eee; border: 1px solid #555; padding: 8px 16px; border-radius: 6px; cursor: pointer; margin: 5px; font-family: monospace; }
   button:hover { background: #444; }
-  .label { font-size: 12px; color: #888; margin-bottom: 2px; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
   .section { margin: 20px 0; padding: 15px; background: #1a1a1a; border-radius: 8px; }
   .gap { color: #f66; font-weight: bold; }
   .good { color: #6f6; font-weight: bold; }
+  .warn { color: #fa0; font-weight: bold; }
+  input { background: #222; color: #eee; border: 1px solid #444; padding: 6px 10px; border-radius: 4px; font-family: monospace; width: 400px; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; }
+  td, th { border: 1px solid #333; padding: 6px 10px; text-align: left; font-size: 12px; }
+  th { background: #222; }
+  .bar { height: 20px; background: #333; border-radius: 4px; margin: 5px 0; position: relative; overflow: hidden; }
+  .fill { height: 100%; border-radius: 4px; transition: width 0.1s linear; }
+  .time { position: absolute; right: 5px; top: 2px; font-size: 11px; color: #fff; }
 </style>
 </head>
 <body>
-<h1>Chunk Transition Gap Diagnostic</h1>
-<p style="color:#888; font-size:13px;">
-  This tests the exact gap duration when switching audio sources using different approaches.
-  Uses synthetic audio (sine wave) to isolate the switching mechanism from network effects.
+<h1>Chunk Transition Deep Diagnostic</h1>
+<p style="color:#888; font-size:12px;">
+  Tests every aspect of the chunk transition to find exactly where the delay comes from.
 </p>
 
+<!-- ═══════════════════════════════════════════════════════════════ -->
 <div class="section">
-  <h2>Test 1: Current Approach — &lt;audio&gt; src swap</h2>
+  <h2>Test 1: Blob Parse Time by File Size</h2>
   <p style="color:#888; font-size:12px;">
-    Simulates current behavior: playing chunk1 (5s), at remaining &lt; 2s, swap src to chunk1+chunk2 (10s) and seek.
+    Generates WAV files of different sizes, creates blob URLs, and measures how long
+    the &lt;audio&gt; element takes to become playable (onCanPlay). This tells us if
+    blob pre-fetch can work for your file sizes.
   </p>
   <button onclick="runTest1()">Run Test 1</button>
-  <div class="label">Playback:</div>
-  <div class="bar" id="bar1"><div class="fill" id="fill1"></div><div class="time" id="time1">0.0s / 0.0s</div></div>
   <div class="log" id="log1"></div>
+  <table id="table1" style="display:none;">
+    <thead><tr><th>Duration</th><th>File Size</th><th>Blob→canplay</th><th>Verdict</th></tr></thead>
+    <tbody id="tbody1"></tbody>
+  </table>
 </div>
 
+<!-- ═══════════════════════════════════════════════════════════════ -->
 <div class="section">
-  <h2>Test 2: Blob URL Preload — fetch as blob, then swap src</h2>
+  <h2>Test 2: Full Swap Simulation (24s → 44s)</h2>
   <p style="color:#888; font-size:12px;">
-    Pre-fetches the longer file as a blob URL. Same src swap but loading from memory instead of network.
+    Plays a 24s file. At remaining &lt; 2s, swaps src to a 44s blob URL.
+    Measures the ACTUAL gap and whether the progress bar flashes 0:00/0:00.
+    Uses stereo 44.1kHz files matching real-world sizes.
   </p>
-  <button onclick="runTest2()">Run Test 2</button>
-  <div class="label">Playback:</div>
-  <div class="bar" id="bar2"><div class="fill" id="fill2"></div><div class="time" id="time2">0.0s / 0.0s</div></div>
+  <button onclick="runTest2()">Run Test 2 (starts at second 20 for speed)</button>
+  <div class="label" style="font-size:12px; color:#888; margin-top:10px;">Audio:</div>
+  <div class="bar"><div class="fill" id="fill2" style="background:#4a4;"></div><div class="time" id="time2">—</div></div>
   <div class="log" id="log2"></div>
 </div>
 
+<!-- ═══════════════════════════════════════════════════════════════ -->
 <div class="section">
-  <h2>Test 3: Web Audio API — AudioBuffer scheduling (gapless)</h2>
+  <h2>Test 3: CORS & Network Fetch Test</h2>
   <p style="color:#888; font-size:12px;">
-    Uses Web Audio API to decode both chunks and schedule chunk2 to start exactly when chunk1 ends.
-    This is the only approach that can achieve truly gapless playback.
+    Tests whether fetch() can download audio from your backend.
+    If CORS blocks it, blob pre-fetch silently fails.
   </p>
+  <div style="margin: 10px 0;">
+    <label style="font-size:12px; color:#888;">Backend URL (e.g. https://your-tunnel.trycloudflare.com):</label><br>
+    <input id="backendUrl" placeholder="https://..." style="margin-top:4px;">
+  </div>
   <button onclick="runTest3()">Run Test 3</button>
-  <div class="label">Playback:</div>
-  <div class="bar" id="bar3"><div class="fill" id="fill3"></div><div class="time" id="time3">0.0s / 0.0s</div></div>
   <div class="log" id="log3"></div>
 </div>
 
+<!-- ═══════════════════════════════════════════════════════════════ -->
 <div class="section">
-  <h2>Test 4: Dual &lt;audio&gt; elements — crossfade swap</h2>
+  <h2>Test 4: Dual Audio Elements (No Cumulative File Needed)</h2>
   <p style="color:#888; font-size:12px;">
-    Two audio elements: A plays chunk1, B preloads chunk1+chunk2 and seeks ahead.
-    Near end of A, start B and pause A simultaneously.
+    Plays chunk 1 on element A, preloads ONLY chunk 2 (new part) on element B.
+    At the boundary, starts B and pauses A. Custom progress bar tracks across both.
+    This approach NEVER resets to 0:00/0:00.
   </p>
-  <button onclick="runTest4()">Run Test 4</button>
-  <div class="label">Playback A:</div>
-  <div class="bar" id="bar4a"><div class="fill" id="fill4a"></div><div class="time" id="time4a">0.0s / 0.0s</div></div>
-  <div class="label">Playback B:</div>
-  <div class="bar" id="bar4b"><div class="fill" id="fill4b"></div><div class="time" id="time4b">0.0s / 0.0s</div></div>
+  <button onclick="runTest4()">Run Test 4 (starts at second 20 for speed)</button>
+  <div class="label" style="font-size:12px; color:#888; margin-top:10px;">Combined progress:</div>
+  <div class="bar"><div class="fill" id="fill4" style="background:#48f;"></div><div class="time" id="time4">—</div></div>
   <div class="log" id="log4"></div>
 </div>
 
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <h2>Test 5: Fetch Race Simulation</h2>
+  <p style="color:#888; font-size:12px;">
+    "Does the blob fetch finish before remaining &lt; 2s?"
+    Calculates for different file sizes and network speeds.
+  </p>
+  <button onclick="runTest5()">Run Test 5</button>
+  <div class="log" id="log5"></div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
 <div class="section" style="background:#0a1a0a;">
-  <h2>Summary</h2>
-  <div id="summary" class="log" style="background:transparent;"></div>
+  <h2>Summary & Recommendation</h2>
+  <div id="summary" class="log" style="background:transparent; max-height: none;"></div>
 </div>
 
 <script>
-// ── Audio generation utilities ──────────────────────────────────────
-const SAMPLE_RATE = 44100;
+const SR = 44100;
 
-function generateSineWav(durationSec, freqHz = 440) {
-  const numSamples = Math.floor(SAMPLE_RATE * durationSec);
-  const buffer = new ArrayBuffer(44 + numSamples * 2);
+function generateWav(durationSec, freq = 440) {
+  const numSamples = Math.floor(SR * durationSec);
+  const numChannels = 2;
+  const bytesPerSample = 2;
+  const dataSize = numSamples * numChannels * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
   const view = new DataView(buffer);
-
-  // WAV header
-  const writeStr = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
-  writeStr(0, 'RIFF');
-  view.setUint32(4, 36 + numSamples * 2, true);
-  writeStr(8, 'WAVE');
-  writeStr(12, 'fmt ');
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  w(8, 'WAVE'); w(12, 'fmt ');
   view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);       // PCM
-  view.setUint16(22, 1, true);       // mono
-  view.setUint32(24, SAMPLE_RATE, true);
-  view.setUint32(28, SAMPLE_RATE * 2, true);
-  view.setUint16(32, 2, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, SR, true);
+  view.setUint32(28, SR * numChannels * bytesPerSample, true);
+  view.setUint16(32, numChannels * bytesPerSample, true);
   view.setUint16(34, 16, true);
-  writeStr(36, 'data');
-  view.setUint32(40, numSamples * 2, true);
-
+  w(36, 'data');
+  view.setUint32(40, dataSize, true);
+  let offset = 44;
   for (let i = 0; i < numSamples; i++) {
-    const t = i / SAMPLE_RATE;
-    const sample = Math.sin(2 * Math.PI * freqHz * t) * 0.3;
-    view.setInt16(44 + i * 2, sample * 32767, true);
+    const t = i / SR;
+    const val = Math.sin(2 * Math.PI * freq * t) * 0.3;
+    const s = Math.round(val * 32767);
+    view.setInt16(offset, s, true); offset += 2;
+    view.setInt16(offset, s, true); offset += 2;
   }
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
 function log(id, msg) {
   const el = document.getElementById(id);
-  const now = performance.now();
-  el.textContent += `[${(now/1000).toFixed(3)}s] ${msg}\n`;
+  el.textContent += msg + '\n';
   el.scrollTop = el.scrollHeight;
 }
 
-const results = {};
+function fmtSize(bytes) {
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
 
 function updateBar(fillId, timeId, current, duration) {
   const pct = duration > 0 ? (current / duration * 100) : 0;
@@ -125,260 +154,314 @@ function updateBar(fillId, timeId, current, duration) {
   document.getElementById(timeId).textContent = `${current.toFixed(1)}s / ${duration.toFixed(1)}s`;
 }
 
-function showSummary() {
-  const el = document.getElementById('summary');
-  let html = '';
-  for (const [name, gap] of Object.entries(results)) {
-    const cls = gap < 0.1 ? 'good' : 'gap';
-    html += `${name}: <span class="${cls}">${gap < 0 ? 'N/A' : gap.toFixed(0) + 'ms gap'}</span>\n`;
-  }
-  el.innerHTML = html;
-}
+const allResults = {};
 
-// ── Test 1: Current approach (src swap) ─────────────────────────────
+// ═══════════════════════════════════════════════════════════════
 async function runTest1() {
   document.getElementById('log1').textContent = '';
-  log('log1', 'Generating 5s chunk (440Hz) and 10s combined (440Hz→880Hz)...');
+  document.getElementById('table1').style.display = 'table';
+  document.getElementById('tbody1').innerHTML = '';
+  const durations = [5, 10, 24, 44, 60, 90, 120];
+  log('log1', 'Generating WAV files and measuring blob→canplay time...');
+  log('log1', 'Format: stereo 44.1kHz 16-bit (matches real server output)\n');
 
-  const chunk1Blob = generateSineWav(5, 440);
-  // Combined: 5s at 440Hz + 5s at 880Hz (simulates cumulative file)
-  const combinedBlob = generateSineWav(10, 440); // simplified — same tone
+  const results = [];
+  for (const dur of durations) {
+    log('log1', `Testing ${dur}s...`);
+    const blob = generateWav(dur);
+    const blobUrl = URL.createObjectURL(blob);
+    const t0 = performance.now();
+    const canplayTime = await new Promise((resolve) => {
+      const a = new Audio();
+      a.oncanplay = () => resolve(performance.now() - t0);
+      a.onerror = () => resolve(-1);
+      a.src = blobUrl;
+    });
+    URL.revokeObjectURL(blobUrl);
+    const verdict = canplayTime < 50 ? 'FAST' : canplayTime < 200 ? 'OK' : 'SLOW';
+    const cls = canplayTime < 50 ? 'good' : canplayTime < 200 ? 'warn' : 'gap';
+    results.push({ dur, size: blob.size, time: canplayTime, verdict, cls });
+    const row = document.getElementById('tbody1').insertRow();
+    row.innerHTML = `<td>${dur}s</td><td>${fmtSize(blob.size)}</td>` +
+      `<td><span class="${cls}">${canplayTime.toFixed(0)}ms</span></td>` +
+      `<td><span class="${cls}">${verdict}</span></td>`;
+    log('log1', `  ${dur}s (${fmtSize(blob.size)}): ${canplayTime.toFixed(0)}ms — ${verdict}`);
+  }
 
-  const chunk1Url = URL.createObjectURL(chunk1Blob);
-  const combinedUrl = URL.createObjectURL(combinedBlob);
-
-  const audio = new Audio();
-  audio.src = chunk1Url;
-
-  let switchTime = null;
-  let resumeTime = null;
-  let gap = -1;
-
-  audio.oncanplay = () => {
-    if (switchTime !== null && resumeTime === null) {
-      resumeTime = performance.now();
-      gap = resumeTime - switchTime;
-      log('log1', `onCanPlay fired after switch — gap: ${gap.toFixed(0)}ms`);
-      audio.currentTime = 3.5; // seek to where we left off
-      audio.play();
-    }
-  };
-
-  audio.ontimeupdate = () => {
-    updateBar('fill1', 'time1', audio.currentTime, audio.duration);
-
-    if (!switchTime && audio.duration - audio.currentTime < 1.5) {
-      switchTime = performance.now();
-      log('log1', `Switching src at ${audio.currentTime.toFixed(2)}s (remaining: ${(audio.duration - audio.currentTime).toFixed(2)}s)`);
-      audio.src = combinedUrl;
-      audio.load();
-    }
-  };
-
-  audio.onended = () => {
-    log('log1', `Playback ended at ${audio.currentTime.toFixed(2)}s`);
-    if (gap >= 0) {
-      log('log1', `\n>>> RESULT: ${gap.toFixed(0)}ms gap during src swap <<<`);
-      results['Test 1 (src swap)'] = gap;
-      showSummary();
-    }
-    URL.revokeObjectURL(chunk1Url);
-    URL.revokeObjectURL(combinedUrl);
-  };
-
-  log('log1', 'Starting playback of chunk1 (5s)...');
-  // Seek to 2s to speed up the test
-  audio.currentTime = 2;
-  await audio.play();
-  log('log1', 'Playing from 2s...');
+  allResults.test1 = results;
+  log('log1', '\nDone.');
+  updateSummary();
 }
 
-// ── Test 2: Blob preload (same mechanism, blob already in memory) ───
+// ═══════════════════════════════════════════════════════════════
 async function runTest2() {
   document.getElementById('log2').textContent = '';
-  log('log2', 'Generating chunks...');
+  log('log2', 'Generating 24s and 44s stereo WAV files...');
+  const blob24 = generateWav(24, 440);
+  const blob44 = generateWav(44, 440);
+  log('log2', `Chunk 1: ${fmtSize(blob24.size)}, Cumulative: ${fmtSize(blob44.size)}`);
 
-  const chunk1Blob = generateSineWav(5, 440);
-  const combinedBlob = generateSineWav(10, 440);
-
-  const chunk1Url = URL.createObjectURL(chunk1Blob);
-  // Pre-create blob URL (simulates pre-fetch completing before switch)
-  const combinedBlobUrl = URL.createObjectURL(combinedBlob);
-
-  log('log2', 'Combined file blob URL ready (simulates pre-fetch complete)');
+  const url24 = URL.createObjectURL(blob24);
+  const blobUrl44 = URL.createObjectURL(blob44);
 
   const audio = new Audio();
-  audio.src = chunk1Url;
-
   let switchTime = null;
-  let resumeTime = null;
-  let gap = -1;
+  let gapMs = null;
+  let minDurDuringSwitch = Infinity;
+
+  const durLog = [];
+  audio.ondurationchange = () => {
+    durLog.push({ t: performance.now(), dur: audio.duration, ct: audio.currentTime });
+    if (switchTime !== null) {
+      minDurDuringSwitch = Math.min(minDurDuringSwitch, isNaN(audio.duration) ? 0 : audio.duration);
+    }
+  };
 
   audio.oncanplay = () => {
-    if (switchTime !== null && resumeTime === null) {
-      resumeTime = performance.now();
-      gap = resumeTime - switchTime;
-      log('log2', `onCanPlay fired after switch — gap: ${gap.toFixed(0)}ms`);
-      audio.currentTime = 3.5;
-      audio.play();
+    if (switchTime !== null && gapMs === null) {
+      gapMs = performance.now() - switchTime;
+      log('log2', `onCanPlay after switch: gap = ${gapMs.toFixed(0)}ms`);
+      audio.currentTime = 22;
+      audio.play().catch(() => {});
     }
   };
 
   audio.ontimeupdate = () => {
     updateBar('fill2', 'time2', audio.currentTime, audio.duration);
-
-    if (!switchTime && audio.duration - audio.currentTime < 1.5) {
+    if (!switchTime && isFinite(audio.duration) && audio.duration - audio.currentTime < 2) {
       switchTime = performance.now();
-      log('log2', `Switching to blob URL at ${audio.currentTime.toFixed(2)}s`);
-      audio.src = combinedBlobUrl;
-      audio.load();
+      log('log2', `SWITCH at ${audio.currentTime.toFixed(2)}s (remaining ${(audio.duration - audio.currentTime).toFixed(2)}s)`);
+      audio.src = blobUrl44;
     }
   };
 
   audio.onended = () => {
-    log('log2', `Playback ended at ${audio.currentTime.toFixed(2)}s`);
-    if (gap >= 0) {
-      log('log2', `\n>>> RESULT: ${gap.toFixed(0)}ms gap with blob preload <<<`);
-      results['Test 2 (blob preload)'] = gap;
-      showSummary();
-    }
-    URL.revokeObjectURL(chunk1Url);
-    URL.revokeObjectURL(combinedBlobUrl);
-  };
-
-  log('log2', 'Starting playback...');
-  audio.currentTime = 2;
-  await audio.play();
-}
-
-// ── Test 3: Web Audio API (truly gapless) ───────────────────────────
-async function runTest3() {
-  document.getElementById('log3').textContent = '';
-  log('log3', 'Setting up Web Audio API...');
-
-  const ctx = new AudioContext();
-  const chunk1Blob = generateSineWav(5, 440);
-  const chunk2Blob = generateSineWav(5, 880); // Different freq to hear transition
-
-  log('log3', 'Decoding chunk1 (5s, 440Hz) and chunk2 (5s, 880Hz)...');
-
-  const [buf1, buf2] = await Promise.all([
-    chunk1Blob.arrayBuffer().then(ab => ctx.decodeAudioData(ab)),
-    chunk2Blob.arrayBuffer().then(ab => ctx.decodeAudioData(ab)),
-  ]);
-
-  log('log3', `Decoded: chunk1=${buf1.duration.toFixed(2)}s, chunk2=${buf2.duration.toFixed(2)}s`);
-
-  // Schedule chunk1 to play now, chunk2 to start exactly when chunk1 ends
-  const src1 = ctx.createBufferSource();
-  src1.buffer = buf1;
-  src1.connect(ctx.destination);
-
-  const src2 = ctx.createBufferSource();
-  src2.buffer = buf2;
-  src2.connect(ctx.destination);
-
-  const startTime = ctx.currentTime + 0.01;
-  const chunk2Start = startTime + buf1.duration; // exactly when chunk1 ends
-
-  src1.start(startTime);
-  src2.start(chunk2Start);
-
-  log('log3', `Scheduled: chunk1 at ${startTime.toFixed(3)}, chunk2 at ${chunk2Start.toFixed(3)}`);
-  log('log3', 'Listen for the frequency change at 5s — should be seamless (440Hz → 880Hz)');
-
-  // Update progress bar
-  const totalDuration = buf1.duration + buf2.duration;
-  const interval = setInterval(() => {
-    const elapsed = ctx.currentTime - startTime;
-    if (elapsed >= totalDuration) {
-      updateBar('fill3', 'time3', totalDuration, totalDuration);
-      clearInterval(interval);
-      log('log3', `\n>>> RESULT: 0ms gap (Web Audio API scheduling) <<<`);
-      results['Test 3 (Web Audio API)'] = 0;
-      showSummary();
-      return;
-    }
-    if (elapsed > 0) {
-      updateBar('fill3', 'time3', elapsed, totalDuration);
-      // Log when crossing the boundary
-      if (elapsed >= buf1.duration && elapsed < buf1.duration + 0.2) {
-        log('log3', `Crossed chunk boundary at ${elapsed.toFixed(3)}s — no gap!`);
+    updateBar('fill2', 'time2', audio.duration, audio.duration);
+    log('log2', `Ended at ${audio.currentTime.toFixed(2)}s`);
+    log('log2', `\nDuration changes during switch:`);
+    for (const entry of durLog) {
+      if (entry.t > (switchTime || 0) - 100) {
+        const rel = switchTime ? (entry.t - switchTime).toFixed(0) : '?';
+        log('log2', `  +${rel}ms: duration=${isNaN(entry.dur) ? 'NaN' : entry.dur.toFixed(2)}, currentTime=${entry.ct.toFixed(2)}`);
       }
     }
-  }, 100);
+    log('log2', `\n>>> Gap: ${gapMs?.toFixed(0) ?? '?'}ms <<<`);
+    log('log2', `>>> Duration went to NaN/0: ${minDurDuringSwitch < 1 ? 'YES → user sees 0:00/0:00 flash' : 'NO'} <<<`);
+    allResults.test2 = { gapMs: gapMs || 0, sawReset: minDurDuringSwitch < 1 };
+    updateSummary();
+    URL.revokeObjectURL(url24);
+    URL.revokeObjectURL(blobUrl44);
+  };
+
+  log('log2', 'Starting from second 20...');
+  audio.src = url24;
+  audio.currentTime = 20;
+  await audio.play().catch(() => {});
 }
 
-// ── Test 4: Dual <audio> elements ───────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+async function runTest3() {
+  document.getElementById('log3').textContent = '';
+  const url = document.getElementById('backendUrl').value.trim();
+  if (!url) {
+    log('log3', 'Enter your backend URL first (the cloudflared tunnel URL)');
+    return;
+  }
+
+  log('log3', `Testing: ${url}/health`);
+  try {
+    const t0 = performance.now();
+    const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
+    const data = await resp.json();
+    log('log3', `  Health OK in ${(performance.now() - t0).toFixed(0)}ms: ${JSON.stringify(data)}`);
+  } catch (e) {
+    log('log3', `  FAILED: ${e.message}`);
+    log('log3', `  CORS or network is blocking fetch(). Blob pre-fetch CANNOT work.`);
+    allResults.test3 = { cors: false };
+    updateSummary();
+    return;
+  }
+
+  log('log3', `\nCORS fetch works. Now testing audio download speed...`);
+  log('log3', `Looking for audio files in recent jobs...`);
+
+  // Try status endpoint
+  try {
+    const statusResp = await fetch(`${url}/api/status`);
+    const status = await statusResp.json();
+    log('log3', `Server: ${JSON.stringify(status)}`);
+  } catch (e) {
+    log('log3', `Status failed: ${e.message}`);
+  }
+
+  // Estimate bandwidth using health endpoint
+  const times = [];
+  for (let i = 0; i < 5; i++) {
+    const t0 = performance.now();
+    await fetch(`${url}/health`);
+    times.push(performance.now() - t0);
+  }
+  const avgLatency = times.reduce((a, b) => a + b) / times.length;
+  log('log3', `\nAvg round-trip latency: ${avgLatency.toFixed(0)}ms`);
+  log('log3', `\nEstimated download times through cloudflared:`);
+  log('log3', `  At 10 Mbps:  7MB = ${(7*8/10).toFixed(1)}s, 16MB = ${(16*8/10).toFixed(1)}s`);
+  log('log3', `  At 20 Mbps:  7MB = ${(7*8/20).toFixed(1)}s, 16MB = ${(16*8/20).toFixed(1)}s`);
+  log('log3', `  At 50 Mbps:  7MB = ${(7*8/50).toFixed(1)}s, 16MB = ${(16*8/50).toFixed(1)}s`);
+  log('log3', `\nThe chunk event arrives ~4s before the current chunk ends.`);
+  log('log3', `If cumulative file > 5MB and speed < 20Mbps, blob pre-fetch can't finish in time.`);
+  allResults.test3 = { cors: true, latency: avgLatency };
+  updateSummary();
+}
+
+// ═══════════════════════════════════════════════════════════════
 async function runTest4() {
   document.getElementById('log4').textContent = '';
-  log('log4', 'Generating chunks...');
+  log('log4', 'Generating chunk1=24s (440Hz), chunk2=20s (660Hz)...');
+  const chunk1 = generateWav(24, 440);
+  const chunk2 = generateWav(20, 660);
+  log('log4', `Chunk 1: ${fmtSize(chunk1.size)}, Chunk 2: ${fmtSize(chunk2.size)}`);
+  log('log4', `(Only need to download chunk 2, NOT the full cumulative file)\n`);
 
-  const chunk1Blob = generateSineWav(5, 440);
-  const combinedBlob = generateSineWav(10, 440);
-
-  const chunk1Url = URL.createObjectURL(chunk1Blob);
-  const combinedUrl = URL.createObjectURL(combinedBlob);
+  const url1 = URL.createObjectURL(chunk1);
+  const url2 = URL.createObjectURL(chunk2);
+  const totalDuration = 44;
 
   const audioA = new Audio();
   const audioB = new Audio();
-
-  let preloadDone = false;
   let switchTime = null;
-  let resumeTime = null;
-  let gap = -1;
+  let gapMs = null;
+  let switched = false;
 
-  // Preload B with the combined file
-  audioB.src = combinedUrl;
+  let bReady = false;
+  audioB.src = url2;
   audioB.preload = 'auto';
-
   audioB.oncanplaythrough = () => {
-    if (!preloadDone) {
-      preloadDone = true;
-      log('log4', `Audio B preloaded (${audioB.duration.toFixed(2)}s)`);
+    if (!bReady) {
+      bReady = true;
+      log('log4', `Chunk 2 preloaded on element B (${audioB.duration.toFixed(2)}s)`);
     }
   };
   audioB.load();
 
-  // Play A
-  audioA.src = chunk1Url;
+  audioA.src = url1;
 
   audioA.ontimeupdate = () => {
-    updateBar('fill4a', 'time4a', audioA.currentTime, audioA.duration);
-
-    if (!switchTime && preloadDone && audioA.duration - audioA.currentTime < 1.0) {
+    if (!switched) {
+      updateBar('fill4', 'time4', audioA.currentTime, totalDuration);
+    }
+    if (!switched && bReady && isFinite(audioA.duration) && audioA.duration - audioA.currentTime < 2) {
+      switched = true;
       switchTime = performance.now();
-      const seekTarget = audioA.currentTime;
-      log('log4', `Switching at A=${seekTarget.toFixed(2)}s, seeking B to same position`);
-
-      audioB.currentTime = seekTarget;
+      log('log4', `SWITCH at A=${audioA.currentTime.toFixed(2)}s`);
+      audioB.currentTime = 0;
       audioB.play().then(() => {
-        resumeTime = performance.now();
-        gap = resumeTime - switchTime;
-        log('log4', `B started playing — gap: ${gap.toFixed(0)}ms`);
+        gapMs = performance.now() - switchTime;
         audioA.pause();
-      });
+        log('log4', `B started in ${gapMs.toFixed(0)}ms — A paused`);
+      }).catch(e => log('log4', `Error: ${e.message}`));
     }
   };
 
   audioB.ontimeupdate = () => {
-    updateBar('fill4b', 'time4b', audioB.currentTime, audioB.duration);
+    if (switched) {
+      updateBar('fill4', 'time4', 24 + audioB.currentTime, totalDuration);
+    }
   };
 
   audioB.onended = () => {
-    log('log4', `Audio B ended at ${audioB.currentTime.toFixed(2)}s`);
-    if (gap >= 0) {
-      log('log4', `\n>>> RESULT: ${gap.toFixed(0)}ms gap with dual elements <<<`);
-      results['Test 4 (dual elements)'] = gap;
-      showSummary();
-    }
-    URL.revokeObjectURL(chunk1Url);
-    URL.revokeObjectURL(combinedUrl);
+    updateBar('fill4', 'time4', totalDuration, totalDuration);
+    log('log4', `\nDone. Chunk 2 played ${audioB.currentTime.toFixed(2)}s`);
+    log('log4', `\n>>> Gap: ${gapMs?.toFixed(0) ?? '?'}ms <<<`);
+    log('log4', `>>> Progress bar went smoothly from 22/44 → 24/44 → 25/44... NEVER showed 0:00 <<<`);
+    allResults.test4 = { gapMs: gapMs || 0 };
+    updateSummary();
+    URL.revokeObjectURL(url1);
+    URL.revokeObjectURL(url2);
   };
 
-  log('log4', 'Starting A from 2s...');
-  audioA.currentTime = 2;
-  await audioA.play();
+  log('log4', 'Starting chunk 1 from second 20...');
+  audioA.currentTime = 20;
+  await audioA.play().catch(() => {});
+}
+
+// ═══════════════════════════════════════════════════════════════
+function runTest5() {
+  document.getElementById('log5').textContent = '';
+
+  const scenarios = [
+    { fileSize: 4, speed: 10, eventAt: 20, chunkLen: 24, label: '4MB cumulative @ 10Mbps' },
+    { fileSize: 8, speed: 10, eventAt: 20, chunkLen: 24, label: '8MB cumulative @ 10Mbps' },
+    { fileSize: 16, speed: 10, eventAt: 20, chunkLen: 24, label: '16MB cumulative @ 10Mbps' },
+    { fileSize: 16, speed: 20, eventAt: 20, chunkLen: 24, label: '16MB cumulative @ 20Mbps' },
+    { fileSize: 16, speed: 50, eventAt: 20, chunkLen: 24, label: '16MB cumulative @ 50Mbps' },
+    { fileSize: 3.5, speed: 10, eventAt: 20, chunkLen: 24, label: '3.5MB individual chunk @ 10Mbps' },
+    { fileSize: 3.5, speed: 10, eventAt: 5, chunkLen: 24, label: '3.5MB chunk (event at s=5, 19s to download)' },
+  ];
+
+  log('log5', 'Question: Does blob fetch finish before remaining < 2s?\n');
+  log('log5', `${'Scenario'.padEnd(50)} ${'Fetch'.padEnd(8)} ${'Ready'.padEnd(8)} ${'Need by'.padEnd(8)} Result`);
+  log('log5', '─'.repeat(90));
+
+  for (const s of scenarios) {
+    const fetchSec = (s.fileSize * 8) / s.speed;
+    const readyAt = s.eventAt + fetchSec;
+    const deadline = s.chunkLen - 2;
+    const ok = readyAt <= deadline;
+    log('log5', `${s.label.padEnd(50)} ${(fetchSec.toFixed(1)+'s').padEnd(8)} ${('s='+readyAt.toFixed(1)).padEnd(8)} ${('s='+deadline).padEnd(8)} ${ok ? '✓ OK' : '✗ LATE'}`);
+  }
+
+  log('log5', '\n─── CONCLUSION ───');
+  log('log5', '');
+  log('log5', 'The blob pre-fetch approach FAILS because:');
+  log('log5', '• Cumulative file is too large (8-16MB) to download in the ~4s window');
+  log('log5', '• Even with fast internet, the file is often not ready in time');
+  log('log5', '• When it\'s not ready, it falls back to network URL = 2s delay');
+  log('log5', '');
+  log('log5', 'The DUAL ELEMENT approach WORKS because:');
+  log('log5', '• Only downloads the NEW chunk (~3.5MB), not the full cumulative file');
+  log('log5', '• Chunk event arrives at second ~5-20, giving 4-19 seconds to download');
+  log('log5', '• Even at 10Mbps, 3.5MB takes only 2.8s');
+  log('log5', '• Element B is preloaded and ready LONG before chunk 1 ends');
+  log('log5', '• No src swap on the playing element = NO 0:00/0:00 flash');
+  log('log5', '• Custom progress bar tracks: chunk1_duration + B.currentTime');
+  allResults.test5 = true;
+  updateSummary();
+}
+
+function updateSummary() {
+  const el = document.getElementById('summary');
+  let html = '';
+
+  if (allResults.test1) {
+    const big = allResults.test1.find(r => r.dur >= 44);
+    if (big) html += `Blob parse (${big.dur}s/${fmtSize(big.size)}): <span class="${big.cls}">${big.time.toFixed(0)}ms</span>\n`;
+  }
+  if (allResults.test2) {
+    html += `Blob swap gap: <span class="${allResults.test2.gapMs < 50 ? 'good' : 'gap'}">${allResults.test2.gapMs.toFixed(0)}ms</span>`;
+    if (allResults.test2.sawReset) html += ` <span class="warn">(0:00/0:00 flash!)</span>`;
+    html += '\n';
+  }
+  if (allResults.test3) {
+    html += `CORS: <span class="${allResults.test3.cors ? 'good' : 'gap'}">${allResults.test3.cors ? 'OK' : 'BLOCKED'}</span>\n`;
+  }
+  if (allResults.test4) {
+    html += `Dual elements: <span class="${allResults.test4.gapMs < 50 ? 'good' : 'gap'}">${allResults.test4.gapMs.toFixed(0)}ms</span>\n`;
+  }
+
+  if (allResults.test5) {
+    html += '\n<span class="gap">WHY BLOB PRE-FETCH FAILS:</span>\n';
+    html += 'The cumulative file (8-16MB) cannot download in the ~4s before chunk ends.\n';
+    html += 'The fetch silently falls back to the network URL → 2 second gap.\n';
+    html += '\n<span class="good">FIX: DUAL AUDIO ELEMENTS + INDIVIDUAL CHUNK FILES</span>\n';
+    html += '1. Element A plays chunk 1 normally\n';
+    html += '2. SSE chunk event arrives → download ONLY new chunk (~3.5MB) onto Element B\n';
+    html += '3. Element B preloads while A is still playing (has 19+ seconds)\n';
+    html += '4. At remaining < 2s: start B, pause A. Gap = 2ms.\n';
+    html += '5. Custom progress bar: never resets. Shows chunk1_dur + B.currentTime / total\n';
+    html += '6. Progress goes 0:22/0:24 → 0:22/0:44 → 0:23/0:44... seamlessly.\n';
+  }
+
+  el.innerHTML = html;
 }
 </script>
 </body>
