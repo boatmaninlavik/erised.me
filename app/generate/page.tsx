@@ -64,6 +64,7 @@ function streamJob(
   es.addEventListener("chunk", (e) => {
     sseWorking = true;
     const data = JSON.parse(e.data);
+    console.log(`[SSE chunk] version=${data.version} audio_file=${data.audio_file} chunk_files=${JSON.stringify(data.chunk_files)} time=${new Date().toISOString()}`);
     onUpdate({
       status: "running",
       partialAudio: data.audio_file,
@@ -212,14 +213,18 @@ function SongCard({
     if (partialVersion <= loadedVersionRef.current) return;
     loadedVersionRef.current = partialVersion;
 
+    console.log(`[SongCard] useEffect fired: version=${partialVersion} hasAudio=${hasAudio} chunkFiles=${JSON.stringify(chunkFiles)}`);
+
     // First chunk: play cumulative file on element A
     if (!hasAudio) {
+      console.log(`[SongCard] Loading FIRST chunk (cumulative): ${partialAudio}`);
       const url = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
       const el = audioRefA.current;
       if (!el) return;
       const onReady = () => {
         el.removeEventListener("canplay", onReady);
         if (!isFinite(el.duration)) return;
+        console.log(`[SongCard] First chunk ready: duration=${el.duration.toFixed(2)}s`);
         chunksRef.current = [{ duration: el.duration, startOffset: 0 }];
         activeIndexRef.current = 0;
         loadedChunksRef.current = 1;
@@ -238,14 +243,27 @@ function SongCard({
     const newChunkFile = chunkFiles && chunkFiles.length > 0
       ? chunkFiles[chunkFiles.length - 1]
       : null;
-    if (!newChunkFile) return;
+    console.log(`[SongCard] Subsequent chunk: newChunkFile=${newChunkFile} loadedChunks=${loadedChunksRef.current}`);
+    if (!newChunkFile) {
+      console.warn(`[SongCard] No chunk file found! chunkFiles=${JSON.stringify(chunkFiles)}`);
+      return;
+    }
 
     const chunkUrl = `${backendUrl}/audio/${newChunkFile}`;
     const nextIdx = loadedChunksRef.current;
+    const fetchStart = performance.now();
+    const activeEl = getEl(activeIndexRef.current);
+    const playPos = activeEl && isFinite(activeEl.currentTime) ? activeEl.currentTime : -1;
+    const playDur = activeEl && isFinite(activeEl.duration) ? activeEl.duration : -1;
+    console.log(`[SongCard] Fetching chunk: ${newChunkFile} (playback at ${playPos.toFixed(1)}s / ${playDur.toFixed(1)}s, ${(playDur - playPos).toFixed(1)}s remaining)`);
 
     fetch(chunkUrl)
-      .then((r) => r.blob())
+      .then((r) => {
+        console.log(`[SongCard] Fetch response: status=${r.status} in ${(performance.now() - fetchStart).toFixed(0)}ms`);
+        return r.blob();
+      })
       .then((blob) => {
+        console.log(`[SongCard] Blob ready: ${blob.size} bytes in ${(performance.now() - fetchStart).toFixed(0)}ms`);
         const blobUrl = URL.createObjectURL(blob);
         blobUrlsRef.current.push(blobUrl);
         const el = getEl(nextIdx);
@@ -256,14 +274,18 @@ function SongCard({
           const prevTotal = chunksRef.current.reduce((s, c) => s + c.duration, 0);
           chunksRef.current.push({ duration: el.duration, startOffset: prevTotal });
           loadedChunksRef.current = nextIdx + 1;
+          const newTotal = prevTotal + el.duration;
+          console.log(`[SongCard] Chunk ${nextIdx} loaded: duration=${el.duration.toFixed(2)}s, totalDuration now ${newTotal.toFixed(2)}s (took ${(performance.now() - fetchStart).toFixed(0)}ms total)`);
           // Duration extends NOW — progress bar grows before current chunk ends
-          setTotalDuration(prevTotal + el.duration);
+          setTotalDuration(newTotal);
         };
         el.addEventListener("canplaythrough", onReady);
         el.src = blobUrl;
         el.load();
       })
-      .catch(() => {});
+      .catch((err) => {
+        console.error(`[SongCard] Fetch FAILED for ${newChunkFile}:`, err);
+      });
   }, [partialAudio, partialVersion, chunkFiles, result, backendUrl, hasAudio, getEl]);
 
   // Playback timer + chunk transition
@@ -279,13 +301,17 @@ function SongCard({
       const remaining = el.duration - el.currentTime;
       const nextIdx = idx + 1;
       if (nextIdx < loadedChunksRef.current && isFinite(remaining) && remaining < 0.5) {
+        console.log(`[SongCard] SWITCHING to chunk ${nextIdx} (remaining=${remaining.toFixed(3)}s on chunk ${idx})`);
         const nextEl = getEl(nextIdx);
         if (nextEl) {
           nextEl.currentTime = 0;
           nextEl.play().then(() => {
             el.pause();
             activeIndexRef.current = nextIdx;
-          }).catch(() => {});
+            console.log(`[SongCard] Switch complete: now playing chunk ${nextIdx}`);
+          }).catch((err) => {
+            console.error(`[SongCard] Switch FAILED:`, err);
+          });
         }
       }
     };
