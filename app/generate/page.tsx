@@ -319,7 +319,8 @@ function SongCard({
     return () => clearInterval(id);
   }, [isPlaying, getEl]);
 
-  // When generation completes, switch to final audio with native controls
+  // When generation completes, pause streaming and show final player
+  const savedPosRef = useRef(0);
   useEffect(() => {
     if (!result) return;
     const idx = activeIndexRef.current;
@@ -329,21 +330,29 @@ function SongCard({
       const chunk = chunksRef.current[idx];
       pos = chunk ? chunk.startOffset + el.currentTime : 0;
     }
+    savedPosRef.current = pos;
     [audioRefA.current, audioRefB.current].forEach((a) => { if (a) a.pause(); });
     setIsPlaying(false);
     setShowFinalPlayer(true);
+  }, [result, getEl]);
 
+  // Once the final player is rendered, load the final audio into it
+  useEffect(() => {
+    if (!showFinalPlayer || !result) return;
     const fin = finalAudioRef.current;
     if (!fin) return;
+    // Avoid reloading if already set
+    if (fin.src && fin.src.includes(result.audio_file)) return;
+    const pos = savedPosRef.current;
     const onReady = () => {
       fin.removeEventListener("canplay", onReady);
-      if (pos > 0 && pos < fin.duration) fin.currentTime = pos;
+      if (pos > 0 && isFinite(fin.duration) && pos < fin.duration) fin.currentTime = pos;
       fin.play().catch(() => {});
     };
     fin.addEventListener("canplay", onReady);
     fin.src = `${backendUrl}/audio/${result.audio_file}`;
     fin.load();
-  }, [result, backendUrl, getEl]);
+  }, [showFinalPlayer, result, backendUrl]);
 
   const togglePlay = useCallback(() => {
     const el = getEl(activeIndexRef.current);
