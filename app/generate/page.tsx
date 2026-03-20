@@ -112,7 +112,6 @@ function streamJob(
         if (data.progress) update.progress = data.progress;
         if (data.partial_audio_file) update.partialAudio = data.partial_audio_file;
         if (data.partial_version != null) update.partialVersion = data.partial_version;
-        if (data.chunk_paths) update.chunkFiles = data.chunk_paths;
         onUpdate(update);
       } catch {
         // retry
@@ -129,21 +128,14 @@ function streamJob(
 const SEAN_EMAIL = "zsean@berkeley.edu";
 
 /**
- * Song player with seamless chunk transitions using Web Audio API.
+ * Song player with seamless chunk transitions using dual audio elements.
  *
- * Each individual chunk WAV is fetched, decoded as an AudioBuffer, and
- * scheduled to play exactly when the previous chunk ends — sample-accurate
- * gapless playback with zero source-swapping.
+ * Two hidden <audio> elements alternate (A plays chunk 0, B preloads chunk 1,
+ * switch at boundary, A preloads chunk 2, etc.). A custom progress bar tracks
+ * combined time so the duration extends (e.g. 0:15/0:24 → 0:15/0:44) as soon
+ * as the next chunk downloads — BEFORE the current chunk ends.
  *
- * totalDuration grows as soon as each chunk is decoded, so the progress bar
- * extends (e.g. 0:15/0:24 → 0:15/0:44) BEFORE the current chunk finishes.
- *
- * If all buffered audio plays out before the next chunk arrives, the
- * AudioContext is suspended (paused) and automatically resumed when new
- * audio is decoded — no gap, no reset to 0:00.
- *
- * After generation completes, switches to native <audio controls> for
- * scrubbing/replay.
+ * After generation, switches to native <audio controls> with the final file.
  */
 function SongCard({
   backendUrl,
@@ -170,20 +162,15 @@ function SongCard({
   saving?: boolean;
   saved?: boolean;
 }) {
-  // Web Audio API refs
-  const ctxRef = useRef<AudioContext | null>(null);
-  const gainRef = useRef<GainNode | null>(null);
-  const nextTimeRef = useRef(0);       // When the next buffer should start (ctx time)
-  const startCtxTimeRef = useRef(0);   // ctx.currentTime when playback first started
-  const totalDurRef = useRef(0);       // Total buffered audio duration
-  const loadedIdxRef = useRef(0);      // How many chunk files we've loaded
-  const startedRef = useRef(false);    // Whether playback has started
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const queueRef = useRef<Promise<void>>(Promise.resolve());
-  const statusRef = useRef(status);
-  statusRef.current = status;
-
+  const audioRefA = useRef<HTMLAudioElement>(null);
+  const audioRefB = useRef<HTMLAudioElement>(null);
   const finalAudioRef = useRef<HTMLAudioElement>(null);
+
+  const chunksRef = useRef<{ duration: number; startOffset: number }[]>([]);
+  const activeIndexRef = useRef(-1);
+  const loadedChunksRef = useRef(0);
+  const loadedVersionRef = useRef(0);
+  const blobUrlsRef = useRef<string[]>([]);
 
   const [totalDuration, setTotalDuration] = useState(0);
   const [displayTime, setDisplayTime] = useState(0);
@@ -191,137 +178,135 @@ function SongCard({
   const [hasAudio, setHasAudio] = useState(false);
   const [showFinalPlayer, setShowFinalPlayer] = useState(false);
 
+  const getEl = useCallback((idx: number) => {
+    return idx % 2 === 0 ? audioRefA.current : audioRefB.current;
+  }, []);
+
   // Reset on new generation
   useEffect(() => {
-    if (status !== "pending") return;
-    if (ctxRef.current) { ctxRef.current.close().catch(() => {}); ctxRef.current = null; }
-    gainRef.current = null;
-    nextTimeRef.current = 0;
-    startCtxTimeRef.current = 0;
-    totalDurRef.current = 0;
-    loadedIdxRef.current = 0;
-    startedRef.current = false;
-    queueRef.current = Promise.resolve();
-    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-    setTotalDuration(0);
-    setDisplayTime(0);
-    setIsPlaying(false);
-    setHasAudio(false);
-    setShowFinalPlayer(false);
-  }, [status]);
-
-  // Cleanup on unmount
-  useEffect(() => () => {
-    if (ctxRef.current) ctxRef.current.close().catch(() => {});
-    if (timerRef.current) clearInterval(timerRef.current);
-  }, []);
-
-  // Start display-time tracking interval
-  const startTimer = useCallback(() => {
-    if (timerRef.current) return;
-    timerRef.current = setInterval(() => {
-      const ctx = ctxRef.current;
-      if (!ctx) return;
-      const elapsed = ctx.currentTime - startCtxTimeRef.current;
-      setDisplayTime(Math.min(elapsed, totalDurRef.current));
-      // Auto-suspend when all buffered audio has played but stream is still going
-      if (
-        elapsed >= totalDurRef.current - 0.05 &&
-        ctx.state === "running" &&
-        statusRef.current === "running"
-      ) {
-        ctx.suspend();
-      }
-    }, 50);
-  }, []);
-
-  // Process new chunk files via Web Audio API — gapless scheduling
-  useEffect(() => {
-    if (result) return;
-
-    // Determine new files to load
-    let filesToLoad: string[] = [];
-
-    if (chunkFiles && chunkFiles.length > loadedIdxRef.current) {
-      filesToLoad = chunkFiles.slice(loadedIdxRef.current);
-      loadedIdxRef.current = chunkFiles.length;
-    } else if (loadedIdxRef.current === 0 && partialAudio && partialVersion > 0) {
-      // Fallback: no individual chunk files, use cumulative file for first chunk
-      filesToLoad = [partialAudio];
-      loadedIdxRef.current = 1;
-    }
-
-    if (filesToLoad.length === 0) return;
-
-    // Init audio context
-    if (!ctxRef.current) {
-      const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      ctxRef.current = new AC();
-      gainRef.current = ctxRef.current.createGain();
-      gainRef.current.connect(ctxRef.current.destination);
-    }
-    const ctx = ctxRef.current;
-    const gain = gainRef.current!;
-
-    // Queue chunk loading sequentially to preserve ordering
-    for (const file of filesToLoad) {
-      queueRef.current = queueRef.current.then(async () => {
-        try {
-          const resp = await fetch(`${backendUrl}/audio/${file}`);
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          const ab = await resp.arrayBuffer();
-          const buf = await ctx.decodeAudioData(ab);
-
-          totalDurRef.current += buf.duration;
-          setTotalDuration(totalDurRef.current);
-          setHasAudio(true);
-
-          // First chunk: kick off playback
-          if (!startedRef.current) {
-            startedRef.current = true;
-            if (ctx.state === "suspended") await ctx.resume();
-            startCtxTimeRef.current = ctx.currentTime;
-            nextTimeRef.current = ctx.currentTime;
-            setIsPlaying(true);
-            startTimer();
-          } else if (ctx.state === "suspended") {
-            // Was auto-suspended due to buffer underrun — resume
-            await ctx.resume();
-            setIsPlaying(true);
-          }
-
-          // Schedule buffer for gapless playback
-          const src = ctx.createBufferSource();
-          src.buffer = buf;
-          src.connect(gain);
-          const t = Math.max(nextTimeRef.current, ctx.currentTime);
-          src.start(t);
-          nextTimeRef.current = t + buf.duration;
-        } catch (err) {
-          console.error("Chunk load/decode error:", err);
-        }
+    if (status === "pending") {
+      chunksRef.current = [];
+      activeIndexRef.current = -1;
+      loadedChunksRef.current = 0;
+      loadedVersionRef.current = 0;
+      setTotalDuration(0);
+      setDisplayTime(0);
+      setIsPlaying(false);
+      setHasAudio(false);
+      setShowFinalPlayer(false);
+      blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      blobUrlsRef.current = [];
+      [audioRefA.current, audioRefB.current].forEach((el) => {
+        if (el) { el.pause(); el.removeAttribute("src"); el.load(); }
       });
     }
-  }, [partialAudio, partialVersion, chunkFiles, result, backendUrl, startTimer]);
+  }, [status]);
 
-  // Switch to final player when generation completes
+  useEffect(() => () => {
+    blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+  }, []);
+
+  // Handle new chunks from SSE
   useEffect(() => {
-    if (!result) return;
+    if (result || !partialAudio || partialVersion <= 0) return;
+    if (partialVersion <= loadedVersionRef.current) return;
+    loadedVersionRef.current = partialVersion;
 
-    // Get current playback position
-    let pos = 0;
-    if (ctxRef.current && startedRef.current) {
-      pos = ctxRef.current.currentTime - startCtxTimeRef.current;
-      pos = Math.min(pos, totalDurRef.current);
+    // First chunk: play cumulative file on element A
+    if (!hasAudio) {
+      const url = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
+      const el = audioRefA.current;
+      if (!el) return;
+      const onReady = () => {
+        el.removeEventListener("canplay", onReady);
+        if (!isFinite(el.duration)) return;
+        chunksRef.current = [{ duration: el.duration, startOffset: 0 }];
+        activeIndexRef.current = 0;
+        loadedChunksRef.current = 1;
+        setTotalDuration(el.duration);
+        setHasAudio(true);
+        el.play().catch(() => {});
+        setIsPlaying(true);
+      };
+      el.addEventListener("canplay", onReady);
+      el.src = url;
+      el.load();
+      return;
     }
 
-    // Tear down Web Audio
-    if (ctxRef.current) { ctxRef.current.close().catch(() => {}); ctxRef.current = null; }
-    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    // Subsequent chunks: download only the NEW individual chunk file
+    const newChunkFile = chunkFiles && chunkFiles.length > 0
+      ? chunkFiles[chunkFiles.length - 1]
+      : null;
+    if (!newChunkFile) return;
+
+    const chunkUrl = `${backendUrl}/audio/${newChunkFile}`;
+    const nextIdx = loadedChunksRef.current;
+
+    fetch(chunkUrl)
+      .then((r) => r.blob())
+      .then((blob) => {
+        const blobUrl = URL.createObjectURL(blob);
+        blobUrlsRef.current.push(blobUrl);
+        const el = getEl(nextIdx);
+        if (!el) return;
+        const onReady = () => {
+          el.removeEventListener("canplaythrough", onReady);
+          if (!isFinite(el.duration)) return;
+          const prevTotal = chunksRef.current.reduce((s, c) => s + c.duration, 0);
+          chunksRef.current.push({ duration: el.duration, startOffset: prevTotal });
+          loadedChunksRef.current = nextIdx + 1;
+          // Duration extends NOW — progress bar grows before current chunk ends
+          setTotalDuration(prevTotal + el.duration);
+        };
+        el.addEventListener("canplaythrough", onReady);
+        el.src = blobUrl;
+        el.load();
+      })
+      .catch(() => {});
+  }, [partialAudio, partialVersion, chunkFiles, result, backendUrl, hasAudio, getEl]);
+
+  // Playback timer + chunk transition
+  useEffect(() => {
+    if (!isPlaying || activeIndexRef.current < 0) return;
+    const tick = () => {
+      const idx = activeIndexRef.current;
+      const el = getEl(idx);
+      if (!el || !isFinite(el.currentTime)) return;
+      const chunk = chunksRef.current[idx];
+      if (chunk) setDisplayTime(chunk.startOffset + el.currentTime);
+
+      const remaining = el.duration - el.currentTime;
+      const nextIdx = idx + 1;
+      if (nextIdx < loadedChunksRef.current && isFinite(remaining) && remaining < 0.5) {
+        const nextEl = getEl(nextIdx);
+        if (nextEl) {
+          nextEl.currentTime = 0;
+          nextEl.play().then(() => {
+            el.pause();
+            activeIndexRef.current = nextIdx;
+          }).catch(() => {});
+        }
+      }
+    };
+    const id = setInterval(tick, 50);
+    return () => clearInterval(id);
+  }, [isPlaying, getEl]);
+
+  // When generation completes, switch to final audio with native controls
+  useEffect(() => {
+    if (!result) return;
+    const idx = activeIndexRef.current;
+    const el = idx >= 0 ? getEl(idx) : null;
+    let pos = 0;
+    if (el && isFinite(el.currentTime) && !el.paused) {
+      const chunk = chunksRef.current[idx];
+      pos = chunk ? chunk.startOffset + el.currentTime : 0;
+    }
+    [audioRefA.current, audioRefB.current].forEach((a) => { if (a) a.pause(); });
     setIsPlaying(false);
     setShowFinalPlayer(true);
 
-    // Load final file with native controls
     const fin = finalAudioRef.current;
     if (!fin) return;
     const onReady = () => {
@@ -332,19 +317,14 @@ function SongCard({
     fin.addEventListener("canplay", onReady);
     fin.src = `${backendUrl}/audio/${result.audio_file}`;
     fin.load();
-  }, [result, backendUrl]);
+  }, [result, backendUrl, getEl]);
 
   const togglePlay = useCallback(() => {
-    const ctx = ctxRef.current;
-    if (!ctx) return;
-    if (ctx.state === "running") {
-      ctx.suspend();
-      setIsPlaying(false);
-    } else {
-      ctx.resume();
-      setIsPlaying(true);
-    }
-  }, []);
+    const el = getEl(activeIndexRef.current);
+    if (!el) return;
+    if (el.paused) { el.play().catch(() => {}); setIsPlaying(true); }
+    else { el.pause(); setIsPlaying(false); }
+  }, [getEl]);
 
   const formatTime = (t: number) => {
     if (!isFinite(t) || t < 0) t = 0;
@@ -388,7 +368,11 @@ function SongCard({
         </div>
       )}
 
-      {/* Custom streaming player — Web Audio API gapless playback */}
+      {/* Hidden audio elements for streaming chunks */}
+      <audio ref={audioRefA} preload="auto" style={{ display: "none" }} />
+      <audio ref={audioRefB} preload="auto" style={{ display: "none" }} />
+
+      {/* Custom streaming player — progress bar extends seamlessly */}
       {hasAudio && !showFinalPlayer && (
         <div className="flex items-center gap-3">
           <button
