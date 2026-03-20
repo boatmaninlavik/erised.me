@@ -114,6 +114,8 @@ class StreamingDecoder:
         total_chunks = len(chunk_starts)
         new_decoded = 0
 
+        import time as _time
+
         for idx in range(self.chunks_decoded, total_chunks):
             sinx = chunk_starts[idx]
 
@@ -131,6 +133,7 @@ class StreamingDecoder:
                 continue
 
             # ── flow matching ──
+            _t_fm_start = _time.perf_counter()
             codes_input = [codes[:, :, sinx : sinx + self.min_samples]]
             if sinx == 0 or self.ovlp_frames == 0:
                 incontext_length = self.first_latent_length
@@ -159,9 +162,11 @@ class StreamingDecoder:
                     num_steps=self.num_steps,
                     disable_progress=True, scenario="other_seg",
                 )
+            _t_fm_end = _time.perf_counter()
             self.latent_list.append(latents)
 
             # ── scalar decode ──
+            _t_scalar_start = _time.perf_counter()
             latent = latents
             if idx == 0:
                 latent = latent[:, self.first_latent_length:, :]
@@ -176,6 +181,7 @@ class StreamingDecoder:
             cur_output = cur_output[:, :self.audio_min_samples].detach().cpu()
             if cur_output.dim() == 3:
                 cur_output = cur_output[0]
+            _t_scalar_end = _time.perf_counter()
             # Normalize if peaks exceed 1.0 — the codec's energy escalates
             # on longer songs.  Scaling (not clamping) preserves the waveform
             # shape so lyrics and melody stay intact instead of turning to
@@ -197,6 +203,7 @@ class StreamingDecoder:
                 ], -1)
 
             # ── save individual chunk for incremental streaming ──
+            _t_save_start = _time.perf_counter()
             chunk_audio = cur_output if idx == 0 else cur_output[:, self.audio_ovlp_samples:]
             chunk_base, chunk_ext = os.path.splitext(self.save_path)
             chunk_path = f"{chunk_base}_chunk{idx}{chunk_ext}"
@@ -212,13 +219,17 @@ class StreamingDecoder:
             temp_path = f"{chunk_base}.tmp{chunk_ext}"
             torchaudio.save(temp_path, partial.to(torch.float32), 48000)
             os.replace(temp_path, self.save_path)
+            _t_save_end = _time.perf_counter()
 
             self.chunks_decoded = idx + 1
             new_decoded += 1
             logger.info(
-                "Streaming chunk %d/%d saved (%d samples, %.1fs)",
+                "Streaming chunk %d/%d saved (%d samples, %.1fs) | flow_matching=%.2fs (num_steps=%d) | scalar_decode=%.2fs | save=%.2fs",
                 self.chunks_decoded, total_chunks,
                 partial.shape[-1], partial.shape[-1] / 48000,
+                _t_fm_end - _t_fm_start, self.num_steps,
+                _t_scalar_end - _t_scalar_start,
+                _t_save_end - _t_save_start,
             )
 
             if on_chunk_ready:

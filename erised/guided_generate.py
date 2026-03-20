@@ -317,6 +317,9 @@ class DPOGuider:
             stream_decoder = StreamingDecoder(pipe.codec, save_path, duration=24, num_steps=8)
             next_stream_at = _FIRST_CHUNK
 
+        import time as _time_mod
+        _ar_resume_time = _time_mod.perf_counter()
+
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=self.dtype):
             # Initial frame
             curr_token = _guided_generate_frame(
@@ -350,7 +353,11 @@ class DPOGuider:
 
                 # Pause-decode-resume on same GPU
                 if next_stream_at and len(frames) >= next_stream_at:
-                    import gc
+                    import gc, time as _time
+                    _t_pause = _time.perf_counter()
+                    logger.info("[streaming] AR generated %d frames in %.2fs since last resume",
+                                len(frames) - (next_stream_at - _HOP if next_stream_at > _FIRST_CHUNK else 0),
+                                _t_pause - _ar_resume_time)
                     frames_cp = torch.stack(frames).permute(1, 2, 0).squeeze(0)
                     saved_orig = _save_backbone_caches(orig_model)
                     saved_dpo = _save_backbone_caches(dpo_model)
@@ -358,7 +365,9 @@ class DPOGuider:
                     _reset_model_caches(dpo_model)
                     gc.collect()
                     torch.cuda.empty_cache()
+                    _t_pre_decode = _time.perf_counter()
                     new_chunks = stream_decoder.decode_available(frames_cp)
+                    _t_post_decode = _time.perf_counter()
                     orig_model.setup_caches(bs_size)
                     dpo_model.setup_caches(bs_size)
                     _restore_backbone_caches(orig_model, saved_orig)
@@ -366,11 +375,21 @@ class DPOGuider:
                     del saved_orig, saved_dpo
                     gc.collect()
                     torch.cuda.empty_cache()
+                    _t_resume = _time.perf_counter()
+                    logger.info(
+                        "[streaming] frame=%d | cache_save+gc=%.2fs | codec_decode=%.2fs | restore+gc=%.2fs | total_pause=%.2fs",
+                        len(frames),
+                        _t_pre_decode - _t_pause,
+                        _t_post_decode - _t_pre_decode,
+                        _t_resume - _t_post_decode,
+                        _t_resume - _t_pause,
+                    )
                     if new_chunks > 0 and on_progress:
                         on_progress(len(frames), max_audio_frames,
                                    os.path.basename(save_path), stream_decoder.chunks_decoded,
                                    chunk_paths=list(stream_decoder.chunk_paths))
                     next_stream_at += _HOP
+                    _ar_resume_time = _time.perf_counter()
 
         # Stack frames and decode to audio
         frames_tensor = torch.stack(frames).permute(1, 2, 0).squeeze(0)
