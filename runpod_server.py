@@ -123,6 +123,8 @@ def generation_worker():
                         dpo_scale=dpo_scale,
                         on_progress=on_progress,
                         streaming_decode=True,
+                        streaming_first_chunk=540,
+                        streaming_lean_gc=True,
                     )
                 else:
                     gen_result = pipeline.generate(
@@ -130,6 +132,8 @@ def generation_worker():
                         max_audio_length_ms=int(max_sec * 1000),
                         on_progress=on_progress,
                         streaming_decode=True,
+                        streaming_first_chunk=540,
+                        streaming_lean_gc=True,
                     )
                 elapsed = time.time() - t0
                 logger.info("[%s] Generated + decoded in %.1fs", model_name, elapsed)
