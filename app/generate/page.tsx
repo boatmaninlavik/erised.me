@@ -21,6 +21,7 @@ interface StreamState {
   progress: { current_frame: number; total_frames: number } | null;
   partialAudio: string | null;
   partialVersion: number;
+  chunkFiles: string[] | null;
 }
 
 async function fetchRetry(url: string, options?: RequestInit, maxRetries = 30): Promise<Response> {
@@ -67,6 +68,7 @@ function streamJob(
       status: "running",
       partialAudio: data.audio_file,
       partialVersion: data.version,
+      chunkFiles: data.chunk_files || null,
     });
   });
 
@@ -126,10 +128,14 @@ function streamJob(
 const SEAN_EMAIL = "zsean@berkeley.edu";
 
 /**
- * Simple song player. During generation, plays the partial combined audio
- * file (which the server updates after each chunk). After generation,
- * switches to the final file. No Web Audio scheduling — just a plain
- * <audio> element that won't produce overlapping/stacking artifacts.
+ * Song player with seamless chunk transitions using dual audio elements.
+ *
+ * Two hidden <audio> elements alternate (A plays chunk 0, B preloads chunk 1,
+ * switch at boundary, A preloads chunk 2, etc.). A custom progress bar tracks
+ * combined time so the duration extends (e.g. 0:15/0:24 → 0:15/0:44) as soon
+ * as the next chunk downloads — BEFORE the current chunk ends.
+ *
+ * After generation, switches to native <audio controls> with the final file.
  */
 function SongCard({
   backendUrl,
@@ -138,6 +144,7 @@ function SongCard({
   progress,
   partialAudio,
   partialVersion,
+  chunkFiles,
   label,
   onSave,
   saving,
@@ -149,100 +156,187 @@ function SongCard({
   progress: { current_frame: number; total_frames: number } | null;
   partialAudio: string | null;
   partialVersion: number;
+  chunkFiles: string[] | null;
   label?: string;
   onSave?: () => void;
   saving?: boolean;
   saved?: boolean;
 }) {
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const [audioSrc, setAudioSrc] = useState<string | null>(null);
+  const audioRefA = useRef<HTMLAudioElement>(null);
+  const audioRefB = useRef<HTMLAudioElement>(null);
+  const finalAudioRef = useRef<HTMLAudioElement>(null);
+
+  const chunksRef = useRef<{ duration: number; startOffset: number }[]>([]);
+  const activeIndexRef = useRef(-1);
+  const loadedChunksRef = useRef(0);
   const loadedVersionRef = useRef(0);
-  const seekOnSwitch = useRef(0);
-  const pendingUrlRef = useRef<string | null>(null);
   const blobUrlsRef = useRef<string[]>([]);
-  const fetchControllerRef = useRef<AbortController | null>(null);
+
+  const [totalDuration, setTotalDuration] = useState(0);
+  const [displayTime, setDisplayTime] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [hasAudio, setHasAudio] = useState(false);
+  const [showFinalPlayer, setShowFinalPlayer] = useState(false);
+
+  const getEl = useCallback((idx: number) => {
+    return idx % 2 === 0 ? audioRefA.current : audioRefB.current;
+  }, []);
 
   // Reset on new generation
   useEffect(() => {
     if (status === "pending") {
-      setAudioSrc(null);
+      chunksRef.current = [];
+      activeIndexRef.current = -1;
+      loadedChunksRef.current = 0;
       loadedVersionRef.current = 0;
-      seekOnSwitch.current = 0;
-      pendingUrlRef.current = null;
-      if (fetchControllerRef.current) fetchControllerRef.current.abort();
+      setTotalDuration(0);
+      setDisplayTime(0);
+      setIsPlaying(false);
+      setHasAudio(false);
+      setShowFinalPlayer(false);
       blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
       blobUrlsRef.current = [];
+      [audioRefA.current, audioRefB.current].forEach((el) => {
+        if (el) { el.pause(); el.removeAttribute("src"); el.load(); }
+      });
     }
   }, [status]);
 
-  // Cleanup blob URLs on unmount
   useEffect(() => () => {
     blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
   }, []);
 
-  // When partial audio becomes available or updates
+  // Handle new chunks from SSE
   useEffect(() => {
     if (result || !partialAudio || partialVersion <= 0) return;
     if (partialVersion <= loadedVersionRef.current) return;
-
-    const networkUrl = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
     loadedVersionRef.current = partialVersion;
 
-    // First chunk — no audio loaded yet, play immediately
-    if (!audioSrc) {
-      setAudioSrc(networkUrl);
+    // First chunk: play cumulative file on element A
+    if (!hasAudio) {
+      const url = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
+      const el = audioRefA.current;
+      if (!el) return;
+      const onReady = () => {
+        el.removeEventListener("canplay", onReady);
+        if (!isFinite(el.duration)) return;
+        chunksRef.current = [{ duration: el.duration, startOffset: 0 }];
+        activeIndexRef.current = 0;
+        loadedChunksRef.current = 1;
+        setTotalDuration(el.duration);
+        setHasAudio(true);
+        el.play().catch(() => {});
+        setIsPlaying(true);
+      };
+      el.addEventListener("canplay", onReady);
+      el.src = url;
+      el.load();
       return;
     }
 
-    // If the audio has already ended or is paused,
-    // switch immediately with network URL.
-    const el = audioRef.current;
-    if (el && (el.ended || el.paused)) {
-      seekOnSwitch.current = el.currentTime;
-      setAudioSrc(networkUrl);
-      return;
-    }
+    // Subsequent chunks: download only the NEW individual chunk file
+    const newChunkFile = chunkFiles && chunkFiles.length > 0
+      ? chunkFiles[chunkFiles.length - 1]
+      : null;
+    if (!newChunkFile) return;
 
-    // Audio is still playing. Pre-download the longer cumulative file
-    // into browser memory NOW so that when we switch at remaining < 2s,
-    // the browser loads from memory (12ms) instead of network (2000ms).
-    // Set network URL as fallback in case the fetch doesn't finish in time.
-    pendingUrlRef.current = networkUrl;
+    const chunkUrl = `${backendUrl}/audio/${newChunkFile}`;
+    const nextIdx = loadedChunksRef.current;
 
-    if (fetchControllerRef.current) fetchControllerRef.current.abort();
-    const controller = new AbortController();
-    fetchControllerRef.current = controller;
-
-    fetch(networkUrl, { signal: controller.signal })
+    fetch(chunkUrl)
       .then((r) => r.blob())
       .then((blob) => {
-        if (controller.signal.aborted) return;
         const blobUrl = URL.createObjectURL(blob);
         blobUrlsRef.current.push(blobUrl);
-        // Upgrade pending URL from network to blob — if the switch
-        // hasn't happened yet, it will now use the in-memory blob.
-        if (pendingUrlRef.current === networkUrl) {
-          pendingUrlRef.current = blobUrl;
-        }
+        const el = getEl(nextIdx);
+        if (!el) return;
+        const onReady = () => {
+          el.removeEventListener("canplaythrough", onReady);
+          if (!isFinite(el.duration)) return;
+          const prevTotal = chunksRef.current.reduce((s, c) => s + c.duration, 0);
+          chunksRef.current.push({ duration: el.duration, startOffset: prevTotal });
+          loadedChunksRef.current = nextIdx + 1;
+          // Duration extends NOW — progress bar grows before current chunk ends
+          setTotalDuration(prevTotal + el.duration);
+        };
+        el.addEventListener("canplaythrough", onReady);
+        el.src = blobUrl;
+        el.load();
       })
-      .catch(() => {}); // network URL remains as fallback
-  }, [partialAudio, partialVersion, result, backendUrl, audioSrc]);
+      .catch(() => {});
+  }, [partialAudio, partialVersion, chunkFiles, result, backendUrl, hasAudio, getEl]);
 
-  // When generation completes, switch to final audio
+  // Playback timer + chunk transition
+  useEffect(() => {
+    if (!isPlaying || activeIndexRef.current < 0) return;
+    const tick = () => {
+      const idx = activeIndexRef.current;
+      const el = getEl(idx);
+      if (!el || !isFinite(el.currentTime)) return;
+      const chunk = chunksRef.current[idx];
+      if (chunk) setDisplayTime(chunk.startOffset + el.currentTime);
+
+      const remaining = el.duration - el.currentTime;
+      const nextIdx = idx + 1;
+      if (nextIdx < loadedChunksRef.current && isFinite(remaining) && remaining < 0.5) {
+        const nextEl = getEl(nextIdx);
+        if (nextEl) {
+          nextEl.currentTime = 0;
+          nextEl.play().then(() => {
+            el.pause();
+            activeIndexRef.current = nextIdx;
+          }).catch(() => {});
+        }
+      }
+    };
+    const id = setInterval(tick, 50);
+    return () => clearInterval(id);
+  }, [isPlaying, getEl]);
+
+  // When generation completes, switch to final audio with native controls
   useEffect(() => {
     if (!result) return;
-    const el = audioRef.current;
-    if (el && !el.paused && isFinite(el.currentTime)) {
-      seekOnSwitch.current = el.currentTime;
+    const idx = activeIndexRef.current;
+    const el = idx >= 0 ? getEl(idx) : null;
+    let pos = 0;
+    if (el && isFinite(el.currentTime) && !el.paused) {
+      const chunk = chunksRef.current[idx];
+      pos = chunk ? chunk.startOffset + el.currentTime : 0;
     }
-    setAudioSrc(`${backendUrl}/audio/${result.audio_file}`);
-  }, [result, backendUrl]);
+    [audioRefA.current, audioRefB.current].forEach((a) => { if (a) a.pause(); });
+    setIsPlaying(false);
+    setShowFinalPlayer(true);
+
+    const fin = finalAudioRef.current;
+    if (!fin) return;
+    const onReady = () => {
+      fin.removeEventListener("canplay", onReady);
+      if (pos > 0 && pos < fin.duration) fin.currentTime = pos;
+      fin.play().catch(() => {});
+    };
+    fin.addEventListener("canplay", onReady);
+    fin.src = `${backendUrl}/audio/${result.audio_file}`;
+    fin.load();
+  }, [result, backendUrl, getEl]);
+
+  const togglePlay = useCallback(() => {
+    const el = getEl(activeIndexRef.current);
+    if (!el) return;
+    if (el.paused) { el.play().catch(() => {}); setIsPlaying(true); }
+    else { el.pause(); setIsPlaying(false); }
+  }, [getEl]);
+
+  const formatTime = (t: number) => {
+    if (!isFinite(t) || t < 0) t = 0;
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t % 60);
+    return `${m}:${s.toString().padStart(2, "0")}`;
+  };
 
   const isLoading = status === "pending" || status === "running";
   const progressPct = progress?.total_frames
     ? Math.round((progress.current_frame / progress.total_frames) * 100)
     : 0;
-  const hasAudio = !!audioSrc;
 
   if (status === "idle") return null;
 
@@ -265,7 +359,6 @@ function SongCard({
         )}
       </div>
 
-      {/* Progress bar while composing (before first audio) */}
       {isLoading && !hasAudio && progressPct > 0 && (
         <div className="bg-zinc-800 rounded-full h-1.5 overflow-hidden">
           <div
@@ -275,46 +368,45 @@ function SongCard({
         </div>
       )}
 
-      {/* Audio player */}
-      {audioSrc && (
-        <audio
-          ref={audioRef}
-          controls
-          src={audioSrc}
-          className="w-full"
-          onCanPlay={() => {
-            const el = audioRef.current;
-            if (!el) return;
-            if (seekOnSwitch.current > 0 && seekOnSwitch.current < el.duration) {
-              el.currentTime = seekOnSwitch.current;
-              seekOnSwitch.current = 0;
-            }
-            el.play().catch(() => {});
-          }}
-          onTimeUpdate={() => {
-            const el = audioRef.current;
-            if (!el || !pendingUrlRef.current) return;
-            const remaining = el.duration - el.currentTime;
-            // When within 2s of the end, switch to the longer partial file
-            if (isFinite(remaining) && remaining < 2) {
-              seekOnSwitch.current = el.currentTime;
-              setAudioSrc(pendingUrlRef.current);
-              pendingUrlRef.current = null;
-            }
-          }}
-          onEnded={() => {
-            // If audio ends and there's a pending longer version, switch to it
-            const el = audioRef.current;
-            if (pendingUrlRef.current && el) {
-              seekOnSwitch.current = el.currentTime;
-              setAudioSrc(pendingUrlRef.current);
-              pendingUrlRef.current = null;
-            }
-          }}
-        />
+      {/* Hidden audio elements for streaming chunks */}
+      <audio ref={audioRefA} preload="auto" style={{ display: "none" }} />
+      <audio ref={audioRefB} preload="auto" style={{ display: "none" }} />
+
+      {/* Custom streaming player — progress bar extends seamlessly */}
+      {hasAudio && !showFinalPlayer && (
+        <div className="flex items-center gap-3">
+          <button
+            onClick={togglePlay}
+            className="w-8 h-8 flex-shrink-0 flex items-center justify-center rounded-full bg-white text-black hover:bg-zinc-200 transition-colors"
+          >
+            {isPlaying ? (
+              <svg width="10" height="12" viewBox="0 0 10 12" fill="currentColor">
+                <rect x="0" y="0" width="3" height="12" />
+                <rect x="7" y="0" width="3" height="12" />
+              </svg>
+            ) : (
+              <svg width="10" height="12" viewBox="0 0 10 12" fill="currentColor">
+                <polygon points="0,0 10,6 0,12" />
+              </svg>
+            )}
+          </button>
+          <div className="flex-1 bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+            <div
+              className="bg-white rounded-full h-full transition-all duration-100"
+              style={{ width: totalDuration > 0 ? `${Math.min(100, (displayTime / totalDuration) * 100)}%` : "0%" }}
+            />
+          </div>
+          <span className="text-xs text-zinc-400 tabular-nums whitespace-nowrap">
+            {formatTime(displayTime)} / {formatTime(totalDuration)}
+          </span>
+        </div>
       )}
 
-      {/* Streaming indicator while audio is playing */}
+      {/* Native player after generation completes */}
+      {showFinalPlayer && (
+        <audio ref={finalAudioRef} controls className="w-full" />
+      )}
+
       {isLoading && hasAudio && progressPct > 0 && (
         <div className="bg-zinc-800 rounded-full h-1 overflow-hidden">
           <div
@@ -359,13 +451,13 @@ export default function GeneratePage() {
   const [selectedModel, setSelectedModel] = useState<"dpo" | "original">("dpo");
 
   const [origState, setOrigState] = useState<StreamState>({
-    status: "idle", result: null, progress: null, partialAudio: null, partialVersion: 0,
+    status: "idle", result: null, progress: null, partialAudio: null, partialVersion: 0, chunkFiles: null,
   });
   const [dpoState, setDpoState] = useState<StreamState>({
-    status: "idle", result: null, progress: null, partialAudio: null, partialVersion: 0,
+    status: "idle", result: null, progress: null, partialAudio: null, partialVersion: 0, chunkFiles: null,
   });
   const [singleState, setSingleState] = useState<StreamState>({
-    status: "idle", result: null, progress: null, partialAudio: null, partialVersion: 0,
+    status: "idle", result: null, progress: null, partialAudio: null, partialVersion: 0, chunkFiles: null,
   });
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
@@ -436,7 +528,7 @@ export default function GeneratePage() {
 
     setError(null);
     setSavedModels(new Set());
-    const blank: StreamState = { status: "pending", result: null, progress: null, partialAudio: null, partialVersion: 0 };
+    const blank: StreamState = { status: "pending", result: null, progress: null, partialAudio: null, partialVersion: 0, chunkFiles: null };
     setOrigState(blank);
     setDpoState({ ...blank, status: "idle" });
 
@@ -490,7 +582,7 @@ export default function GeneratePage() {
 
     setError(null);
     setSavedModels(new Set());
-    const blank: StreamState = { status: "pending", result: null, progress: null, partialAudio: null, partialVersion: 0 };
+    const blank: StreamState = { status: "pending", result: null, progress: null, partialAudio: null, partialVersion: 0, chunkFiles: null };
     setSingleState(blank);
 
     try {
@@ -794,6 +886,7 @@ export default function GeneratePage() {
                 progress={origState.progress}
                 partialAudio={origState.partialAudio}
                 partialVersion={origState.partialVersion}
+                chunkFiles={origState.chunkFiles}
                 label="Original Model"
                 onSave={origState.result ? () => saveToLibrary(origState.result!) : undefined}
                 saving={saving === "original"}
@@ -806,6 +899,7 @@ export default function GeneratePage() {
                 progress={dpoState.progress}
                 partialAudio={dpoState.partialAudio}
                 partialVersion={dpoState.partialVersion}
+                chunkFiles={dpoState.chunkFiles}
                 label="DPO Guided"
                 onSave={dpoState.result ? () => saveToLibrary(dpoState.result!) : undefined}
                 saving={saving === "dpo"}
@@ -823,6 +917,7 @@ export default function GeneratePage() {
               progress={singleState.progress}
               partialAudio={singleState.partialAudio}
               partialVersion={singleState.partialVersion}
+              chunkFiles={singleState.chunkFiles}
               onSave={singleState.result ? () => saveToLibrary(singleState.result!) : undefined}
               saving={saving === selectedModel}
               saved={savedModels.has(selectedModel)}
