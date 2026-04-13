@@ -229,16 +229,35 @@ class DPOTrainer:
         resume_dir = resume_from or os.path.join(self.checkpoint_dir, "latest")
         if os.path.exists(os.path.join(resume_dir, "training_state.pt")):
             logger.info("Resuming from checkpoint: %s", resume_dir)
-            # Load model weights (safetensors or pytorch format)
-            ckpt_files = [f for f in os.listdir(resume_dir) if f.endswith(('.bin', '.safetensors', '.pt')) and f != 'training_state.pt']
-            if ckpt_files:
-                ckpt_file = os.path.join(resume_dir, ckpt_files[0])
-                if ckpt_file.endswith('.safetensors'):
-                    from safetensors.torch import load_file
-                    state_dict = load_file(ckpt_file, device=str(device))
-                else:
-                    state_dict = torch.load(ckpt_file, weights_only=True, map_location=device)
+            # Sharded safetensors checkpoints must be reassembled from every
+            # shard listed in the index file, not a single arbitrary file.
+            index_path = os.path.join(resume_dir, "model.safetensors.index.json")
+            if os.path.exists(index_path):
+                from safetensors.torch import load_file
+                import json as _json
+                with open(index_path) as _f:
+                    _index = _json.load(_f)
+                _shard_files = sorted(set(_index["weight_map"].values()))
+                state_dict = {}
+                for _shard in _shard_files:
+                    state_dict.update(load_file(os.path.join(resume_dir, _shard), device=str(device)))
+                logger.info("Loaded %d tensors from %d safetensors shards", len(state_dict), len(_shard_files))
                 policy_model.load_state_dict(state_dict, strict=False)
+            else:
+                ckpt_files = [f for f in os.listdir(resume_dir) if f.endswith(('.bin', '.safetensors', '.pt')) and f != 'training_state.pt']
+                if ckpt_files:
+                    ckpt_file = os.path.join(resume_dir, ckpt_files[0])
+                    if ckpt_file.endswith('.safetensors'):
+                        from safetensors.torch import load_file
+                        state_dict = load_file(ckpt_file, device=str(device))
+                    else:
+                        state_dict = torch.load(ckpt_file, weights_only=True, map_location=device)
+                    policy_model.load_state_dict(state_dict, strict=False)
+            # Refresh fp32 masters from the loaded policy — otherwise the next
+            # _optimizer_step copies the pre-resume (base) master weights back
+            # onto the bf16 model and silently wipes out the checkpoint.
+            for _bp, _fp in zip(_trainable_bf16, _fp32_masters):
+                _fp.data.copy_(_bp.data.float().cpu())
             resumed = self._load_training_state(optimizer, scheduler, scaler, resume_dir)
             if resumed:
                 start_epoch, start_step, global_step, best_loss = resumed
