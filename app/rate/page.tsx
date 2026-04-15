@@ -40,6 +40,7 @@ export default function RatePage() {
   const [serverStatus, setServerStatus] = useState<ServerStatus>({ pending: 0, ready: 0, generating: false, rated: 0 });
   const [voted, setVoted] = useState<"a" | "b" | null>(null);
   const [pairState, setPairState] = useState<"none" | "loading" | "ready" | "partial" | "generating">("none");
+  const [mode, setMode] = useState<"orig_vs_dpo" | "orig_vs_orig">("orig_vs_dpo");
   const [randomizingPrompt, setRandomizingPrompt] = useState(false);
   const [randomizingLyrics, setRandomizingLyrics] = useState(false);
   const [randomError, setRandomError] = useState<string | null>(null);
@@ -180,7 +181,7 @@ export default function RatePage() {
       await fetch(`${backendUrl}/api/queue`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, count, user_email: user?.email || null }),
+        body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, count, mode, user_email: user?.email || null }),
       });
       if (!currentPair) fetchNext();
     } finally {
@@ -325,6 +326,35 @@ export default function RatePage() {
           {/* Queue form */}
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 space-y-4">
             <h3 className="text-sm font-medium text-zinc-300">Queue new pairs</h3>
+            {isSean && (
+              <div>
+                <label className="block text-xs text-zinc-500 mb-2 uppercase tracking-wide">Compare</label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setMode("orig_vs_dpo")}
+                    className={`flex-1 py-2 rounded-xl text-xs font-medium border transition-colors ${
+                      mode === "orig_vs_dpo"
+                        ? "bg-white text-black border-white"
+                        : "bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700"
+                    }`}
+                  >
+                    Original vs DPO
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMode("orig_vs_orig")}
+                    className={`flex-1 py-2 rounded-xl text-xs font-medium border transition-colors ${
+                      mode === "orig_vs_orig"
+                        ? "bg-white text-black border-white"
+                        : "bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700"
+                    }`}
+                  >
+                    Original vs Original
+                  </button>
+                </div>
+              </div>
+            )}
             <div>
               <div className="flex items-center justify-between mb-2">
                 <label className="text-xs text-zinc-500 uppercase tracking-wide">Prompt</label>

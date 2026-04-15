@@ -303,11 +303,295 @@ def serve_audio(filename: str):
 
 @app.get("/api/status")
 def status():
+    with rate_lock:
+        ready_n = len(rate_ready)
     return {
         "pending": gen_stats["pending"],
         "completed": gen_stats["completed"],
         "generating": gen_stats["generating"],
+        "ready": ready_n,
+        "rated": rate_stats["rated"],
     }
+
+
+# ── Rate / A-B pair rating ──────────────────────────────────────────
+import random
+import sqlite3
+import subprocess
+
+DPO_DB_PATH = os.environ.get(
+    "ERISED_DPO_DB", "/workspace/heartlib/heartlib/dpo_preferences.db"
+)
+GCS_PREFS_PREFIX = os.environ.get(
+    "ERISED_GCS_PREFS_PREFIX", "gcs:erised-dpo/preferences"
+)
+GCS_KEY = os.environ.get("ERISED_GCS_KEY", "/workspace/key.json")
+GCS_PROJECT = os.environ.get("ERISED_GCS_PROJECT", "gen-lang-client-0191019282")
+
+rate_pending: dict[str, dict] = {}
+rate_ready: list[dict] = []
+rate_stats = {"rated": 0}
+rate_lock = threading.Lock()
+
+try:
+    _c = sqlite3.connect(DPO_DB_PATH)
+    rate_stats["rated"] = _c.execute("SELECT COUNT(*) FROM preferences").fetchone()[0]
+    _c.close()
+    logger.info("Loaded rated count from %s: %d", DPO_DB_PATH, rate_stats["rated"])
+except Exception as _e:
+    logger.warning("Could not read preference count from %s: %s", DPO_DB_PATH, _e)
+
+
+class QueueRequest(BaseModel):
+    prompt: str
+    lyrics: str
+    max_sec: int = 60
+    count: int = 1
+    mode: str = "orig_vs_dpo"  # or "orig_vs_orig"
+    user_email: str | None = None
+
+
+class RateVote(BaseModel):
+    pair_id: str
+    choice: str
+    user_email: str | None = None
+
+
+def _resolve_ready_pair(pair_id: str, info: dict):
+    """Return a display-ready pair dict if both jobs are done, else None."""
+    with jobs_lock:
+        a = jobs.get(info["a_job"], {})
+        b = jobs.get(info["b_job"], {})
+    if a.get("status") != "done" or b.get("status") != "done":
+        return None
+    # Randomize A/B slot assignment so the rater can't bias on model position.
+    if random.random() < 0.5:
+        slot_a, slot_b = a["result"], b["result"]
+        m_a, m_b = info["a_model"], info["b_model"]
+    else:
+        slot_a, slot_b = b["result"], a["result"]
+        m_a, m_b = info["b_model"], info["a_model"]
+    return {
+        "pair_id": pair_id,
+        "prompt": info["prompt"],
+        "lyrics": info["lyrics"],
+        "a_audio": slot_a["audio_file"],
+        "b_audio": slot_b["audio_file"],
+        "tags_a": slot_a["tags"],
+        "tags_b": slot_b["tags"],
+        "a_model": m_a,
+        "b_model": m_b,
+        "mode": info["mode"],
+    }
+
+
+@app.post("/api/queue")
+def queue_pairs(req: QueueRequest):
+    if not req.prompt.strip() or not req.lyrics.strip():
+        raise HTTPException(400, "Prompt and lyrics required")
+    if req.mode not in ("orig_vs_dpo", "orig_vs_orig"):
+        raise HTTPException(400, "mode must be orig_vs_dpo or orig_vs_orig")
+
+    mode = req.mode
+    # DPO model is gated to the authorized user; downgrade silently for guests
+    if mode == "orig_vs_dpo" and req.user_email != DPO_USER_EMAIL:
+        mode = "orig_vs_orig"
+
+    if mode == "orig_vs_dpo":
+        a_model, b_model = "original", "dpo"
+    else:
+        a_model, b_model = "original", "original"
+
+    n = max(1, min(req.count, 10))
+    for _ in range(n):
+        pair_id = str(uuid.uuid4())[:8]
+        a_job = str(uuid.uuid4())[:8]
+        b_job = str(uuid.uuid4())[:8]
+        with jobs_lock:
+            jobs[a_job] = {"status": "pending"}
+            jobs[b_job] = {"status": "pending"}
+            _save_job(a_job)
+            _save_job(b_job)
+        gen_stats["pending"] += 2
+
+        with rate_lock:
+            rate_pending[pair_id] = {
+                "prompt": req.prompt,
+                "lyrics": req.lyrics,
+                "a_job": a_job,
+                "b_job": b_job,
+                "a_model": a_model,
+                "b_model": b_model,
+                "user_email": req.user_email,
+                "mode": mode,
+            }
+
+        job_queue.put((a_job, req.prompt, req.lyrics, req.max_sec, a_model, 3.0))
+        job_queue.put((b_job, req.prompt, req.lyrics, req.max_sec, b_model, 3.0))
+
+    return {"queued": n, "mode": mode}
+
+
+@app.get("/api/next")
+def next_pair():
+    with rate_lock:
+        for pid, info in list(rate_pending.items()):
+            pair = _resolve_ready_pair(pid, info)
+            if pair is not None:
+                rate_ready.append(pair)
+                del rate_pending[pid]
+        if rate_ready:
+            return {"status": "ready", "pair": rate_ready[0]}
+        if rate_pending or gen_stats["generating"]:
+            return {"status": "generating"}
+        return {"status": "empty"}
+
+
+@app.get("/api/pair/{pair_id}")
+def get_pair(pair_id: str):
+    with rate_lock:
+        for p in rate_ready:
+            if p["pair_id"] == pair_id:
+                return {
+                    "status": "ready",
+                    "pair": {**p, "a_ready": True, "b_ready": True},
+                }
+        info = rate_pending.get(pair_id)
+    if info is None:
+        raise HTTPException(404, "Unknown pair_id")
+    pair = _resolve_ready_pair(pair_id, info)
+    if pair is not None:
+        with rate_lock:
+            rate_pending.pop(pair_id, None)
+            rate_ready.append(pair)
+        return {
+            "status": "ready",
+            "pair": {**pair, "a_ready": True, "b_ready": True},
+        }
+    return {"status": "generating"}
+
+
+def _save_pref_sqlite(row: dict):
+    conn = sqlite3.connect(DPO_DB_PATH)
+    try:
+        conn.execute(
+            """
+            INSERT INTO preferences (
+                pair_id, prompt, lyrics, winner_id, loser_id,
+                winner_tokens_path, loser_tokens_path, rater_id, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["pair_id"],
+                row["prompt"],
+                row["lyrics"],
+                row["winner_id"],
+                row["loser_id"],
+                row["winner_tokens_path"],
+                row["loser_tokens_path"],
+                row["rater_id"],
+                row["timestamp"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _save_pref_gcs(row: dict):
+    """Best-effort upload of preference row + token files to GCS."""
+    env = {
+        **os.environ,
+        "RCLONE_CONFIG_GCS_TYPE": "google cloud storage",
+        "RCLONE_CONFIG_GCS_SERVICE_ACCOUNT_FILE": GCS_KEY,
+        "RCLONE_CONFIG_GCS_PROJECT_NUMBER": GCS_PROJECT,
+        "RCLONE_CONFIG_GCS_BUCKET_POLICY_ONLY": "true",
+    }
+    tmp = f"/tmp/pref_{row['pair_id']}.json"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(row, f)
+        subprocess.run(
+            ["rclone", "copyto", tmp, f"{GCS_PREFS_PREFIX}/{row['pair_id']}.json"],
+            env=env, timeout=30, check=False,
+        )
+    except Exception as e:
+        logger.warning("GCS upload of pref row failed: %s", e)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+    for p in (row["winner_tokens_path"], row["loser_tokens_path"]):
+        if not os.path.isfile(p):
+            logger.warning("Token file missing for GCS upload: %s", p)
+            continue
+        name = os.path.basename(p)
+        try:
+            subprocess.run(
+                ["rclone", "copyto", p, f"{GCS_PREFS_PREFIX}/tokens/{name}"],
+                env=env, timeout=180, check=False,
+            )
+        except Exception as e:
+            logger.warning("GCS upload of token file %s failed: %s", name, e)
+
+
+@app.post("/api/rate")
+def rate_pair(req: RateVote):
+    if req.choice not in ("a", "b"):
+        raise HTTPException(400, "Choice must be 'a' or 'b'")
+    with rate_lock:
+        pair = None
+        for i, p in enumerate(rate_ready):
+            if p["pair_id"] == req.pair_id:
+                pair = rate_ready.pop(i)
+                break
+    if pair is None:
+        raise HTTPException(404, "Pair not found")
+
+    if req.choice == "a":
+        winner_audio, loser_audio = pair["a_audio"], pair["b_audio"]
+        winner_model, loser_model = pair["a_model"], pair["b_model"]
+    else:
+        winner_audio, loser_audio = pair["b_audio"], pair["a_audio"]
+        winner_model, loser_model = pair["b_model"], pair["a_model"]
+
+    winner_id = winner_audio.rsplit(".", 1)[0]
+    loser_id = loser_audio.rsplit(".", 1)[0]
+    winner_tokens = os.path.join(output_dir, f"{winner_id}_tokens.pt")
+    loser_tokens = os.path.join(output_dir, f"{loser_id}_tokens.pt")
+
+    row = {
+        "pair_id": f"{winner_id}_{loser_id}",
+        "prompt": pair["prompt"],
+        "lyrics": pair["lyrics"],
+        "winner_id": winner_id,
+        "loser_id": loser_id,
+        "winner_tokens_path": winner_tokens,
+        "loser_tokens_path": loser_tokens,
+        "rater_id": req.user_email or "anonymous",
+        "timestamp": time.time(),
+        "mode": pair.get("mode"),
+        "winner_model": winner_model,
+        "loser_model": loser_model,
+    }
+
+    try:
+        _save_pref_sqlite(row)
+    except Exception as e:
+        logger.exception("SQLite write failed for pair %s", req.pair_id)
+        raise HTTPException(500, f"SQLite write failed: {e}")
+
+    threading.Thread(target=_save_pref_gcs, args=(row,), daemon=True).start()
+
+    rate_stats["rated"] += 1
+    logger.info(
+        "Rating: pair=%s winner=%s(%s) loser=%s(%s) mode=%s user=%s",
+        req.pair_id, winner_id, winner_model, loser_id, loser_model,
+        pair.get("mode"), req.user_email,
+    )
+    return {"status": "recorded", "count": rate_stats["rated"]}
 
 
 if __name__ == "__main__":
