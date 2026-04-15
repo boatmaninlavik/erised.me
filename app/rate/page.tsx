@@ -5,16 +5,46 @@ import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/lib/auth-context";
 import { Navbar } from "@/components/navbar";
 
+type JobStatus = "idle" | "pending" | "running" | "done" | "error";
+
+interface GenerationResult {
+  audio_file: string;
+  tags: string;
+  num_frames: number;
+  elapsed: number;
+  model: string;
+}
+
+interface StreamState {
+  status: JobStatus;
+  result: GenerationResult | null;
+  progress: { current_frame: number; total_frames: number } | null;
+  partialAudio: string | null;
+  partialVersion: number;
+  chunkFiles: string[] | null;
+}
+
+const EMPTY_STREAM: StreamState = {
+  status: "idle",
+  result: null,
+  progress: null,
+  partialAudio: null,
+  partialVersion: 0,
+  chunkFiles: null,
+};
+
 interface Pair {
   pair_id: string;
   prompt: string;
   lyrics?: string;
-  a_audio: string;
-  b_audio?: string;
-  tags_a: string;
-  tags_b?: string;
-  a_ready?: boolean;
-  b_ready?: boolean;
+  a_job: string;
+  b_job: string;
+  a_audio: string | null;
+  b_audio: string | null;
+  tags_a: string | null;
+  tags_b: string | null;
+  a_status?: string;
+  b_status?: string;
 }
 
 interface ServerStatus {
@@ -24,7 +54,377 @@ interface ServerStatus {
   rated: number;
 }
 
+async function fetchRetry(url: string, options?: RequestInit, maxRetries = 30): Promise<Response> {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const resp = await fetch(url, options);
+      if (resp.status === 502 || resp.status === 504) {
+        await new Promise((r) => setTimeout(r, 3000));
+        continue;
+      }
+      return resp;
+    } catch {
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+  throw new Error("Server unreachable after retries");
+}
+
+function streamJob(
+  backendUrl: string,
+  jobId: string,
+  onUpdate: (state: Partial<StreamState>) => void,
+): () => void {
+  let cancelled = false;
+
+  const es = new EventSource(`${backendUrl}/api/job/${jobId}/stream`);
+  let sseWorking = false;
+
+  es.addEventListener("progress", (e) => {
+    sseWorking = true;
+    const data = JSON.parse((e as MessageEvent).data);
+    onUpdate({ status: "running", progress: data });
+  });
+
+  es.addEventListener("chunk", (e) => {
+    sseWorking = true;
+    const data = JSON.parse((e as MessageEvent).data);
+    onUpdate({
+      status: "running",
+      partialAudio: data.audio_file,
+      partialVersion: data.version,
+      chunkFiles: data.chunk_files || null,
+    });
+  });
+
+  es.addEventListener("done", (e) => {
+    sseWorking = true;
+    const data = JSON.parse((e as MessageEvent).data);
+    onUpdate({ status: "done", result: data });
+    es.close();
+  });
+
+  es.addEventListener("error", () => {
+    es.close();
+    if (!sseWorking) {
+      fallbackPoll();
+      return;
+    }
+    fallbackPoll();
+  });
+
+  async function fallbackPoll() {
+    while (!cancelled) {
+      await new Promise((r) => setTimeout(r, 2000));
+      if (cancelled) break;
+      try {
+        const resp = await fetchRetry(`${backendUrl}/api/job/${jobId}`);
+        const data = await resp.json();
+        if (data.status === "done") {
+          onUpdate({ status: "done", result: data.result });
+          return;
+        }
+        if (data.status === "error") {
+          onUpdate({ status: "error" });
+          return;
+        }
+        const update: Partial<StreamState> = { status: "running" };
+        if (data.progress) update.progress = data.progress;
+        if (data.partial_audio_file) update.partialAudio = data.partial_audio_file;
+        if (data.partial_version != null) update.partialVersion = data.partial_version;
+        onUpdate(update);
+      } catch {
+        // retry
+      }
+    }
+  }
+
+  return () => {
+    cancelled = true;
+    es.close();
+  };
+}
+
 const SEAN_EMAIL = "zsean@berkeley.edu";
+
+function SongCard({
+  backendUrl,
+  status,
+  result,
+  progress,
+  partialAudio,
+  partialVersion,
+  chunkFiles,
+  label,
+}: {
+  backendUrl: string;
+  status: JobStatus;
+  result: GenerationResult | null;
+  progress: { current_frame: number; total_frames: number } | null;
+  partialAudio: string | null;
+  partialVersion: number;
+  chunkFiles: string[] | null;
+  label?: string;
+}) {
+  const audioRefA = useRef<HTMLAudioElement>(null);
+  const audioRefB = useRef<HTMLAudioElement>(null);
+  const finalAudioRef = useRef<HTMLAudioElement>(null);
+
+  const chunksRef = useRef<{ duration: number; startOffset: number }[]>([]);
+  const activeIndexRef = useRef(-1);
+  const loadedChunksRef = useRef(0);
+  const loadedVersionRef = useRef(0);
+  const blobUrlsRef = useRef<string[]>([]);
+
+  const [totalDuration, setTotalDuration] = useState(0);
+  const [displayTime, setDisplayTime] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [hasAudio, setHasAudio] = useState(false);
+  const [showFinalPlayer, setShowFinalPlayer] = useState(false);
+
+  const getEl = useCallback((idx: number) => {
+    return idx % 2 === 0 ? audioRefA.current : audioRefB.current;
+  }, []);
+
+  useEffect(() => {
+    if (status === "pending" || status === "idle") {
+      chunksRef.current = [];
+      activeIndexRef.current = -1;
+      loadedChunksRef.current = 0;
+      loadedVersionRef.current = 0;
+      setTotalDuration(0);
+      setDisplayTime(0);
+      setIsPlaying(false);
+      setHasAudio(false);
+      setShowFinalPlayer(false);
+      blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      blobUrlsRef.current = [];
+      [audioRefA.current, audioRefB.current].forEach((el) => {
+        if (el) { el.pause(); el.removeAttribute("src"); el.load(); }
+      });
+    }
+  }, [status]);
+
+  useEffect(() => () => {
+    blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+  }, []);
+
+  useEffect(() => {
+    if (result || !partialAudio || partialVersion <= 0) return;
+    if (partialVersion <= loadedVersionRef.current) return;
+    loadedVersionRef.current = partialVersion;
+
+    if (!hasAudio) {
+      const url = `${backendUrl}/audio/${partialAudio}?v=${partialVersion}`;
+      const el = audioRefA.current;
+      if (!el) return;
+      const onReady = () => {
+        el.removeEventListener("canplay", onReady);
+        if (!isFinite(el.duration)) return;
+        chunksRef.current = [{ duration: el.duration, startOffset: 0 }];
+        activeIndexRef.current = 0;
+        loadedChunksRef.current = 1;
+        setTotalDuration(el.duration);
+        setHasAudio(true);
+        el.play().catch(() => {});
+        setIsPlaying(true);
+      };
+      el.addEventListener("canplay", onReady);
+      el.src = url;
+      el.load();
+      return;
+    }
+
+    const newChunkFile = chunkFiles && chunkFiles.length > 0
+      ? chunkFiles[chunkFiles.length - 1]
+      : null;
+    if (!newChunkFile) return;
+
+    const chunkUrl = `${backendUrl}/audio/${newChunkFile}`;
+    const nextIdx = loadedChunksRef.current;
+
+    fetch(chunkUrl)
+      .then((r) => r.blob())
+      .then((blob) => {
+        const blobUrl = URL.createObjectURL(blob);
+        blobUrlsRef.current.push(blobUrl);
+        const el = getEl(nextIdx);
+        if (!el) return;
+        const onReady = () => {
+          el.removeEventListener("canplaythrough", onReady);
+          if (!isFinite(el.duration)) return;
+          const prevTotal = chunksRef.current.reduce((s, c) => s + c.duration, 0);
+          chunksRef.current.push({ duration: el.duration, startOffset: prevTotal });
+          loadedChunksRef.current = nextIdx + 1;
+          setTotalDuration(prevTotal + el.duration);
+        };
+        el.addEventListener("canplaythrough", onReady);
+        el.src = blobUrl;
+        el.load();
+      })
+      .catch(() => {});
+  }, [partialAudio, partialVersion, chunkFiles, result, backendUrl, hasAudio, getEl]);
+
+  useEffect(() => {
+    if (!isPlaying || activeIndexRef.current < 0) return;
+    const tick = () => {
+      const idx = activeIndexRef.current;
+      const el = getEl(idx);
+      if (!el || !isFinite(el.currentTime)) return;
+      const chunk = chunksRef.current[idx];
+      if (chunk) setDisplayTime(chunk.startOffset + el.currentTime);
+
+      const remaining = el.duration - el.currentTime;
+      const nextIdx = idx + 1;
+      if (nextIdx < loadedChunksRef.current && isFinite(remaining) && remaining < 0.5) {
+        const nextEl = getEl(nextIdx);
+        if (nextEl) {
+          nextEl.currentTime = 0;
+          nextEl.play().then(() => {
+            el.pause();
+            activeIndexRef.current = nextIdx;
+          }).catch(() => {});
+        }
+      }
+    };
+    const id = setInterval(tick, 50);
+    return () => clearInterval(id);
+  }, [isPlaying, getEl]);
+
+  const savedPosRef = useRef(0);
+  useEffect(() => {
+    if (!result) return;
+    const idx = activeIndexRef.current;
+    const el = idx >= 0 ? getEl(idx) : null;
+    let pos = 0;
+    if (el && isFinite(el.currentTime) && !el.paused) {
+      const chunk = chunksRef.current[idx];
+      pos = chunk ? chunk.startOffset + el.currentTime : 0;
+    }
+    savedPosRef.current = pos;
+    [audioRefA.current, audioRefB.current].forEach((a) => { if (a) a.pause(); });
+    setIsPlaying(false);
+    setShowFinalPlayer(true);
+  }, [result, getEl]);
+
+  useEffect(() => {
+    if (!showFinalPlayer || !result) return;
+    const fin = finalAudioRef.current;
+    if (!fin) return;
+    if (fin.src && fin.src.includes(result.audio_file)) return;
+    const pos = savedPosRef.current;
+    const onReady = () => {
+      fin.removeEventListener("canplay", onReady);
+      if (pos > 0 && isFinite(fin.duration) && pos < fin.duration) fin.currentTime = pos;
+      fin.play().catch(() => {});
+    };
+    fin.addEventListener("canplay", onReady);
+    fin.src = `${backendUrl}/audio/${result.audio_file}`;
+    fin.load();
+  }, [showFinalPlayer, result, backendUrl]);
+
+  const togglePlay = useCallback(() => {
+    const el = getEl(activeIndexRef.current);
+    if (!el) return;
+    if (el.paused) { el.play().catch(() => {}); setIsPlaying(true); }
+    else { el.pause(); setIsPlaying(false); }
+  }, [getEl]);
+
+  const formatTime = (t: number) => {
+    if (!isFinite(t) || t < 0) t = 0;
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t % 60);
+    return `${m}:${s.toString().padStart(2, "0")}`;
+  };
+
+  const isLoading = status === "pending" || status === "running";
+  const progressPct = progress?.total_frames
+    ? Math.round((progress.current_frame / progress.total_frames) * 100)
+    : 0;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        {label && <h3 className="font-medium text-sm tracking-tight text-zinc-300">{label}</h3>}
+        {isLoading && !hasAudio && (
+          <span className="text-xs text-zinc-500 animate-pulse">
+            Composing{progressPct > 0 ? ` (${progressPct}%)` : "..."}
+          </span>
+        )}
+        {isLoading && hasAudio && (
+          <span className="text-xs text-zinc-500 animate-pulse">
+            Streaming{progressPct > 0 ? ` (${progressPct}%)` : "..."}
+          </span>
+        )}
+        {result && (
+          <span className="text-xs text-zinc-500">{result.elapsed}s · {result.num_frames} frames</span>
+        )}
+      </div>
+
+      {isLoading && !hasAudio && progressPct > 0 && (
+        <div className="bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+          <div
+            className="bg-zinc-600 rounded-full h-full transition-all duration-500"
+            style={{ width: `${progressPct}%` }}
+          />
+        </div>
+      )}
+
+      <audio ref={audioRefA} preload="auto" style={{ display: "none" }} />
+      <audio ref={audioRefB} preload="auto" style={{ display: "none" }} />
+
+      {hasAudio && !showFinalPlayer && (
+        <div className="flex items-center gap-3">
+          <button
+            onClick={togglePlay}
+            className="w-8 h-8 flex-shrink-0 flex items-center justify-center rounded-full bg-white text-black hover:bg-zinc-200 transition-colors"
+          >
+            {isPlaying ? (
+              <svg width="10" height="12" viewBox="0 0 10 12" fill="currentColor">
+                <rect x="0" y="0" width="3" height="12" />
+                <rect x="7" y="0" width="3" height="12" />
+              </svg>
+            ) : (
+              <svg width="10" height="12" viewBox="0 0 10 12" fill="currentColor">
+                <polygon points="0,0 10,6 0,12" />
+              </svg>
+            )}
+          </button>
+          <div className="flex-1 bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+            <div
+              className="bg-white rounded-full h-full transition-all duration-100"
+              style={{ width: totalDuration > 0 ? `${Math.min(100, (displayTime / totalDuration) * 100)}%` : "0%" }}
+            />
+          </div>
+          <span className="text-xs text-zinc-400 tabular-nums whitespace-nowrap">
+            {formatTime(displayTime)} / {formatTime(totalDuration)}
+          </span>
+        </div>
+      )}
+
+      {showFinalPlayer && (
+        <audio ref={finalAudioRef} controls className="w-full" />
+      )}
+
+      {isLoading && hasAudio && progressPct > 0 && (
+        <div className="bg-zinc-800 rounded-full h-1 overflow-hidden">
+          <div
+            className="bg-zinc-600 rounded-full h-full transition-all duration-500"
+            style={{ width: `${progressPct}%` }}
+          />
+        </div>
+      )}
+
+      {status === "error" && (
+        <p className="text-xs text-red-400">Generation failed</p>
+      )}
+
+      {result && (
+        <p className="text-xs text-zinc-600 font-mono break-all">{result.tags}</p>
+      )}
+    </div>
+  );
+}
 
 export default function RatePage() {
   const { user, guestId } = useAuth();
@@ -39,14 +439,19 @@ export default function RatePage() {
   const [currentPair, setCurrentPair] = useState<Pair | null>(null);
   const [serverStatus, setServerStatus] = useState<ServerStatus>({ pending: 0, ready: 0, generating: false, rated: 0 });
   const [voted, setVoted] = useState<"a" | "b" | null>(null);
-  const [pairState, setPairState] = useState<"none" | "loading" | "ready" | "partial" | "generating">("none");
+  const [pairState, setPairState] = useState<"none" | "loading" | "ready" | "generating">("none");
   const [mode, setMode] = useState<"orig_vs_dpo" | "orig_vs_orig">("orig_vs_dpo");
   const [randomizingPrompt, setRandomizingPrompt] = useState(false);
   const [randomizingLyrics, setRandomizingLyrics] = useState(false);
   const [randomError, setRandomError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  const pollingPairId = useRef<string | null>(null);
+
+  const [aState, setAState] = useState<StreamState>(EMPTY_STREAM);
+  const [bState, setBState] = useState<StreamState>(EMPTY_STREAM);
+  const aCleanupRef = useRef<(() => void) | null>(null);
+  const bCleanupRef = useRef<(() => void) | null>(null);
+  const fetchingNextRef = useRef(false);
 
   const loadBackendUrl = useCallback(async () => {
     const RUNPOD_URL = process.env.NEXT_PUBLIC_RUNPOD_URL;
@@ -94,55 +499,33 @@ export default function RatePage() {
     return () => clearInterval(interval);
   }, [loadBackendUrl]);
 
-  useEffect(() => {
-    if (!backendUrl) return;
-    const interval = setInterval(async () => {
-      try {
-        const resp = await fetch(`${backendUrl}/api/status`);
-        const data = await resp.json();
-        setServerStatus(data);
-        if (!currentPair && !pollingPairId.current && data.ready > 0) fetchNext();
-      } catch {}
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [backendUrl, currentPair]);
+  const stopStreams = useCallback(() => {
+    if (aCleanupRef.current) { aCleanupRef.current(); aCleanupRef.current = null; }
+    if (bCleanupRef.current) { bCleanupRef.current(); bCleanupRef.current = null; }
+  }, []);
 
-  // Poll for song B when we have a partial pair
-  useEffect(() => {
-    if (!backendUrl || pairState !== "partial" || !pollingPairId.current) return;
-    const pid = pollingPairId.current;
-    const interval = setInterval(async () => {
-      try {
-        const resp = await fetch(`${backendUrl}/api/pair/${pid}`);
-        const data = await resp.json();
-        if (data.status === "ready" && data.pair.b_ready) {
-          setCurrentPair(data.pair);
-          setPairState("ready");
-          pollingPairId.current = null;
-        }
-      } catch {}
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [backendUrl, pairState]);
-
-  async function fetchNext() {
-    if (!backendUrl) return;
+  const fetchNext = useCallback(async () => {
+    if (!backendUrl || fetchingNextRef.current) return;
+    fetchingNextRef.current = true;
     setPairState("loading");
     try {
       const resp = await fetch(`${backendUrl}/api/next`);
       const data = await resp.json();
       if (data.status === "ready") {
-        setCurrentPair(data.pair);
+        const pair: Pair = data.pair;
+        stopStreams();
+        setAState({ ...EMPTY_STREAM, status: "pending" });
+        setBState({ ...EMPTY_STREAM, status: "pending" });
+        setCurrentPair(pair);
         setVoted(null);
         setSaved(false);
         setPairState("ready");
-        pollingPairId.current = null;
-      } else if (data.status === "partial") {
-        setCurrentPair(data.pair);
-        setVoted(null);
-        setSaved(false);
-        setPairState("partial");
-        pollingPairId.current = data.pair.pair_id;
+        aCleanupRef.current = streamJob(backendUrl, pair.a_job, (u) =>
+          setAState((s) => ({ ...s, ...u }))
+        );
+        bCleanupRef.current = streamJob(backendUrl, pair.b_job, (u) =>
+          setBState((s) => ({ ...s, ...u }))
+        );
       } else if (data.status === "generating") {
         setPairState("generating");
       } else {
@@ -150,8 +533,25 @@ export default function RatePage() {
       }
     } catch {
       setPairState("none");
+    } finally {
+      fetchingNextRef.current = false;
     }
-  }
+  }, [backendUrl, stopStreams]);
+
+  useEffect(() => {
+    if (!backendUrl) return;
+    const interval = setInterval(async () => {
+      try {
+        const resp = await fetch(`${backendUrl}/api/status`);
+        const data = await resp.json();
+        setServerStatus(data);
+        if (!currentPair && !fetchingNextRef.current && data.ready > 0) fetchNext();
+      } catch {}
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [backendUrl, currentPair, fetchNext]);
+
+  useEffect(() => () => { stopStreams(); }, [stopStreams]);
 
   async function randomize(type: "prompt" | "lyrics") {
     const setLoading = type === "prompt" ? setRandomizingPrompt : setRandomizingLyrics;
@@ -189,8 +589,10 @@ export default function RatePage() {
     }
   }
 
+  const bothDone = aState.status === "done" && bState.status === "done";
+
   async function vote(choice: "a" | "b") {
-    if (!backendUrl || !currentPair || voted || pairState !== "ready") return;
+    if (!backendUrl || !currentPair || voted || !bothDone) return;
     setVoted(choice);
     try {
       const resp = await fetch(`${backendUrl}/api/rate`, {
@@ -199,14 +601,15 @@ export default function RatePage() {
         body: JSON.stringify({ pair_id: currentPair.pair_id, choice, user_email: user?.email || null }),
       });
       const data = await resp.json();
-      setServerStatus((s) => ({ ...s, rated: data.count }));
+      setServerStatus((s) => ({ ...s, rated: data.count ?? s.rated + 1 }));
     } catch {}
-    // Don't auto-advance — let user save winner first if they want
   }
 
   function goToNext() {
+    stopStreams();
     setCurrentPair(null);
-    pollingPairId.current = null;
+    setAState(EMPTY_STREAM);
+    setBState(EMPTY_STREAM);
     setSaved(false);
     setVoted(null);
     fetchNext();
@@ -214,10 +617,12 @@ export default function RatePage() {
 
   async function saveWinnerToLibrary() {
     if (!currentPair || !voted) return;
+    const winnerResult = voted === "a" ? aState.result : bState.result;
+    if (!winnerResult) return;
     setSaving(true);
     try {
-      const winnerAudio = voted === "a" ? currentPair.a_audio : currentPair.b_audio!;
-      const winnerTags = voted === "a" ? currentPair.tags_a : currentPair.tags_b!;
+      const winnerAudio = winnerResult.audio_file;
+      const winnerTags = winnerResult.tags;
 
       const audioResp = await fetch(`/api/proxy-audio?file=${encodeURIComponent(winnerAudio)}`);
       if (!audioResp.ok) {
@@ -246,7 +651,6 @@ export default function RatePage() {
         model: "rate-winner",
       };
 
-      // Try with identity fields; fall back without them if columns don't exist yet
       const { error: insertErr } = await supabase.from("dpo-songs").insert({
         ...baseRow,
         guest_id: guestId,
@@ -264,8 +668,6 @@ export default function RatePage() {
       setSaving(false);
     }
   }
-
-  const bReady = currentPair?.b_ready !== false;
 
   return (
     <div className="min-h-screen bg-black text-white">
@@ -323,7 +725,6 @@ export default function RatePage() {
             )}
           </div>
 
-          {/* Queue form */}
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 space-y-4">
             <h3 className="text-sm font-medium text-zinc-300">Queue new pairs</h3>
             {isSean && (
@@ -427,83 +828,73 @@ export default function RatePage() {
             </button>
           </div>
 
-          {/* Rating */}
-          {(pairState === "ready" || pairState === "partial") && currentPair ? (
+          {pairState === "ready" && currentPair ? (
             <div className="space-y-4">
               <p className="text-xs text-zinc-500 text-center">
-                {voted ? "Voted!" : bReady ? "Which sounds better?" : "Listen to A while B generates..."}
+                {voted ? "Voted!" : bothDone ? "Which sounds better?" : "Listen as they generate..."}
               </p>
               <p className="text-xs text-zinc-600 text-center font-mono break-words overflow-wrap-anywhere">{currentPair.prompt}</p>
 
-              {/* Option A */}
               <div
                 className={`bg-zinc-900 border rounded-2xl p-5 space-y-3 transition-colors ${
                   voted === "a" ? "border-white" : "border-zinc-800"
                 }`}
               >
-                <h3 className="text-sm font-medium text-zinc-300">Option A</h3>
-                <audio
-                  controls
-                  src={`${backendUrl}/audio/${currentPair.a_audio}`}
-                  className="w-full"
+                <SongCard
+                  backendUrl={backendUrl!}
+                  status={aState.status}
+                  result={aState.result}
+                  progress={aState.progress}
+                  partialAudio={aState.partialAudio}
+                  partialVersion={aState.partialVersion}
+                  chunkFiles={aState.chunkFiles}
+                  label="Option A"
                 />
-                <p className="text-xs text-zinc-600 font-mono break-words overflow-wrap-anywhere">
-                  {currentPair.tags_a}
-                </p>
                 <button
                   onClick={() => vote("a")}
-                  disabled={!!voted || !bReady}
+                  disabled={!!voted || !bothDone}
                   className={`w-full py-3 rounded-xl text-sm font-medium transition-colors ${
                     voted === "a"
                       ? "bg-white text-black"
-                      : !bReady
+                      : !bothDone
                         ? "bg-zinc-800/50 text-zinc-600 cursor-not-allowed"
                         : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
                   }`}
                 >
-                  {!bReady ? "Waiting for B..." : voted === "a" ? "Winner" : "A is better"}
+                  {!bothDone ? "Waiting for both to finish..." : voted === "a" ? "Winner" : "A is better"}
                 </button>
               </div>
 
-              {/* Option B */}
               <div
                 className={`bg-zinc-900 border rounded-2xl p-5 space-y-3 transition-colors ${
-                  !bReady ? "border-zinc-800/50 opacity-60" :
                   voted === "b" ? "border-white" : "border-zinc-800"
                 }`}
               >
-                <h3 className="text-sm font-medium text-zinc-300">Option B</h3>
-                {bReady ? (
-                  <>
-                    <audio
-                      controls
-                      src={`${backendUrl}/audio/${currentPair.b_audio}`}
-                      className="w-full"
-                    />
-                    <p className="text-xs text-zinc-600 font-mono break-words overflow-wrap-anywhere">
-                      {currentPair.tags_b}
-                    </p>
-                    <button
-                      onClick={() => vote("b")}
-                      disabled={!!voted}
-                      className={`w-full py-3 rounded-xl text-sm font-medium transition-colors ${
-                        voted === "b"
-                          ? "bg-white text-black"
-                          : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
-                      }`}
-                    >
-                      {voted === "b" ? "Winner" : "B is better"}
-                    </button>
-                  </>
-                ) : (
-                  <div className="py-8 text-center">
-                    <div className="inline-block w-5 h-5 border-2 border-zinc-600 border-t-zinc-300 rounded-full animate-spin mb-3" />
-                    <p className="text-sm text-zinc-500 animate-pulse">Generating song B...</p>
-                  </div>
-                )}
+                <SongCard
+                  backendUrl={backendUrl!}
+                  status={bState.status}
+                  result={bState.result}
+                  progress={bState.progress}
+                  partialAudio={bState.partialAudio}
+                  partialVersion={bState.partialVersion}
+                  chunkFiles={bState.chunkFiles}
+                  label="Option B"
+                />
+                <button
+                  onClick={() => vote("b")}
+                  disabled={!!voted || !bothDone}
+                  className={`w-full py-3 rounded-xl text-sm font-medium transition-colors ${
+                    voted === "b"
+                      ? "bg-white text-black"
+                      : !bothDone
+                        ? "bg-zinc-800/50 text-zinc-600 cursor-not-allowed"
+                        : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
+                  }`}
+                >
+                  {!bothDone ? "Waiting for both to finish..." : voted === "b" ? "Winner" : "B is better"}
+                </button>
               </div>
 
-              {/* Post-vote actions: save winner + next */}
               {voted && (
                 <div className="flex gap-3 pt-2">
                   <button

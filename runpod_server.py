@@ -304,7 +304,7 @@ def serve_audio(filename: str):
 @app.get("/api/status")
 def status():
     with rate_lock:
-        ready_n = len(rate_ready)
+        ready_n = len(rate_pairs)
     return {
         "pending": gen_stats["pending"],
         "completed": gen_stats["completed"],
@@ -328,8 +328,7 @@ GCS_PREFS_PREFIX = os.environ.get(
 GCS_KEY = os.environ.get("ERISED_GCS_KEY", "/workspace/key.json")
 GCS_PROJECT = os.environ.get("ERISED_GCS_PROJECT", "gen-lang-client-0191019282")
 
-rate_pending: dict[str, dict] = {}
-rate_ready: list[dict] = []
+rate_pairs: dict[str, dict] = {}  # pair_id -> info, insertion-ordered FIFO queue
 rate_stats = {"rated": 0}
 rate_lock = threading.Lock()
 
@@ -357,31 +356,34 @@ class RateVote(BaseModel):
     user_email: str | None = None
 
 
-def _resolve_ready_pair(pair_id: str, info: dict):
-    """Return a display-ready pair dict if both jobs are done, else None."""
+def _pair_view(pair_id: str, info: dict) -> dict:
+    """Render a pair for /api/next and /api/pair responses.
+
+    Each slot exposes the underlying job_id so the frontend can SSE-stream
+    chunks via /api/job/{id}/stream just like the /generate page does. Audio
+    filenames + tags are filled in lazily once each job's result lands, so the
+    pair becomes visible in the UI immediately and chunks arrive over SSE.
+    """
     with jobs_lock:
-        a = jobs.get(info["a_job"], {})
-        b = jobs.get(info["b_job"], {})
-    if a.get("status") != "done" or b.get("status") != "done":
-        return None
-    # Randomize A/B slot assignment so the rater can't bias on model position.
-    if random.random() < 0.5:
-        slot_a, slot_b = a["result"], b["result"]
-        m_a, m_b = info["a_model"], info["b_model"]
-    else:
-        slot_a, slot_b = b["result"], a["result"]
-        m_a, m_b = info["b_model"], info["a_model"]
+        a_job_state = jobs.get(info["slot_a_job"], {})
+        b_job_state = jobs.get(info["slot_b_job"], {})
+    a_result = a_job_state.get("result") or {}
+    b_result = b_job_state.get("result") or {}
     return {
         "pair_id": pair_id,
         "prompt": info["prompt"],
         "lyrics": info["lyrics"],
-        "a_audio": slot_a["audio_file"],
-        "b_audio": slot_b["audio_file"],
-        "tags_a": slot_a["tags"],
-        "tags_b": slot_b["tags"],
-        "a_model": m_a,
-        "b_model": m_b,
         "mode": info["mode"],
+        "a_job": info["slot_a_job"],
+        "b_job": info["slot_b_job"],
+        "a_audio": a_result.get("audio_file"),
+        "b_audio": b_result.get("audio_file"),
+        "tags_a": a_result.get("tags"),
+        "tags_b": b_result.get("tags"),
+        "a_model": info["slot_a_model"],
+        "b_model": info["slot_b_model"],
+        "a_status": a_job_state.get("status", "pending"),
+        "b_status": b_job_state.get("status", "pending"),
     }
 
 
@@ -398,51 +400,58 @@ def queue_pairs(req: QueueRequest):
         mode = "orig_vs_orig"
 
     if mode == "orig_vs_dpo":
-        a_model, b_model = "original", "dpo"
+        gen_a_model, gen_b_model = "original", "dpo"
     else:
-        a_model, b_model = "original", "original"
+        gen_a_model, gen_b_model = "original", "original"
 
     n = max(1, min(req.count, 10))
     for _ in range(n):
         pair_id = str(uuid.uuid4())[:8]
-        a_job = str(uuid.uuid4())[:8]
-        b_job = str(uuid.uuid4())[:8]
+        gen_a_job = str(uuid.uuid4())[:8]
+        gen_b_job = str(uuid.uuid4())[:8]
         with jobs_lock:
-            jobs[a_job] = {"status": "pending"}
-            jobs[b_job] = {"status": "pending"}
-            _save_job(a_job)
-            _save_job(b_job)
+            jobs[gen_a_job] = {"status": "pending"}
+            jobs[gen_b_job] = {"status": "pending"}
+            _save_job(gen_a_job)
+            _save_job(gen_b_job)
         gen_stats["pending"] += 2
 
+        # Randomize which generator job is shown as slot A vs slot B at queue
+        # time so we don't have to wait until both are done to assign slots.
+        if random.random() < 0.5:
+            slot_a_job, slot_b_job = gen_a_job, gen_b_job
+            slot_a_model, slot_b_model = gen_a_model, gen_b_model
+        else:
+            slot_a_job, slot_b_job = gen_b_job, gen_a_job
+            slot_a_model, slot_b_model = gen_b_model, gen_a_model
+
         with rate_lock:
-            rate_pending[pair_id] = {
+            rate_pairs[pair_id] = {
                 "prompt": req.prompt,
                 "lyrics": req.lyrics,
-                "a_job": a_job,
-                "b_job": b_job,
-                "a_model": a_model,
-                "b_model": b_model,
+                "slot_a_job": slot_a_job,
+                "slot_b_job": slot_b_job,
+                "slot_a_model": slot_a_model,
+                "slot_b_model": slot_b_model,
                 "user_email": req.user_email,
                 "mode": mode,
             }
 
-        job_queue.put((a_job, req.prompt, req.lyrics, req.max_sec, a_model, 3.0))
-        job_queue.put((b_job, req.prompt, req.lyrics, req.max_sec, b_model, 3.0))
+        job_queue.put((gen_a_job, req.prompt, req.lyrics, req.max_sec, gen_a_model, 3.0))
+        job_queue.put((gen_b_job, req.prompt, req.lyrics, req.max_sec, gen_b_model, 3.0))
 
     return {"queued": n, "mode": mode}
 
 
 @app.get("/api/next")
 def next_pair():
+    """Return the front of the rate queue. The pair is shown in the UI as
+    soon as it's been queued; per-song chunks arrive over /api/job/{id}/stream."""
     with rate_lock:
-        for pid, info in list(rate_pending.items()):
-            pair = _resolve_ready_pair(pid, info)
-            if pair is not None:
-                rate_ready.append(pair)
-                del rate_pending[pid]
-        if rate_ready:
-            return {"status": "ready", "pair": rate_ready[0]}
-        if rate_pending or gen_stats["generating"]:
+        if rate_pairs:
+            pid, info = next(iter(rate_pairs.items()))
+            return {"status": "ready", "pair": _pair_view(pid, info)}
+        if gen_stats["generating"]:
             return {"status": "generating"}
         return {"status": "empty"}
 
@@ -450,25 +459,10 @@ def next_pair():
 @app.get("/api/pair/{pair_id}")
 def get_pair(pair_id: str):
     with rate_lock:
-        for p in rate_ready:
-            if p["pair_id"] == pair_id:
-                return {
-                    "status": "ready",
-                    "pair": {**p, "a_ready": True, "b_ready": True},
-                }
-        info = rate_pending.get(pair_id)
+        info = rate_pairs.get(pair_id)
     if info is None:
         raise HTTPException(404, "Unknown pair_id")
-    pair = _resolve_ready_pair(pair_id, info)
-    if pair is not None:
-        with rate_lock:
-            rate_pending.pop(pair_id, None)
-            rate_ready.append(pair)
-        return {
-            "status": "ready",
-            "pair": {**pair, "a_ready": True, "b_ready": True},
-        }
-    return {"status": "generating"}
+    return {"status": "ready", "pair": _pair_view(pair_id, info)}
 
 
 def _save_pref_sqlite(row: dict):
@@ -542,21 +536,31 @@ def rate_pair(req: RateVote):
     if req.choice not in ("a", "b"):
         raise HTTPException(400, "Choice must be 'a' or 'b'")
     with rate_lock:
-        pair = None
-        for i, p in enumerate(rate_ready):
-            if p["pair_id"] == req.pair_id:
-                pair = rate_ready.pop(i)
-                break
-    if pair is None:
+        info = rate_pairs.get(req.pair_id)
+    if info is None:
         raise HTTPException(404, "Pair not found")
 
     if req.choice == "a":
-        winner_audio, loser_audio = pair["a_audio"], pair["b_audio"]
-        winner_model, loser_model = pair["a_model"], pair["b_model"]
+        winner_job = info["slot_a_job"]
+        loser_job = info["slot_b_job"]
+        winner_model = info["slot_a_model"]
+        loser_model = info["slot_b_model"]
     else:
-        winner_audio, loser_audio = pair["b_audio"], pair["a_audio"]
-        winner_model, loser_model = pair["b_model"], pair["a_model"]
+        winner_job = info["slot_b_job"]
+        loser_job = info["slot_a_job"]
+        winner_model = info["slot_b_model"]
+        loser_model = info["slot_a_model"]
 
+    with jobs_lock:
+        winner_state = jobs.get(winner_job, {})
+        loser_state = jobs.get(loser_job, {})
+    winner_result = winner_state.get("result")
+    loser_result = loser_state.get("result")
+    if not winner_result or not loser_result:
+        raise HTTPException(409, "Both songs must finish generating before rating")
+
+    winner_audio = winner_result["audio_file"]
+    loser_audio = loser_result["audio_file"]
     winner_id = winner_audio.rsplit(".", 1)[0]
     loser_id = loser_audio.rsplit(".", 1)[0]
     winner_tokens = os.path.join(output_dir, f"{winner_id}_tokens.pt")
@@ -564,15 +568,15 @@ def rate_pair(req: RateVote):
 
     row = {
         "pair_id": f"{winner_id}_{loser_id}",
-        "prompt": pair["prompt"],
-        "lyrics": pair["lyrics"],
+        "prompt": info["prompt"],
+        "lyrics": info["lyrics"],
         "winner_id": winner_id,
         "loser_id": loser_id,
         "winner_tokens_path": winner_tokens,
         "loser_tokens_path": loser_tokens,
         "rater_id": req.user_email or "anonymous",
         "timestamp": time.time(),
-        "mode": pair.get("mode"),
+        "mode": info.get("mode"),
         "winner_model": winner_model,
         "loser_model": loser_model,
     }
@@ -585,11 +589,13 @@ def rate_pair(req: RateVote):
 
     threading.Thread(target=_save_pref_gcs, args=(row,), daemon=True).start()
 
+    with rate_lock:
+        rate_pairs.pop(req.pair_id, None)
     rate_stats["rated"] += 1
     logger.info(
         "Rating: pair=%s winner=%s(%s) loser=%s(%s) mode=%s user=%s",
         req.pair_id, winner_id, winner_model, loser_id, loser_model,
-        pair.get("mode"), req.user_email,
+        info.get("mode"), req.user_email,
     )
     return {"status": "recorded", "count": rate_stats["rated"]}
 
