@@ -86,7 +86,7 @@ def _save_job(job_id: str):
 # ── Generation worker ────────────────────────────────────────────────
 def generation_worker():
     while True:
-        job_id, prompt, lyrics, max_sec, model_name, dpo_scale = job_queue.get()
+        job_id, prompt, lyrics, max_sec, model_name, dpo_scale, temperature = job_queue.get()
         with jobs_lock:
             jobs[job_id]["status"] = "running"
             _save_job(job_id)
@@ -121,6 +121,7 @@ def generation_worker():
                         prompt=prompt, lyrics=lyrics,
                         max_audio_length_ms=int(max_sec * 1000),
                         dpo_scale=dpo_scale,
+                        temperature=temperature,
                         on_progress=on_progress,
                         streaming_decode=True,
                         streaming_first_chunk=540,
@@ -130,13 +131,14 @@ def generation_worker():
                     gen_result = pipeline.generate(
                         prompt=prompt, lyrics=lyrics,
                         max_audio_length_ms=int(max_sec * 1000),
+                        temperature=temperature,
                         on_progress=on_progress,
                         streaming_decode=True,
                         streaming_first_chunk=540,
                         streaming_lean_gc=True,
                     )
                 elapsed = time.time() - t0
-                logger.info("[%s] Generated + decoded in %.1fs", model_name, elapsed)
+                logger.info("[%s temp=%.2f] Generated + decoded in %.1fs", model_name, temperature, elapsed)
 
             actual_audio = os.path.basename(gen_result.audio_path)
             with jobs_lock:
@@ -210,7 +212,7 @@ def submit(req: SubmitRequest):
         jobs[job_id] = {"status": "pending"}
         _save_job(job_id)
     gen_stats["pending"] += 1
-    job_queue.put((job_id, req.prompt, req.lyrics, req.max_sec, effective_model, req.dpo_scale))
+    job_queue.put((job_id, req.prompt, req.lyrics, req.max_sec, effective_model, req.dpo_scale, 1.0))
     logger.info("Job %s: model=%s, user=%s", job_id, effective_model, req.user_email)
     return {"job_id": job_id}
 
@@ -387,6 +389,15 @@ def _pair_view(pair_id: str, info: dict) -> dict:
     }
 
 
+# Per-slot temperature spread for orig_vs_orig: one slot generates "safer"
+# (lower temp), the other "more adventurous" (higher temp). Picked tight enough
+# that both slots stay coherent — wide spreads (>0.4) push the high-temp slot
+# into nonsense and the low-temp slot into monotone, which makes ratings less
+# about taste and more about "which one is broken".
+ORIG_TEMP_LOW = 0.85
+ORIG_TEMP_HIGH = 1.15
+
+
 @app.post("/api/queue")
 def queue_pairs(req: QueueRequest):
     if not req.prompt.strip() or not req.lyrics.strip():
@@ -401,8 +412,15 @@ def queue_pairs(req: QueueRequest):
 
     if mode == "orig_vs_dpo":
         gen_a_model, gen_b_model = "original", "dpo"
+        # In orig_vs_dpo the variable being rated IS the model, so keep
+        # temperature fixed across both slots to avoid confounding signal.
+        gen_a_temp, gen_b_temp = 1.0, 1.0
     else:
         gen_a_model, gen_b_model = "original", "original"
+        # In orig_vs_orig both slots are the same model — vary temperature
+        # so the user is rating a meaningful "creative vs safer" contrast
+        # instead of two near-identical seed rolls.
+        gen_a_temp, gen_b_temp = ORIG_TEMP_LOW, ORIG_TEMP_HIGH
 
     n = max(1, min(req.count, 10))
     for _ in range(n):
@@ -421,9 +439,11 @@ def queue_pairs(req: QueueRequest):
         if random.random() < 0.5:
             slot_a_job, slot_b_job = gen_a_job, gen_b_job
             slot_a_model, slot_b_model = gen_a_model, gen_b_model
+            slot_a_temp, slot_b_temp = gen_a_temp, gen_b_temp
         else:
             slot_a_job, slot_b_job = gen_b_job, gen_a_job
             slot_a_model, slot_b_model = gen_b_model, gen_a_model
+            slot_a_temp, slot_b_temp = gen_b_temp, gen_a_temp
 
         with rate_lock:
             rate_pairs[pair_id] = {
@@ -433,12 +453,14 @@ def queue_pairs(req: QueueRequest):
                 "slot_b_job": slot_b_job,
                 "slot_a_model": slot_a_model,
                 "slot_b_model": slot_b_model,
+                "slot_a_temp": slot_a_temp,
+                "slot_b_temp": slot_b_temp,
                 "user_email": req.user_email,
                 "mode": mode,
             }
 
-        job_queue.put((gen_a_job, req.prompt, req.lyrics, req.max_sec, gen_a_model, 3.0))
-        job_queue.put((gen_b_job, req.prompt, req.lyrics, req.max_sec, gen_b_model, 3.0))
+        job_queue.put((gen_a_job, req.prompt, req.lyrics, req.max_sec, gen_a_model, 3.0, gen_a_temp))
+        job_queue.put((gen_b_job, req.prompt, req.lyrics, req.max_sec, gen_b_model, 3.0, gen_b_temp))
 
     return {"queued": n, "mode": mode}
 
@@ -545,11 +567,15 @@ def rate_pair(req: RateVote):
         loser_job = info["slot_b_job"]
         winner_model = info["slot_a_model"]
         loser_model = info["slot_b_model"]
+        winner_temp = info.get("slot_a_temp", 1.0)
+        loser_temp = info.get("slot_b_temp", 1.0)
     else:
         winner_job = info["slot_b_job"]
         loser_job = info["slot_a_job"]
         winner_model = info["slot_b_model"]
         loser_model = info["slot_a_model"]
+        winner_temp = info.get("slot_b_temp", 1.0)
+        loser_temp = info.get("slot_a_temp", 1.0)
 
     with jobs_lock:
         winner_state = jobs.get(winner_job, {})
@@ -579,6 +605,8 @@ def rate_pair(req: RateVote):
         "mode": info.get("mode"),
         "winner_model": winner_model,
         "loser_model": loser_model,
+        "winner_temp": winner_temp,
+        "loser_temp": loser_temp,
     }
 
     try:
@@ -593,8 +621,9 @@ def rate_pair(req: RateVote):
         rate_pairs.pop(req.pair_id, None)
     rate_stats["rated"] += 1
     logger.info(
-        "Rating: pair=%s winner=%s(%s) loser=%s(%s) mode=%s user=%s",
-        req.pair_id, winner_id, winner_model, loser_id, loser_model,
+        "Rating: pair=%s winner=%s(%s,t=%.2f) loser=%s(%s,t=%.2f) mode=%s user=%s",
+        req.pair_id, winner_id, winner_model, winner_temp,
+        loser_id, loser_model, loser_temp,
         info.get("mode"), req.user_email,
     )
     return {"status": "recorded", "count": rate_stats["rated"]}
