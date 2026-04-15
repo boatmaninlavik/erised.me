@@ -487,6 +487,19 @@ def get_pair(pair_id: str):
     return {"status": "ready", "pair": _pair_view(pair_id, info)}
 
 
+@app.delete("/api/pair/{pair_id}")
+def skip_pair(pair_id: str):
+    """Drop a pair from the rate queue without writing a preference. Used
+    when generation produced unplayable/empty audio so the user can move on."""
+    with rate_lock:
+        info = rate_pairs.pop(pair_id, None)
+    if info is None:
+        raise HTTPException(404, "Unknown pair_id")
+    logger.info("Skipped pair %s (a=%s b=%s mode=%s)",
+                pair_id, info.get("slot_a_job"), info.get("slot_b_job"), info.get("mode"))
+    return {"skipped": pair_id}
+
+
 def _save_pref_sqlite(row: dict):
     conn = sqlite3.connect(DPO_DB_PATH)
     try:

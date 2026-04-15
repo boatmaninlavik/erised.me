@@ -615,6 +615,15 @@ export default function RatePage() {
     fetchNext();
   }
 
+  async function skipPair() {
+    if (!backendUrl || !currentPair) return;
+    const pid = currentPair.pair_id;
+    try {
+      await fetch(`${backendUrl}/api/pair/${pid}`, { method: "DELETE" });
+    } catch {}
+    goToNext();
+  }
+
   async function saveWinnerToLibrary() {
     if (!currentPair || !voted) return;
     const winnerResult = voted === "a" ? aState.result : bState.result;
@@ -913,6 +922,17 @@ export default function RatePage() {
                     className="flex-1 py-3 bg-white text-black font-semibold rounded-xl text-sm tracking-tight hover:bg-zinc-100 transition-colors"
                   >
                     Next Pair
+                  </button>
+                </div>
+              )}
+
+              {!voted && (
+                <div className="pt-1">
+                  <button
+                    onClick={skipPair}
+                    className="w-full py-2 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+                  >
+                    Skip this pair (audio broken or unplayable)
                   </button>
                 </div>
               )}
