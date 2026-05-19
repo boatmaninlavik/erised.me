@@ -430,7 +430,7 @@ export default function RatePage() {
   const { user, guestId } = useAuth();
   const isSean = user?.email === SEAN_EMAIL;
   const [backendUrl, setBackendUrl] = useState<string | null>(null);
-  const [gpuStatus, setGpuStatus] = useState<"loading" | "online" | "offline" | "starting">("loading");
+  const [gpuStatus, setGpuStatus] = useState<"loading" | "online" | "offline" | "starting">("online");
   const [prompt, setPrompt] = useState("");
   const [lyrics, setLyrics] = useState("");
   const [maxSec, setMaxSec] = useState(60);
@@ -453,51 +453,13 @@ export default function RatePage() {
   const bCleanupRef = useRef<(() => void) | null>(null);
   const fetchingNextRef = useRef(false);
 
-  const loadBackendUrl = useCallback(async () => {
+  // GPU wakes on first /api/queue. No /health polling — that kept the container alive indefinitely.
+  useEffect(() => {
     const RUNPOD_URL = process.env.NEXT_PUBLIC_RUNPOD_URL;
     const MODAL_URL = "https://boatmaninlavik--erised-gpu-serve.modal.run";
-
-    if (RUNPOD_URL) {
-      try {
-        const resp = await fetch(`${RUNPOD_URL}/health`, { signal: AbortSignal.timeout(3000) });
-        if (resp.ok) {
-          setBackendUrl(RUNPOD_URL);
-          setGpuStatus("online");
-          return;
-        }
-      } catch {}
-    }
-
-    try {
-      const resp = await fetch(`${MODAL_URL}/health`, { signal: AbortSignal.timeout(5000) });
-      if (resp.ok) {
-        setBackendUrl(MODAL_URL);
-        setGpuStatus("online");
-        return;
-      }
-    } catch {}
-
-    setGpuStatus("starting");
-    try {
-      const resp = await fetch(`${MODAL_URL}/health`, { signal: AbortSignal.timeout(120000) });
-      if (resp.ok) {
-        setBackendUrl(MODAL_URL);
-        setGpuStatus("online");
-      } else {
-        setBackendUrl(null);
-        setGpuStatus("offline");
-      }
-    } catch {
-      setBackendUrl(null);
-      setGpuStatus("offline");
-    }
+    setBackendUrl(RUNPOD_URL || MODAL_URL);
+    setGpuStatus("online");
   }, []);
-
-  useEffect(() => {
-    loadBackendUrl();
-    const interval = setInterval(loadBackendUrl, 30000);
-    return () => clearInterval(interval);
-  }, [loadBackendUrl]);
 
   const stopStreams = useCallback(() => {
     if (aCleanupRef.current) { aCleanupRef.current(); aCleanupRef.current = null; }
@@ -540,6 +502,9 @@ export default function RatePage() {
 
   useEffect(() => {
     if (!backendUrl) return;
+    // Only poll while there's outstanding work; otherwise this would keep the GPU alive forever.
+    const hasWork = serverStatus.pending > 0 || serverStatus.ready > 0 || currentPair !== null;
+    if (!hasWork) return;
     const interval = setInterval(async () => {
       try {
         const resp = await fetch(`${backendUrl}/api/status`);
@@ -549,7 +514,7 @@ export default function RatePage() {
       } catch {}
     }, 2000);
     return () => clearInterval(interval);
-  }, [backendUrl, currentPair, fetchNext]);
+  }, [backendUrl, currentPair, fetchNext, serverStatus.pending, serverStatus.ready]);
 
   useEffect(() => () => { stopStreams(); }, [stopStreams]);
 
@@ -583,6 +548,8 @@ export default function RatePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt, lyrics, max_sec: maxSec, count, mode, user_email: user?.email || null }),
       });
+      // Optimistically reflect the new jobs so the polling effect kicks back in.
+      setServerStatus((s) => ({ ...s, pending: s.pending + count * 2 }));
       if (!currentPair) fetchNext();
     } finally {
       setQueueing(false);
@@ -709,7 +676,7 @@ export default function RatePage() {
             The generation server isn&apos;t running right now. Check back later.
           </p>
           <button
-            onClick={loadBackendUrl}
+            onClick={() => window.location.reload()}
             className="text-xs text-zinc-600 hover:text-zinc-400 transition-colors mt-4"
           >
             Retry connection
