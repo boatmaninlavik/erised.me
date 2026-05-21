@@ -204,7 +204,7 @@ def serve():
             audio_filename = f"{job_id}.wav"
             audio_path = os.path.join(output_dir, audio_filename)
 
-            def on_progress(current_frame, total_frames, partial_audio_file=None, partial_version=None):
+            def on_progress(current_frame, total_frames, partial_audio_file=None, partial_version=None, **kwargs):
                 with jobs_lock:
                     jobs[job_id]["progress"] = {
                         "current_frame": current_frame,
