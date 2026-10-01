@@ -36,7 +36,7 @@ MPS_REPO, SHAO_REPO = "Vinpolar/Khala-MusicGeneration-v1.0-MPS", "liujiafeng/Sha
 SR, FRAME, EOS = 44100, 2048, 128001
 MIN_MINUTES, MAX_MINUTES = 1, 4
 
-H100_USD_PER_S = 3.95 / 3600
+H100_USD_PER_S = 4.4 / 3600     # H100 $3.95/h + container memory/CPU, rounded up
 IDLE_S_PER_SONG = 60          # = scaledown_window: the GPU stays up this long after the last song
 SPEND_CAP_USD = 25.0          # leaves room under the $30 workspace credit for the web app + rounding
 
@@ -108,7 +108,7 @@ def setup():
 
 
 # ------------------------------------------------------------------ the GPU worker
-@app.cls(image=gpu_image, gpu="H100", memory=65536, volumes={"/data": vol}, timeout=1800,
+@app.cls(image=gpu_image, gpu="H100", memory=32768, volumes={"/data": vol}, timeout=1800,
          scaledown_window=IDLE_S_PER_SONG, max_containers=1)
 class ShaoWorker:
     @modal.enter()
