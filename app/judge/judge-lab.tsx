@@ -7,12 +7,12 @@ import { BlindTest } from "./blind-test";
 import { ResultsView } from "./results";
 import { Segmented, Spinner } from "./ui";
 
-// Chart colors validated for this surface with the dataviz palette checker:
-// accent #3987e5 and emphasis #d95926 both pass contrast + colorblind separation on #111113.
+// Model colors on the #111113 surface: the model being tested is blue (#3987e5), the one it's
+// compared against is light gray (#a1a1aa) — they differ in hue and lightness, so colorblind-safe.
 const THEME = {
   "--jl-surface": "#111113",
   "--jl-accent": "#3987e5",
-  "--jl-emph": "#d95926",
+  "--jl-older": "#a1a1aa",
 } as React.CSSProperties;
 
 type View = "test" | "results";

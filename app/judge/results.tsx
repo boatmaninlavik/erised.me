@@ -5,8 +5,8 @@ import type { Results, Side } from "@/lib/judge-lab-types";
 import { audioUrl, MiniPlayer, type PlayRequest } from "./audio";
 import { Card, DownloadIcon, PlayIcon, Spinner, cx, pct, songFileName, wilson } from "./ui";
 
-// Newer model (listed last in the pair set) gets the accent color, the older one the emphasis color.
-const COLORS = ["var(--jl-emph)", "var(--jl-accent)"];
+// Newer model (listed last in the pair set) is blue, the one it's compared against light gray.
+const COLORS = ["var(--jl-older)", "var(--jl-accent)"];
 
 const shortPrompt = (p: string) => {
   const text = p.replace(/\s+/g, " ").trim() || "Untitled prompt";

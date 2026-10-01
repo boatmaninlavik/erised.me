@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BlindPair, BlindSet, Choice, HistoryItem, Revealed, SetSummary, Side } from "@/lib/judge-lab-types";
 import { audioUrl, MiniPlayer, PlayButton, Scrubber, usePlayer, type Player, type PlayRequest } from "./audio";
-import { Card, DownloadIcon, Kbd, PlayIcon, Spinner, cx, formatTime, songFileName } from "./ui";
+import { Card, DownloadIcon, EyeOffIcon, Kbd, PlayIcon, Spinner, cx, formatTime, songFileName } from "./ui";
 
 const other = (s: Side): Side => (s === "a" ? "b" : "a");
 const coin = (): Side => (Math.random() < 0.5 ? "a" : "b");
@@ -30,14 +30,23 @@ export function BlindTest({ set, onVoted, onSeeResults }: {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [replay, setReplay] = useState<PlayRequest>(null);
   const [replaying, setReplaying] = useState<string | null>(null);
-  const [revealed, setRevealed] = useState<Record<string, Revealed>>({});
+  // Reveals are fetched once and cached; hiding just stops showing them, so re-revealing is instant.
+  const revealCache = useRef<Record<string, Revealed>>({});
+  const [shown, setShown] = useState<Set<string>>(new Set());
   const reveal = useCallback(async (uid: string) => {
-    const r = await fetch(`/api/judge-lab/reveal?set=${encodeURIComponent(set.id)}&uid=${encodeURIComponent(uid)}`);
-    if (r.ok) {
-      const info: Revealed = await r.json();
-      setRevealed((m) => ({ ...m, [uid]: info }));
+    if (!revealCache.current[uid]) {
+      const r = await fetch(`/api/judge-lab/reveal?set=${encodeURIComponent(set.id)}&uid=${encodeURIComponent(uid)}`);
+      if (!r.ok) return;
+      revealCache.current[uid] = await r.json();
     }
+    setShown((s) => new Set(s).add(uid));
   }, [set.id]);
+  const hide = useCallback((uid: string) => setShown((s) => {
+    const n = new Set(s);
+    n.delete(uid);
+    return n;
+  }), []);
+  const revealed = (uid: string) => (shown.has(uid) ? revealCache.current[uid] : undefined);
   const active = useRef<"L" | "R">("L");
 
   useEffect(() => {
@@ -161,7 +170,8 @@ export function BlindTest({ set, onVoted, onSeeResults }: {
                 <p className="font-medium">
                   {saved === "tie" ? "Saved: you couldn't tell them apart." : `Saved: you picked ${pickedDisplay(saved, left)}.`}
                 </p>
-                <PickReveal choice={saved} left={left} info={revealed[pair.uid]} onReveal={() => reveal(pair.uid)} />
+                <PickReveal choice={saved} left={left} info={revealed(pair.uid)}
+                  onReveal={() => reveal(pair.uid)} onHide={() => hide(pair.uid)} />
               </div>
               <div className="flex items-center gap-4">
                 <button onClick={() => { setSaved(null); setRevising(true); }} className="text-xs text-zinc-500 transition-colors hover:text-white">
@@ -209,7 +219,10 @@ export function BlindTest({ set, onVoted, onSeeResults }: {
           pairs={data.pairs}
           nowPlaying={replaying}
           revealed={revealed}
+          shownCount={history.filter((h) => shown.has(h.uid)).length}
           onReveal={reveal}
+          onHide={hide}
+          onHideAll={() => setShown(new Set())}
           onPlay={(p, letter, side) => {
             L.pause(); R.pause();
             setReplay((r) => ({ n: (r?.n ?? 0) + 1, track: { id: `${p.uid}:${side}`, title: `Take ${letter}`, sub: p.prompt, audio: p.audio[side] } }));
@@ -307,20 +320,33 @@ const shortPrompt = (p: string) => {
 };
 
 /** Every pair you've already rated, in the A/B layout you heard it — replay or download either take. */
-function RatedPairs({ history, pairs, nowPlaying, revealed, onReveal, onPlay }: {
+function RatedPairs({ history, pairs, nowPlaying, revealed, shownCount, onReveal, onHide, onHideAll, onPlay }: {
   history: HistoryItem[];
   pairs: BlindPair[];
   nowPlaying: string | null;
-  revealed: Record<string, Revealed>;
+  revealed: (uid: string) => Revealed | undefined;
+  shownCount: number;
   onReveal: (uid: string) => void;
+  onHide: (uid: string) => void;
+  onHideAll: () => void;
   onPlay: (p: BlindPair, letter: "A" | "B", side: Side) => void;
 }) {
   const byUid = new Map(pairs.map((p) => [p.uid, p]));
   return (
     <details className="group rounded-2xl border border-white/[0.06] px-5 py-4 open:bg-white/[0.02]">
-      <summary className="cursor-pointer list-none text-sm text-zinc-400 transition-colors hover:text-white">
-        <span className="mr-2 inline-block transition-transform group-open:rotate-90">›</span>
-        Pairs you&apos;ve rated ({history.length}) — replay or download a take
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-4 text-sm text-zinc-400">
+        <span className="transition-colors hover:text-white">
+          <span className="mr-2 inline-block transition-transform group-open:rotate-90">›</span>
+          Pairs you&apos;ve rated ({history.length}) — replay or download a take
+        </span>
+        {shownCount > 0 && (
+          <button
+            onClick={(e) => { e.preventDefault(); onHideAll(); }}
+            className="hidden items-center gap-1.5 text-xs text-zinc-500 transition-colors hover:text-white group-open:inline-flex"
+          >
+            <EyeOffIcon className="h-3.5 w-3.5" /> Hide all models
+          </button>
+        )}
       </summary>
       <ul className="mt-3 divide-y divide-white/[0.06]">
         {history.map((h) => {
@@ -330,9 +356,10 @@ function RatedPairs({ history, pairs, nowPlaying, revealed, onReveal, onPlay }: 
           return (
             <li key={h.uid} className="flex flex-wrap items-center gap-x-5 gap-y-2 py-3">
               <p className="min-w-0 flex-1 basis-64 truncate text-sm text-zinc-300" title={p.prompt}>{shortPrompt(p.prompt)}</p>
-              <div className="flex w-64 shrink-0 items-center gap-3 text-xs">
-                <span className="text-zinc-500">{h.choice === "tie" ? "Couldn't tell" : `You picked ${h.choice === h.left ? "A" : "B"}`}</span>
-                <PickReveal choice={h.choice} left={h.left} info={revealed[h.uid]} onReveal={() => onReveal(h.uid)} small />
+              <div className="flex w-72 shrink-0 items-center gap-3 text-xs">
+                <span className="whitespace-nowrap text-zinc-500">{h.choice === "tie" ? "Couldn't tell" : `You picked ${h.choice === h.left ? "A" : "B"}`}</span>
+                <PickReveal choice={h.choice} left={h.left} info={revealed(h.uid)}
+                  onReveal={() => onReveal(h.uid)} onHide={() => onHide(h.uid)} small />
               </div>
               <div className="flex shrink-0 items-center gap-3">
                 {takes.map(([letter, side]) => {
@@ -357,33 +384,46 @@ function RatedPairs({ history, pairs, nowPlaying, revealed, onReveal, onPlay }: 
   );
 }
 
-/** Dot + model name; the newer model gets the accent color, the older one the emphasis color. */
-function ModelTag({ m }: { m: Revealed[Side] }) {
+/** "Fine-tuned Shao (sft_v1)" -> "Fine-tuned", "Original Shao" -> "Original" (full name stays in the tooltip). */
+const shortName = (name: string) => name.replace(/\s*\([^)]*\)\s*$/, "").replace(/\s*\bShao\b\s*/g, " ").trim() || name;
+
+/** Dot + model name: the model being tested is blue, the one it's compared against light gray. */
+function ModelTag({ m, short }: { m: Revealed[Side]; short?: boolean }) {
   return (
     <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-      <span className="h-2 w-2 rounded-full" style={{ background: m.newer ? "var(--jl-accent)" : "var(--jl-emph)" }} />
-      <span className="text-zinc-200">{m.name}</span>
+      <span className="h-2 w-2 rounded-full" style={{ background: m.newer ? "var(--jl-accent)" : "var(--jl-older)" }} />
+      <span className="text-zinc-200">{short ? shortName(m.name) : m.name}</span>
     </span>
   );
 }
 
-/** "Reveal model" link that turns into the model behind your pick (both models for "can't tell"). */
-function PickReveal({ choice, left, info, onReveal, small }: {
-  choice: Choice; left: Side; info?: Revealed; onReveal: () => void; small?: boolean;
+/** "Reveal model" button that turns into the model behind your pick (both models for "can't tell").
+ *  Click the revealed label to hide it again. */
+function PickReveal({ choice, left, info, onReveal, onHide, small }: {
+  choice: Choice; left: Side; info?: Revealed; onReveal: () => void; onHide: () => void; small?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
   if (info) {
+    const full = choice === "tie"
+      ? `A: ${info[left].name} · B: ${info[other(left)].name}`
+      : info[choice].name;
     return (
-      <span className={cx("inline-flex flex-wrap items-center gap-x-3 gap-y-1", small ? "text-xs" : "text-sm")}>
+      <button
+        onClick={onHide}
+        title={`${full} — click to hide`}
+        className={cx("group/tag inline-flex items-center gap-2 rounded-md px-1.5 py-0.5 -mx-1.5 transition-colors hover:bg-white/[0.05]",
+          small ? "text-xs" : "text-sm")}
+      >
         {choice === "tie" ? (
           <>
-            <span className="text-zinc-500">A</span><ModelTag m={info[left]} />
-            <span className="text-zinc-500">B</span><ModelTag m={info[other(left)]} />
+            <span className="text-zinc-500">A</span><ModelTag m={info[left]} short={small} />
+            <span className="text-zinc-500">B</span><ModelTag m={info[other(left)]} short={small} />
           </>
         ) : (
-          <ModelTag m={info[choice]} />
+          <ModelTag m={info[choice]} short={small} />
         )}
-      </span>
+        <EyeOffIcon className="h-3.5 w-3.5 text-zinc-500 opacity-0 transition-opacity group-hover/tag:opacity-100" />
+      </button>
     );
   }
   return (
