@@ -29,10 +29,6 @@ export default function Home() {
             <Link href="/library" className="hover:text-zinc-300 transition-colors tracking-tight">
               My Library
             </Link>
-            <span>·</span>
-            <Link href="/rate" className="hover:text-zinc-300 transition-colors tracking-tight">
-              Rate songs — let Erised know your taste
-            </Link>
           </div>
         </div>
       </div>

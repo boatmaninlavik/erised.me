@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
+import { GEN_URL } from "@/lib/backend";
 
+// Fetches a finished song from the generator so the browser can save it to Supabase.
 export async function GET(req: NextRequest) {
   const file = req.nextUrl.searchParams.get("file");
   if (!file) {
@@ -12,21 +14,8 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Invalid filename" }, { status: 400 });
   }
 
-  const RUNPOD_URL = process.env.NEXT_PUBLIC_RUNPOD_URL;
-  const MODAL_URL = "https://boatmaninlavik--erised-gpu-serve.modal.run";
-
-  // Try RunPod first, fall back to Modal
-  let backendUrl: string | null = null;
-  if (RUNPOD_URL) {
-    try {
-      const h = await fetch(`${RUNPOD_URL}/health`, { signal: AbortSignal.timeout(2000) });
-      if (h.ok) backendUrl = RUNPOD_URL;
-    } catch {}
-  }
-  if (!backendUrl) backendUrl = MODAL_URL;
-
   try {
-    const resp = await fetch(`${backendUrl}/audio/${sanitized}`, {
+    const resp = await fetch(`${GEN_URL}/audio/${sanitized}`, {
       signal: AbortSignal.timeout(30000),
     });
     if (!resp.ok) {
@@ -37,7 +26,7 @@ export async function GET(req: NextRequest) {
     }
 
     const arrayBuffer = await resp.arrayBuffer();
-    const contentType = resp.headers.get("content-type") || "audio/wav";
+    const contentType = resp.headers.get("content-type") || "audio/mpeg";
 
     return new NextResponse(arrayBuffer, {
       headers: { "Content-Type": contentType },

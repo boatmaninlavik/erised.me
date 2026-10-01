@@ -182,7 +182,7 @@ export default function LibraryPage() {
                             ? "bg-zinc-800 text-zinc-400"
                             : "bg-zinc-800 text-zinc-500"
                       }`}>
-                        {song.model === "rate-winner" ? "Rated" : song.model === "dpo" ? "DPO" : "Original"}
+                        {song.model === "rate-winner" ? "Rated" : song.model === "dpo" ? "DPO" : song.model?.startsWith("shao") ? "Shao" : "Original"}
                       </span>
                     </div>
                     <p className="text-xs text-zinc-500 mt-1">{formatDate(song.created_at)}</p>
