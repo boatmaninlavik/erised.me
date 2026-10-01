@@ -356,7 +356,7 @@ function RatedPairs({ history, pairs, nowPlaying, revealed, shownCount, onReveal
           return (
             <li key={h.uid} className="flex flex-wrap items-center gap-x-5 gap-y-2 py-3">
               <p className="min-w-0 flex-1 basis-64 truncate text-sm text-zinc-300" title={p.prompt}>{shortPrompt(p.prompt)}</p>
-              <div className="flex w-72 shrink-0 items-center gap-3 text-xs">
+              <div className="flex w-80 shrink-0 items-center gap-3 text-xs">
                 <span className="whitespace-nowrap text-zinc-500">{h.choice === "tie" ? "Couldn't tell" : `You picked ${h.choice === h.left ? "A" : "B"}`}</span>
                 <PickReveal choice={h.choice} left={h.left} info={revealed(h.uid)}
                   onReveal={() => onReveal(h.uid)} onHide={() => onHide(h.uid)} small />

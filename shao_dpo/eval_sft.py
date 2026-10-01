@@ -483,10 +483,10 @@ def listen_prep(seed: int = 2026):
                       "b": f"b2://{B2_BUCKET}/{OUT}listen/{p['pid']:02d}_{b}.mp3",
                       "model": {"a": a, "b": b}, "prior": None, "prior_label": None})
     _put("listen/pairset.json", {
-        "id": f"shao-{RUN}", "kind": "model-ab", "title": "Original Shao vs fine-tuned Shao",
+        "id": f"shao-{RUN}", "kind": "model-ab", "title": "Original Khala vs SFT Khala",
         "blurb": f"Same {len(pairs)} test prompts, one take from each model, loudness-matched to {LISTEN_LUFS:g} LUFS. "
                  "Which take is which stays hidden until you finish.",
-        "models": {"original": "Original Shao", "final": f"Fine-tuned Shao ({RUN})"},
+        "models": {"original": "Original Khala", "final": "SFT Khala"},
         "pairs": pairs})
     return {"pairs": len(pairs), "max_lufs_error": max(abs(r["lufs_after"] - LISTEN_LUFS) for r in rows)}
 
