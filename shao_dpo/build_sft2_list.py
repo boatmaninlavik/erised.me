@@ -2,9 +2,11 @@
 
 Every song folder with audio (songs/<id>/audio.*) is checked against Cursor's own eligibility rule
 (sft_core.eligible: plain Suno generation `type == "gen"`, no extend/concat/edit/crop/upsample/cover/remix/stem
-history or special task, public + complete, has lyrics and a style prompt, >= 30 s, >= 125 likes, >= 100 plays)
-— with two differences: instrumental songs are kept (the first run had 537; Cursor's rule now skips them only for
-collecting) and persona songs are kept (normal songs sung with a saved voice). Then:
+history or special task, complete, has lyrics and a style prompt, >= 30 s, >= 125 likes, >= 100 plays)
+— with three differences: instrumental songs are kept (the first run had 537; Cursor's rule now skips them only for
+collecting), persona songs are kept (normal songs sung with a saved voice), and songs marked non-public /
+hidden / trashed are kept when we already have their audio (Sean, 2026-10-02: research training data; CDN audio
+was already scraped). Then:
   - exact duplicate recordings (same audio fingerprint under two IDs) keep only the most-liked one
   - lyrics get a `lyrics` = cleaned copy (copyright / link / credit / markdown-only lines removed, markdown section
     headings turned into [Section]); the original stays in `lyrics_raw`
@@ -13,7 +15,7 @@ collecting) and persona songs are kept (normal songs sung with a saved voice). T
   - at most 2% of the list per creator (most-liked kept), same as Cursor's lists
 
 Output (B2): selected/sft2/list.jsonl (token-converter schema), selected/sft2/summary.json,
-             selected/sft2/rejected_examples.json
+             selected/sft2/left_out_ids.json (every left-out song ID, by reason), selected/sft2/rejected_examples.json
 Runs every 2 hours once deployed, so Cursor's newly downloaded songs are picked up automatically.
 
 Run:    MODAL_PROFILE=erised7 modal run --detach shao_dpo/build_sft2_list.py      (once now)
@@ -45,12 +47,11 @@ def meaningful(v):
 
 
 def why_not(c, likes, plays):
-    """Cursor's eligible(), returning the reason, minus the instrumental exclusion."""
+    """Cursor's eligible(), returning the reason, minus instrumental + not_public exclusions."""
     m = c.get("metadata") or {}
     if not c.get("id") or not c.get("user_id"):
         return "no_creator_id"
-    if c.get("is_public") is False or c.get("is_hidden") or c.get("is_trashed"):
-        return "not_public"
+    # Keep songs we already have audio for even if Suno marks them private/hidden/trashed.
     if c.get("status") != "complete":
         return "not_complete"
     if m.get("type") != "gen":
@@ -164,16 +165,19 @@ def build():
         metas = dict(zip(ids, pool.map(meta, ids)))
 
     reasons, examples, keep = collections.Counter(), collections.defaultdict(list), []
+    left_ids = collections.defaultdict(list)                       # reason -> every song ID left out for it
     for cid in ids:
         c = metas[cid]
         if not c:
             reasons["no_metadata_file"] += 1
+            left_ids["no_metadata_file"].append(cid)
             continue
         likes = max(int(c.get("upvote_count") or 0), seen_likes[cid])
         plays = max(int(c.get("play_count") or 0), seen_plays[cid])
         why = why_not(c, likes, plays)
         if why:
             reasons[why] += 1
+            left_ids[why].append(cid)
             if len(examples[why]) < 5:
                 examples[why].append({"id": cid, "likes": likes, "title": c.get("title")})
             continue
@@ -188,6 +192,7 @@ def build():
         group.sort(key=lambda x: -x[2])
         deduped.append(group[0])
         reasons["duplicate_recording"] += len(group) - 1
+        left_ids["duplicate_recording"] += [x[0] for x in group[1:]]
 
     # 2% creator cap, most-liked first
     deduped.sort(key=lambda x: -x[2])
@@ -197,6 +202,7 @@ def build():
         uid = item[1]["user_id"]
         if per_creator[uid] >= cap:
             reasons["over_creator_cap"] += 1
+            left_ids["over_creator_cap"].append(item[0])
             continue
         per_creator[uid] += 1
         final.append(item)
@@ -242,6 +248,7 @@ def build():
         "left_out": dict(reasons.most_common()), "lyrics_cleaning": dict(cleaning.most_common()),
     }
     s3.put_object(Bucket=BUCKET, Key=OUT + "summary.json", Body=json.dumps(summary, indent=1).encode())
+    s3.put_object(Bucket=BUCKET, Key=OUT + "left_out_ids.json", Body=json.dumps(left_ids).encode())
     s3.put_object(Bucket=BUCKET, Key=OUT + "rejected_examples.json", Body=json.dumps(examples, indent=1, ensure_ascii=False).encode())
     print(json.dumps(summary), flush=True)
     return summary
