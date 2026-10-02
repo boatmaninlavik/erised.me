@@ -1,10 +1,10 @@
 """Build (and keep rebuilding) the song list for the second fine-tuning run, from everything in B2 erised-sft.
 
 Every song folder with audio (songs/<id>/audio.*) is checked against Cursor's own eligibility rule
-(sft_core.eligible: plain Suno generation `type == "gen"`, no extend/concat/edit/crop/upsample/cover/persona/
-remix/stem history, public + complete, has lyrics and a style prompt, >= 30 s, >= 125 likes, >= 100 plays) — with
-one difference: instrumental songs are kept (the first run had 537; Cursor's rule now skips them only for
-collecting). Then:
+(sft_core.eligible: plain Suno generation `type == "gen"`, no extend/concat/edit/crop/upsample/cover/remix/stem
+history or special task, public + complete, has lyrics and a style prompt, >= 30 s, >= 125 likes, >= 100 plays)
+— with two differences: instrumental songs are kept (the first run had 537; Cursor's rule now skips them only for
+collecting) and persona songs are kept (normal songs sung with a saved voice). Then:
   - exact duplicate recordings (same audio fingerprint under two IDs) keep only the most-liked one
   - lyrics get a `lyrics` = cleaned copy (copyright / link / credit / markdown-only lines removed, markdown section
     headings turned into [Section]); the original stays in `lyrics_raw`
@@ -30,9 +30,11 @@ import modal
 BUCKET, ENDPOINT = "erised-sft", "https://s3.us-west-004.backblazeb2.com"
 OUT = "selected/sft2/"
 MIN_LIKES, MIN_PLAYS, MIN_SECONDS, CREATOR_SHARE = 125, 100, 30, 0.02
-SPECIAL = ("cover_clip_id", "persona_id", "artist_clip_id", "continue_at", "infill", "upsample_clip_id",
+SPECIAL = ("cover_clip_id", "artist_clip_id", "continue_at", "infill", "upsample_clip_id",
            "edited_clip_id", "overpainting_clip_id", "underpainting_clip_id", "mashup_clip_ids", "stem_from_id",
-           "history", "concat_history", "speed_clip_id", "is_remix")          # = Cursor's sft_core.SPECIAL
+           "history", "concat_history", "speed_clip_id", "is_remix")
+# = Cursor's sft_core.SPECIAL minus persona_id: persona songs (a normal song sung with a voice the creator saved)
+# are kept (Sean, 2026-10-02: "persona songs are fine so long as the music is good")
 
 app = modal.App("sft2-list")
 image = modal.Image.debian_slim(python_version="3.11").pip_install("boto3")
@@ -53,8 +55,8 @@ def why_not(c, likes, plays):
         return "not_complete"
     if m.get("type") != "gen":
         return f"type_{m.get('type') or 'unknown'}"
-    if meaningful(m.get("task")) or meaningful(c.get("persona")):
-        return "task_or_persona"
+    if meaningful(m.get("task")):
+        return f"task_{m.get('task')}"
     for k in SPECIAL:
         if meaningful(m.get(k)):
             return f"derived_{k}"
