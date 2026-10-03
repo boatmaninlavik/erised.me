@@ -243,6 +243,10 @@ def build():
         raw = m.get("prompt") or ""
         instrumental = bool(m.get("make_instrumental")) or m.get("has_vocal") is False
         clean, removed = clean_lyrics(raw) if not instrumental else ("", collections.Counter())
+        if not instrumental and len(re.sub(r"[\W_]+", "", clean)) < 3:      # the "lyrics" were only links/credits
+            reasons["no_lyrics_after_cleaning"] += 1
+            left_ids["no_lyrics_after_cleaning"].append(cid)
+            continue
         cleaning.update(removed)
         cleaning["songs_changed"] += int(bool(removed))
         split = v1[cid]["split"] if cid in v1 else ("test" if c["user_id"] in test_creators else "train")

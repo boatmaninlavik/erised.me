@@ -248,6 +248,91 @@ def check_a(tag: str):
     return tag
 
 
+# ------------------------------------------------------------------ surprise: real Suno songs vs the model's own songs
+@app.function(image=gen_image, gpu="H100", memory=65536, volumes={"/data": vol}, secrets=[b2_secret], timeout=3600)
+def surprise_compare(max_seconds: int = 60, n_boot: int = 4000):
+    """How surprised each model is by (a) the real Suno song made from each check B prompt, (b) original Khala's
+    take and (c) SFT Khala's take on the same prompt. Same prompt for all three (the check B prompt the takes were
+    generated from) and the same stretch of audio (first min(lengths, max_seconds) of each), so only the music
+    differs. Generated mp3s go through the same codec encoding as the real songs (layers 0-1)."""
+    import sys, tempfile
+    import numpy as np, torch
+    sys.path[:0] = ["/root", "/root/khala"]
+    import dpo_common as dc
+    from core.khala_runtime import load_vanilla_model
+    vol.reload()
+    prompts = json.load(open("/data/eval/check_b_prompts.json"))
+    meta = {m["id"]: m for m in json.load(open("/data/sft_data/meta.json"))}
+    real_codes = np.load("/data/sft_data/codes.npy", mmap_mode="r")
+    dac, b2 = _load_codec(), _b2()
+
+    def encode(key):
+        with tempfile.NamedTemporaryFile(suffix=".mp3") as f:
+            f.write(b2.get_object(Bucket=B2_BUCKET, Key=key)["Body"].read()); f.flush()
+            wav = _decode_file(f.name)
+        T = -(-wav.shape[1] // FRAME)
+        wav = np.pad(wav, ((0, 0), (0, T * FRAME - wav.shape[1])))
+        core, ctx, parts = 640 * FRAME, 44 * FRAME, []
+        with torch.no_grad():
+            for st in range(0, T * FRAME, core):
+                a, b = max(0, st - ctx), min(T * FRAME, st + core + ctx)
+                c = dac.encode(torch.from_numpy(wav[:, a:b])[None].cuda())
+                parts.append(c[:2, 0, (st - a) // FRAME:(st - a) // FRAME + (min(st + core, T * FRAME) - st) // FRAME])
+        return torch.cat(parts, 1).T.cpu().numpy().astype(np.int16)
+
+    songs = {}                                             # pid -> {source: codes}
+    for p in prompts:
+        m = meta[p["song_id"]]
+        songs[p["pid"]] = {"real_suno": np.array(real_codes[m["c0"]:m["c0"] + m["frames"]]),
+                           "original_take": encode(f"{OUT}check_b/original/{p['pid']:02d}.mp3"),
+                           "sft_take": encode(f"{OUT}check_b/final/{p['pid']:02d}.mp3")}
+    del dac
+    torch.cuda.empty_cache()
+    cap = int(max_seconds * SR / FRAME)
+    lengths = {pid: min(cap, *(len(c) for c in s.values())) for pid, s in songs.items()}
+
+    out = {"seconds_compared_per_prompt": {pid: round(n * FRAME / SR, 1) for pid, n in lengths.items()}}
+    for tag, label in (("original", "original_khala"), ("final", "sft_khala")):
+        model = load_vanilla_model("backbone", _weights_path(tag), "/data/weights/backbone_megatron_args.json", "cuda", torch.float32).eval()
+        head_w = model.lm_head.weight[:dc.REAL_VOCAB]
+        scores = {}
+        with torch.no_grad():
+            for p in prompts:
+                for src, codes in songs[p["pid"]].items():
+                    ids, a0 = dc.build_sequence(p["prompt_ids"], codes[:lengths[p["pid"]]])
+                    ids = ids.cuda()
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        h = dc.hidden_states(model, ids[None], use_checkpoint=False)[0]
+                        lp = torch.cat([dc._chunk_logp(h[a0 - 1:-1][s:s + 1024], head_w, ids[a0:][s:s + 1024]) for s in range(0, len(ids) - a0, 1024)])
+                    scores.setdefault(src, {})[p["pid"]] = float(-lp.mean())
+        del model
+        torch.cuda.empty_cache()
+        rng = np.random.default_rng(0)
+        pids = sorted(lengths)
+
+        def paired(a, b):                                   # mean(a - b) over prompts, prompt-bootstrap 95%
+            d = np.array([scores[a][i] - scores[b][i] for i in pids])
+            boots = [d[rng.integers(0, len(d), len(d))].mean() for _ in range(n_boot)]
+            return {"mean": round(float(d.mean()), 4), "range95": [round(float(x), 4) for x in np.percentile(boots, [2.5, 97.5])],
+                    "share_positive": round(float((d > 0).mean()), 3)}
+
+        own = "original_take" if tag == "original" else "sft_take"
+        out[label] = {"mean_surprise": {src: round(float(np.mean(list(v.values()))), 4) for src, v in scores.items()},
+                      "real_minus_own": paired("real_suno", own),
+                      "real_minus_other_model": paired("real_suno", "sft_take" if tag == "original" else "original_take"),
+                      "per_prompt": scores}
+        print(json.dumps({label: {k: v for k, v in out[label].items() if k != "per_prompt"}}), flush=True)
+    out["gap_change_sft_vs_original"] = round(out["sft_khala"]["real_minus_own"]["mean"] - out["original_khala"]["real_minus_own"]["mean"], 4)
+    _put("surprise_compare.json", out)
+    return {k: v for k, v in out.items() if k != "seconds_compared_per_prompt"}
+
+
+@app.local_entrypoint()
+def compare():
+    call = surprise_compare.spawn()
+    print(f"surprise comparison launched: {call.object_id} (safe to close the laptop); result: B2 {OUT}surprise_compare.json")
+
+
 # ------------------------------------------------------------------ check B: generation
 @app.function(image=gen_image, gpu="H100", memory=65536, volumes={"/data": vol}, secrets=[b2_secret], timeout=3 * 3600)
 def generate(tag: str, pids: list):
