@@ -160,20 +160,45 @@ def build():
         except Exception:
             return None
 
-    ids = sorted(audio)
+    # Sean 2026-10-02: restore the 863 songs Claude dropped as not_public — keep them even if
+    # they also fail type/task filters (they were only labeled not_public because that check ran first).
+    try:
+        force_include = {
+            ln.strip() for ln in s3.get_object(Bucket=BUCKET, Key=OUT + "force_include_ids.txt")["Body"]
+            .read().decode().splitlines() if ln.strip()
+        }
+    except Exception:
+        force_include = set()
+
+    ids = sorted(set(audio) | force_include)
     with ThreadPoolExecutor(64) as pool:
         metas = dict(zip(ids, pool.map(meta, ids)))
 
     reasons, examples, keep = collections.Counter(), collections.defaultdict(list), []
     left_ids = collections.defaultdict(list)                       # reason -> every song ID left out for it
+    forced = []
     for cid in ids:
         c = metas[cid]
         if not c:
             reasons["no_metadata_file"] += 1
             left_ids["no_metadata_file"].append(cid)
             continue
+        if cid not in audio:
+            reasons["force_include_no_audio"] += 1
+            left_ids["force_include_no_audio"].append(cid)
+            continue
         likes = max(int(c.get("upvote_count") or 0), seen_likes[cid])
         plays = max(int(c.get("play_count") or 0), seen_plays[cid])
+        if cid in force_include:
+            # force-include skips only the private check; every other rule still applies (Sean 2026-10-02:
+            # drop the extended/edited/cover ones among them from the list — audio stays in the bucket)
+            why = why_not(dict(c, is_public=True), likes, plays)
+            if why:
+                reasons[f"force_include_{why}"] += 1
+                left_ids[f"force_include_{why}"].append(cid)
+                continue
+            forced.append((cid, c, likes, plays))
+            continue
         why = why_not(c, likes, plays)
         if why:
             reasons[why] += 1
@@ -183,7 +208,7 @@ def build():
             continue
         keep.append((cid, c, likes, plays))
 
-    # exact duplicate recordings: keep the most-liked
+    # exact duplicate recordings: keep the most-liked (force-includes exempt — always kept)
     by_etag = collections.defaultdict(list)
     for item in keep:
         by_etag[audio[item[0]]["etag"]].append(item)
@@ -194,9 +219,9 @@ def build():
         reasons["duplicate_recording"] += len(group) - 1
         left_ids["duplicate_recording"] += [x[0] for x in group[1:]]
 
-    # 2% creator cap, most-liked first
+    # 2% creator cap, most-liked first (force-includes bypass the cap)
     deduped.sort(key=lambda x: -x[2])
-    cap = max(1, int(CREATOR_SHARE * len(deduped)))
+    cap = max(1, int(CREATOR_SHARE * (len(deduped) + len(forced))))
     per_creator, final = collections.Counter(), []
     for item in deduped:
         uid = item[1]["user_id"]
@@ -206,6 +231,7 @@ def build():
             continue
         per_creator[uid] += 1
         final.append(item)
+    final.extend(forced)
 
     with ThreadPoolExecutor(64) as pool:
         receipts = dict(zip([x[0] for x in final], pool.map(receipt, [x[0] for x in final])))
@@ -244,6 +270,7 @@ def build():
         "train": splits["train"], "test": splits["test"],
         "from_first_run": sum(r["in_first_run"] for r in rows), "new": sum(not r["in_first_run"] for r in rows),
         "instrumental": sum(r["instrumental"] for r in rows),
+        "force_include": len(forced), "force_include_requested": len(force_include),
         "creators": len(per_creator), "creator_cap": cap, "largest_creator": max(per_creator.values(), default=0),
         "left_out": dict(reasons.most_common()), "lyrics_cleaning": dict(cleaning.most_common()),
     }
