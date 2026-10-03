@@ -17,6 +17,10 @@ DERIVED = ("cover_clip_id", "artist_clip_id", "continue_at", "infill", "upsample
            "overpainting_clip_id", "underpainting_clip_id", "mashup_clip_ids", "stem_from_id", "history",
            "concat_history", "speed_clip_id", "is_remix")
 
+# normal original songs made with a Suno helper — allowed (Sean 2026-10-02); covers/samples/vox/extends are not
+ALLOWED_TASKS = {"artist_consistency", "playlist_condition", "agentic_thinking", "agentic_instant",
+                 "image_to_song", "video_to_song"}
+
 app = modal.App("sft2-verify")
 image = modal.Image.debian_slim(python_version="3.11").pip_install("boto3")
 
@@ -72,8 +76,10 @@ def verify():
         md = m.get("metadata") or {}
         if md.get("type") != "gen":
             bad("not_plain_generation", r, f"type={md.get('type')}")
-        if present(md.get("task")):
+        if present(md.get("task")) and md.get("task") not in ALLOWED_TASKS:
             bad("special_task", r, f"task={md.get('task')}")
+        elif present(md.get("task")):
+            info[f"helper_task:{md.get('task')}"] += 1
         for k in DERIVED:
             if present(md.get(k)):
                 bad(f"derived:{k}", r, str(md.get(k))[:60])
@@ -129,7 +135,8 @@ def verify():
     # count distinct failing songs (re-run the per-song rules cheaply)
     result["songs_failing_any_rule"] = sum(1 for r in rows if files[r["id"]]["metadata"] is None
                                            or ((files[r["id"]]["metadata"].get("metadata") or {}).get("type") != "gen")
-                                           or present((files[r["id"]]["metadata"].get("metadata") or {}).get("task"))
+                                           or (present((files[r["id"]]["metadata"].get("metadata") or {}).get("task"))
+                                               and (files[r["id"]]["metadata"].get("metadata") or {}).get("task") not in ALLOWED_TASKS)
                                            or any(present((files[r["id"]]["metadata"].get("metadata") or {}).get(k)) for k in DERIVED))
     s3.put_object(Bucket=BUCKET, Key="selected/sft2/verify.json", Body=json.dumps(result, indent=1, ensure_ascii=False).encode())
     return result
@@ -141,3 +148,28 @@ def main():
     print(json.dumps({k: v for k, v in r.items() if k != "examples"}, indent=1))
     print("title-flag examples:", json.dumps(r["examples"].get("title_flag", [])[:12], ensure_ascii=False))
     print("clip_roots examples:", json.dumps(r["examples"].get("clip_roots", [])[:5], ensure_ascii=False))
+
+
+@app.function(image=image, cpu=2, memory=16384, secrets=[modal.Secret.from_name("b2-key")], timeout=1800)
+def tokens_check(list_key: str = "selected/sft2/frozen_2026-10-02.jsonl"):
+    """Every song in the list has a layer-0/1 token file whose length matches its audio (within 2 s)."""
+    import boto3
+    s3 = boto3.client("s3", endpoint_url=ENDPOINT)
+    raw = s3.get_object(Bucket=BUCKET, Key="shao_tokens/v1/manifest.jsonl")["Body"].read().decode()
+    man = {json.loads(l)["id"]: json.loads(l) for l in raw.split("\n") if l.strip()}
+    songs = [json.loads(l) for l in s3.get_object(Bucket=BUCKET, Key=list_key)["Body"].read().decode().split("\n") if l.strip()]
+    have = set()
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix="shao_tokens/v1/q01/"):
+        have |= {o["Key"].split("/")[-1][:-4] for o in page.get("Contents", [])}
+    ids = {s["id"] for s in songs}
+    off = [s["id"] for s in songs if s["id"] in man and s["audio"].get("duration_seconds")
+           and abs(man[s["id"]]["seconds"] - s["audio"]["duration_seconds"]) > 2]
+    return {"manifest_bytes": len(raw), "manifest_newlines": raw.count("\n"), "manifest_rows": len(man),
+            "token_files": len(have), "list_songs": len(ids), "list_songs_with_tokens": len(ids & have),
+            "list_songs_missing_tokens": len(ids - have), "list_songs_in_manifest": len(ids & set(man)),
+            "length_off_by_more_than_2s": len(off), "examples_off": off[:5]}
+
+
+@app.local_entrypoint()
+def tokens():
+    print(json.dumps(tokens_check.remote(), indent=1))
