@@ -38,6 +38,7 @@ ap.add_argument("--save_every", type=int, default=500)
 ap.add_argument("--n_eval", type=int, default=300)
 ap.add_argument("--budget_minutes", type=float, default=50)    # hard stop (whole job, all GPUs)
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--data", default="/data/sft_data")               # packed songs: codes.npy, prompts.npy, meta.json
 args = ap.parse_args()
 
 dist.init_process_group("nccl")
@@ -49,9 +50,9 @@ run_dir = f"/data/sft_runs/{args.job}"
 os.makedirs(run_dir, exist_ok=True)
 
 # ---------------- data (packed by sft_train.prepare) ----------------
-codes_all = np.load("/data/sft_data/codes.npy", mmap_mode="r")      # shared by all 8 processes, not copied
-prompt_all = np.load("/data/sft_data/prompts.npy", mmap_mode="r")
-meta = json.load(open("/data/sft_data/meta.json"))
+codes_all = np.load(f"{args.data}/codes.npy", mmap_mode="r")      # shared by all 8 processes, not copied
+prompt_all = np.load(f"{args.data}/prompts.npy", mmap_mode="r")
+meta = json.load(open(f"{args.data}/meta.json"))
 
 
 def sequence(i):
